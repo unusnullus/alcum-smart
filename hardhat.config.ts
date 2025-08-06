@@ -38,16 +38,18 @@ const config: HardhatUserConfig = {
     hardhat: {
       blockGasLimit: 9999999999999,
       gas: 30000000,
-      // forking: {
-      //   url: process.env.RPC_URL || "",
-      // },
+      forking: {
+        url: process.env.RPC_URL || "",
+      },
     },
   },
   gasReporter: {
     enabled: true,
     currency: "USD",
     coinmarketcap: COINMARKETCAP_API_KEY,
-    token: 'HBAR'
+  },
+  etherscan: {
+    apiKey: process.env.ETHERSCAN_KEY,
   },
   mocha: {
     timeout: 100000000,

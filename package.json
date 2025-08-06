@@ -1,11 +1,12 @@
 {
-  "name": "Alcum",
+  "name": "alcum-wallet",
   "version": "1.0.0",
+  "description": "Smart contracts for Alcum wallet",
+  "author": "Alcum wallet",
   "scripts": {
     "compile": "yarn hardhat compile",
     "test": "yarn hardhat test --network hardhat",
-    "deploy": "yarn hardhat run scripts/deploy.ts",
-    "deploy-suite": "yarn hardhat run scripts/deploy-suite.ts"
+    "deploy": "yarn hardhat run scripts/deploy.ts"
   },
   "keywords": [
     "defi",
@@ -37,7 +38,7 @@
     "eslint-plugin-n": "^16.6.2",
     "eslint-plugin-promise": "^6.1.1",
     "ethers": "^6.11.1",
-    "hardhat": "^2.21.0",
+    "hardhat": "^2.22.14",
     "hardhat-contract-sizer": "^2.10.0",
     "hardhat-gas-reporter": "^1.0.10",
     "solhint": "^4.1.1",
@@ -49,12 +50,10 @@
   },
   "dependencies": {
     "@chainlink/contracts": "^1.3.0",
-    "@hashgraph/hedera-local": "^2.19.1",
+    "@nomicfoundation/hardhat-foundry": "^1.2.0",
     "@openzeppelin/contracts": "5.0.2",
     "@openzeppelin/contracts-upgradeable": "5.0.2",
-    "@types/uuid": "^10.0.0",
     "@uniswap/v2-core": "^1.0.1",
-    "@uniswap/v2-periphery": "^1.1.0-beta.0",
-    "uuid": "^11.1.0"
+    "@uniswap/v2-periphery": "^1.1.0-beta.0"
   }
 }
