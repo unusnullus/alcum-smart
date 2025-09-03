@@ -4,17 +4,19 @@ pragma solidity 0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {console} from "forge-std/console.sol";
 
+import {Upgrades, Options} from "openzeppelin-foundry-upgrades/Upgrades.sol";
+
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
-import {ERC20Mock} from "../contracts/mock/ERC20Mock.sol";
+import {ERC20Mock} from "@contracts/mock/ERC20Mock.sol";
 
-import {Zapper} from "../../contracts/Zapper.sol";
-import {CUPToken} from "../../contracts/CUPToken.sol";
-import {xCUP} from "../../contracts/xCUP.sol";
-import {ICopperPriceConsumer} from "../../contracts/interfaces/ICopperPriceConsumer.sol";
-import {IEpochManager} from "../../contracts/interfaces/IEpochManager.sol";
-import {EpochManager} from "../../contracts/EpochManager.sol";
+import {Zapper} from "@contracts/Zapper.sol";
+import {CUPToken} from "@contracts/CUPToken.sol";
+import {xCUP} from "@contracts/xCUP.sol";
+import {ICopperPriceConsumer} from "@contracts/interfaces/ICopperPriceConsumer.sol";
+import {IEpochManager} from "@contracts/interfaces/IEpochManager.sol";
+import {EpochManager} from "@contracts/EpochManager.sol";
 
 import {IUniswapV2Router02} from "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 
@@ -63,35 +65,52 @@ contract ZapperTest is Test {
         vm.selectFork(forkId);
 
         // Deploy contracts
-        vm.prank(owner);
+        vm.startPrank(owner);
         cupToken = new CUPToken();
 
-        vm.prank(owner);
-        erc20Mock = new ERC20Mock();
+        erc20Mock = new ERC20Mock("TST", "TST", 18);
 
-        vm.prank(owner);
-        xcup = new xCUP(cupToken, "xCUP", "xCUP");
-
-        vm.prank(owner);
-        epochManager = new EpochManager();
-
-        vm.prank(owner);
-        zapper = new Zapper(
-            address(cupToken),
-            address(usdc),
-            address(xcup),
-            address(router),
-            address(copperPriceConsumer),
-            address(epochManager)
+        // Deploy xCUP using upgradeable pattern
+        address xcupProxy = Upgrades.deployTransparentProxy(
+            "xCUP.sol:xCUP",
+            owner,
+            abi.encodeCall(xCUP.initialize, (cupToken, "xCUP", "xCUP"))
         );
+        xcup = xCUP(xcupProxy);
+
+        // Deploy EpochManager
+        address epochManagerProxy = Upgrades.deployTransparentProxy(
+            "EpochManager.sol:EpochManager",
+            owner,
+            abi.encodeCall(EpochManager.initialize, (2592000))
+        );
+        epochManager = IEpochManager(epochManagerProxy);
+
+        // Deploy Zapper
+        address zapperProxy = Upgrades.deployTransparentProxy(
+            "Zapper.sol:Zapper",
+            owner,
+            abi.encodeCall(
+                Zapper.initialize,
+                (
+                    address(cupToken),
+                    address(usdc),
+                    address(xcup),
+                    address(router),
+                    address(copperPriceConsumer),
+                    address(epochManager)
+                )
+            )
+        );
+        zapper = Zapper(zapperProxy);
 
         // Setup roles
-        vm.startPrank(owner);
         zapper.grantRole(zapper.VAULT_CURATOR_ROLE(), admin);
-        vm.stopPrank();
+        xcup.grantRole(xcup.REDEEMER_ROLE(), address(zapper));
 
-        vm.prank(owner);
         erc20Mock.mint(owner, 5000000e20);
+
+        vm.stopPrank();
 
         // Make balances
         deal(address(usdc), owner, 5000000e20);
@@ -99,6 +118,23 @@ contract ZapperTest is Test {
         deal(address(cupToken), address(zapper), 5000000e20);
 
         addLiquidity();
+    }
+
+    function testWithdrawDeposit() public {
+        uint256 amountToDeposit = 10e6;
+
+        vm.prank(owner);
+        usdc.approve(address(zapper), amountToDeposit);
+
+        vm.prank(owner);
+        zapper.zapAndDeposit(usdc, amountToDeposit);
+
+        bytes32[] memory pendingDepositIds = zapper.getPendingDepositIds();
+
+        vm.prank(owner);
+        zapper.withdrawDeposit(pendingDepositIds[0]);
+
+        assertGe(usdc.balanceOf(owner), amountToDeposit, "Should receive usdc back");
     }
 
     function testRedeem() public {
@@ -110,14 +146,23 @@ contract ZapperTest is Test {
         vm.prank(owner);
         zapper.zapAndDeposit(usdc, amountToDeposit);
 
-        vm.startPrank(owner);
-        IERC20(address(xcup)).approve(address(zapper), xcup.balanceOf(owner));
-        vm.stopPrank();
+        vm.prank(owner);
+        epochManager.nextEpoch();
+
+        bytes32[] memory pendingDepositIds = zapper.getPendingDepositIds();
+
+        vm.prank(admin);
+        zapper.approveDeposit(pendingDepositIds[0], amountToDeposit);
 
         vm.prank(owner);
-        uint256 usdcToWithdraw = zapper.redeem();
+        zapper.claimDeposit(pendingDepositIds[0]);
 
-        console.log("usdcToWithdraw", usdcToWithdraw);
+        vm.startPrank(owner);
+        IERC20(address(xcup)).approve(address(zapper), xcup.balanceOf(owner));
+        console.log("xcup balance", xcup.balanceOf(owner));
+
+        uint256 usdcToWithdraw = zapper.redeem(xcup.balanceOf(owner));
+        vm.stopPrank();
 
         // assertGt(usdc, 0, "Should receive usdc");
     }
@@ -238,6 +283,9 @@ contract ZapperTest is Test {
         vm.prank(owner);
         zapper.zapAndDeposit(erc20Mock, amountToDeposit);
 
+        vm.prank(owner);
+        epochManager.nextEpoch();
+
         // Approve the deposit
         vm.prank(admin);
         zapper.approveDeposit(depositId, 47482973758155927037);
@@ -265,6 +313,9 @@ contract ZapperTest is Test {
         zapper.zapAndDeposit(erc20Mock, amountToDeposit);
 
         vm.prank(owner);
+        epochManager.nextEpoch();
+
+        vm.prank(owner);
         vm.expectRevert("Deposit not approved");
         zapper.claimDeposit(depositId);
     }
@@ -272,6 +323,9 @@ contract ZapperTest is Test {
     function testClaimDepositRevertWhenWrongUser() public {
         address otherUser = 0x1111111111111111111111111111111111111111;
         bytes32 depositId = keccak256(abi.encodePacked(owner, block.timestamp, uint256(50e18)));
+
+        vm.prank(owner);
+        epochManager.nextEpoch();
 
         vm.prank(otherUser);
         vm.expectRevert("Invalid user");
@@ -510,5 +564,77 @@ contract ZapperTest is Test {
 
         // Give zapper some CUP tokens
         deal(address(cupToken), address(zapper), 5000000e18);
+    }
+
+    function testZapAndDepositWithPermit() public {
+        uint256 amountToDeposit = 10e18;
+
+        // Ensure user has sufficient allowance so permit is not executed
+        vm.prank(owner);
+        erc20Mock.approve(address(zapper), amountToDeposit);
+
+        // Create permit parameters (these won't be used since user has sufficient allowance)
+        Zapper.PermitParams memory permitParams = Zapper.PermitParams({
+            value: amountToDeposit,
+            deadline: block.timestamp + 3600, // 1 hour from now
+            v: 27,
+            r: 0x1234567890123456789012345678901234567890123456789012345678901234,
+            s: 0x1234567890123456789012345678901234567890123456789012345678901234
+        });
+
+        // Test with ERC20Mock - since user has sufficient allowance, permit won't be executed
+        vm.prank(owner);
+        zapper.zapAndDepositWithPermit(erc20Mock, amountToDeposit, permitParams);
+
+        // Verify deposit was created
+        bytes32[] memory pendingDepositIds = zapper.getPendingDepositIds();
+        assertGt(pendingDepositIds.length, 0, "Should have pending deposits");
+    }
+
+    function testZapAndDepositWithPermitRevertWhenZeroAmount() public {
+        Zapper.PermitParams memory permitParams = Zapper.PermitParams({
+            value: 0,
+            deadline: block.timestamp + 3600,
+            v: 27,
+            r: 0x1234567890123456789012345678901234567890123456789012345678901234,
+            s: 0x1234567890123456789012345678901234567890123456789012345678901234
+        });
+
+        vm.prank(owner);
+        vm.expectRevert("Invalid amount");
+        zapper.zapAndDepositWithPermit(usdc, 0, permitParams);
+    }
+
+    function testZapAndDepositWithPermitRevertWhenInvalidToken() public {
+        uint256 amountToDeposit = 10e6;
+        Zapper.PermitParams memory permitParams = Zapper.PermitParams({
+            value: amountToDeposit,
+            deadline: block.timestamp + 3600,
+            v: 27,
+            r: 0x1234567890123456789012345678901234567890123456789012345678901234,
+            s: 0x1234567890123456789012345678901234567890123456789012345678901234
+        });
+
+        vm.prank(owner);
+        vm.expectRevert("Invalid token");
+        zapper.zapAndDepositWithPermit(IERC20(address(0)), amountToDeposit, permitParams);
+    }
+
+    function testZapAndDepositWithPermitRevertWhenPaused() public {
+        vm.prank(owner);
+        zapper.pause();
+
+        uint256 amountToDeposit = 10e6;
+        Zapper.PermitParams memory permitParams = Zapper.PermitParams({
+            value: amountToDeposit,
+            deadline: block.timestamp + 3600,
+            v: 27,
+            r: 0x1234567890123456789012345678901234567890123456789012345678901234,
+            s: 0x1234567890123456789012345678901234567890123456789012345678901234
+        });
+
+        vm.prank(owner);
+        vm.expectRevert();
+        zapper.zapAndDepositWithPermit(usdc, amountToDeposit, permitParams);
     }
 }

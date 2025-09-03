@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 
-import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
 
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
@@ -18,6 +21,11 @@ import {IEpochManager} from "./interfaces/IEpochManager.sol";
 
 import {console} from "hardhat/console.sol";
 
+/**
+ * @title Silo
+ * @dev A simple contract that holds USDC tokens and provides unlimited approval to the Zapper contract.
+ * This contract acts as a vault for USDC tokens during the zapping process.
+ */
 contract Silo {
     using SafeERC20 for IERC20;
 
@@ -26,28 +34,51 @@ contract Silo {
     }
 }
 
-contract Zapper is AccessControl, Ownable, Pausable {
+/**
+ * @title Zapper
+ * @dev A DeFi protocol contract that allows users to zap (swap) various tokens into USDC and deposit them into a vault.
+ * The contract manages deposits through an approval system where vault curators can approve or decline deposits.
+ */
+contract Zapper is
+    Initializable,
+    AccessControlUpgradeable,
+    OwnableUpgradeable,
+    PausableUpgradeable,
+    ReentrancyGuardUpgradeable
+{
     using SafeERC20 for IERC20;
 
+    /// @dev Role identifier for vault curators who can approve/decline deposits
     bytes32 public constant VAULT_CURATOR_ROLE = keccak256("VAULT_CURATOR_ROLE");
 
+    /// @dev CUP token contract address
     IERC20 private _cup;
+    /// @dev USDC token contract address
     IERC20 private _usdc;
-
+    /// @dev xCUP vault contract (ERC4626 compliant)
     IERC4626 private _vault;
-
+    /// @dev Uniswap V2 router for token swaps
     IUniswapV2Router02 private _router;
-
+    /// @dev Copper price oracle consumer
     ICopperPriceConsumer private _copperPriceConsumer;
-
+    /// @dev Silo contract that holds USDC during operations
     Silo private _silo;
-
+    /// @dev Epoch manager for time-based operations
     IEpochManager private _epochManager;
 
+    /// @dev Mapping of deposit IDs to deposit information
     mapping(bytes32 depositId => Deposit) private _approvedDeposits;
-
+    /// @dev Array of pending deposit IDs
     bytes32[] private _pendingDepositIds;
 
+    /**
+     * @dev Struct representing a user deposit
+     * @param user The address of the user who made the deposit
+     * @param depositId Unique identifier for the deposit
+     * @param amount Total amount deposited in USDC
+     * @param approvedAmount Amount approved by vault curators
+     * @param approved Whether the deposit has been approved
+     */
     struct Deposit {
         address user;
         bytes32 depositId;
@@ -56,6 +87,14 @@ contract Zapper is AccessControl, Ownable, Pausable {
         bool approved;
     }
 
+    /**
+     * @dev Struct for permit parameters (currently unused but reserved for future use)
+     * @param value The permit value
+     * @param deadline The permit deadline
+     * @param v The v component of the signature
+     * @param r The r component of the signature
+     * @param s The s component of the signature
+     */
     struct PermitParams {
         uint256 value;
         uint256 deadline;
@@ -64,42 +103,107 @@ contract Zapper is AccessControl, Ownable, Pausable {
         bytes32 s;
     }
 
+    /**
+     * @dev Emitted when a user claims their approved deposit and receives vault shares
+     * @param depositId The unique identifier of the deposit
+     * @param user The address of the user claiming the deposit
+     * @param shares The number of vault shares received
+     */
     event DepositClaimed(bytes32 depositId, address user, uint256 shares);
 
+    /**
+     * @dev Emitted when a vault curator approves a deposit
+     * @param depositId The unique identifier of the deposit
+     * @param approvedAmount The amount approved for the deposit
+     */
     event DepositApproved(bytes32 depositId, uint256 approvedAmount);
 
+    /**
+     * @dev Emitted when a vault curator declines a deposit and refunds the user
+     * @param depositId The unique identifier of the deposit
+     * @param user The address of the user whose deposit was declined
+     * @param refundAmount The amount refunded to the user
+     */
     event DepositDeclined(bytes32 depositId, address user, uint256 refundAmount);
 
+    /**
+     * @dev Emitted when a user withdraws their deposit before approval
+     * @param depositId The unique identifier of the deposit
+     * @param user The address of the user withdrawing the deposit
+     * @param amount The amount withdrawn
+     */
     event DepositWithdrawn(bytes32 depositId, address user, uint256 amount);
 
+    /**
+     * @dev Emitted when deposits are approved proportionally
+     * @param totalApproved Total amount approved across all deposits
+     * @param totalDeposited Total amount deposited across all pending deposits
+     * @param proportion The proportion used for approval (scaled by 1e18)
+     */
     event ProportionalApproval(uint256 totalApproved, uint256 totalDeposited, uint256 proportion);
 
+    /**
+     * @dev Emitted when USDC is withdrawn from the contract
+     * @param user The address of the user withdrawing USDC
+     * @param amount The amount of USDC withdrawn
+     */
     event Withdraw(address indexed user, uint256 amount);
 
     /**
-     * @dev The `ZapAndDeposit` event is emitted when a user zaps in and
-     * deposits
-     * assets into a vault.
+     * @dev Emitted when a user zaps tokens and deposits them
+     * @param router The address of the Uniswap router used
+     * @param tokenIn The address of the input token
+     * @param amount The amount of tokens zapped and deposited
      */
     event ZapAndDeposit(address indexed router, address indexed tokenIn, uint256 amount);
 
+    /**
+     * @dev
+     */
+    error PermitFailed();
+
+    /**
+     * @dev Modifier that ensures the epoch is active
+     * @custom:revert "Epoch not active" if the epoch has ended
+     */
     modifier whenEpochActive() {
         require(_epochManager.timeLeftInEpoch() > 0, "Epoch not active");
         _;
     }
 
-    constructor(
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
+     * @dev Initializes the Zapper contract with required addresses and configurations
+     * @param cup The address of the CUP token contract
+     * @param usdc The address of the USDC token contract
+     * @param vault The address of the xCUP vault contract (ERC4626)
+     * @param router The address of the Uniswap V2 router
+     * @param copperPriceConsumer The address of the copper price oracle consumer
+     * @param epochManager The address of the epoch manager contract
+     */
+    function initialize(
         address cup,
         address usdc,
         address vault,
         address router,
         address copperPriceConsumer,
         address epochManager
-    ) Ownable(_msgSender()) {
+    ) public initializer {
         require(cup != address(0), "Invalid CUP address");
+        require(usdc != address(0), "Invalid USDC address");
         require(vault != address(0), "Invalid Vault address");
         require(router != address(0), "Invalid Router address");
         require(copperPriceConsumer != address(0), "Invalid Copper Price Consumer address");
+        require(epochManager != address(0), "Invalid Epoch Manager address");
+
+        __AccessControl_init();
+        __Ownable_init(_msgSender());
+        __Pausable_init();
+        __ReentrancyGuard_init();
 
         _grantRole(DEFAULT_ADMIN_ROLE, _msgSender());
 
@@ -113,6 +217,70 @@ contract Zapper is AccessControl, Ownable, Pausable {
         _epochManager = IEpochManager(epochManager);
     }
 
+    /**
+     * @dev Removes a deposit ID from the pending deposits array
+     * @param depositId The deposit ID to remove
+     */
+    function _removePendingDeposit(bytes32 depositId) internal {
+        for (uint256 i = 0; i < _pendingDepositIds.length; i++) {
+            if (_pendingDepositIds[i] == depositId) {
+                _pendingDepositIds[i] = _pendingDepositIds[_pendingDepositIds.length - 1];
+                _pendingDepositIds.pop();
+                break;
+            }
+        }
+    }
+
+    /**
+     * @dev Records a new deposit in the system
+     * @param amount The amount of the deposit in USDC
+     * @return depositId The unique identifier for the deposit
+     */
+    function _recordDeposit(uint256 amount) internal returns (bytes32 depositId) {
+        // Generate a unique deposit ID
+        depositId = keccak256(abi.encodePacked(_msgSender(), block.timestamp, amount));
+        _approvedDeposits[depositId] = Deposit({
+            user: _msgSender(),
+            depositId: depositId,
+            amount: amount,
+            approvedAmount: 0,
+            approved: false
+        });
+        _pendingDepositIds.push(depositId);
+    }
+
+    /**
+     * @dev Swaps input tokens for USDC using Uniswap V2
+     * @param tokenIn The token to swap from
+     * @param amount The amount of tokens to swap
+     * @return depositValue The amount of USDC received from the swap
+     */
+    function _zapIn(IERC20 tokenIn, uint256 amount) internal returns (uint256 depositValue) {
+        uint256 initialTokenOutBalance = _usdc.balanceOf(address(_silo));
+
+        if (msg.value == 0) {
+            tokenIn.safeTransferFrom(_msgSender(), address(this), amount);
+        }
+
+        // WETH check
+        if (address(tokenIn) != _router.WETH()) {
+            tokenIn.forceApprove(router(), amount);
+        } else {
+            require(msg.value == amount, "Invalid ETH amount");
+        }
+        _tradeForToken(address(tokenIn), usdc(), amount);
+
+        uint256 balanceAfterZap = _usdc.balanceOf(address(_silo));
+
+        depositValue = balanceAfterZap - initialTokenOutBalance;
+    }
+
+    /**
+     * @dev Executes a token swap on Uniswap V2
+     * @param tokenIn The address of the input token
+     * @param tokenOut The address of the output token
+     * @param amountIn The amount of input tokens to swap
+     */
     function _tradeForToken(address tokenIn, address tokenOut, uint256 amountIn) internal {
         address[] memory path = new address[](2);
         path[0] = tokenIn;
@@ -133,52 +301,69 @@ contract Zapper is AccessControl, Ownable, Pausable {
         _router.swapExactTokensForTokens(amountIn, minOutput, path, address(_silo), block.timestamp);
     }
 
-    function _removePendingDeposit(bytes32 depositId) internal {
-        for (uint256 i = 0; i < _pendingDepositIds.length; i++) {
-            if (_pendingDepositIds[i] == depositId) {
-                _pendingDepositIds[i] = _pendingDepositIds[_pendingDepositIds.length - 1];
-                _pendingDepositIds.pop();
-                break;
-            }
+    /**
+     * @dev The `_executePermit` function is used to execute a permit.
+     */
+    function _execPermit(IERC20 token, address owner, address spender, PermitParams calldata permitParams) internal {
+        ERC20Permit(address(token)).permit(
+            owner,
+            spender,
+            permitParams.value,
+            permitParams.deadline,
+            permitParams.v,
+            permitParams.r,
+            permitParams.s
+        );
+        if (token.allowance(owner, spender) != permitParams.value) {
+            revert PermitFailed();
         }
     }
 
-    function _recordDeposit(uint256 amount) internal returns (bytes32 depositId) {
-        // Generate a unique deposit ID
-        depositId = keccak256(abi.encodePacked(_msgSender(), block.timestamp, amount));
-        _approvedDeposits[depositId] = Deposit({
-            user: _msgSender(),
-            depositId: depositId,
-            amount: amount,
-            approvedAmount: 0,
-            approved: false
-        });
-        _pendingDepositIds.push(depositId);
-    }
-
-    function _zapIn(IERC20 tokenIn, uint256 amount) internal returns (uint256 depositValue) {
-        uint256 initialTokenOutBalance = _usdc.balanceOf(address(_silo));
-
-        if (msg.value == 0) {
-            tokenIn.safeTransferFrom(_msgSender(), address(this), amount);
-        }
-
-        // WETH check
-        if (address(tokenIn) != 0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14) {
-            tokenIn.forceApprove(router(), amount);
+    /**
+     * @dev Processes a deposit by either transferring USDC directly or zapping other tokens
+     * @param tokenIn The token being deposited
+     * @param amount The amount of tokens to deposit
+     * @return depositValue The final USDC value of the deposit
+     */
+    function _processDeposit(IERC20 tokenIn, uint256 amount) internal returns (uint256 depositValue) {
+        if (tokenIn == _usdc) {
+            tokenIn.safeTransferFrom(_msgSender(), address(_silo), amount);
+            depositValue = amount;
         } else {
-            require(msg.value == amount, "Invalid ETH amount");
+            depositValue = _zapIn(tokenIn, amount);
         }
-        _tradeForToken(address(tokenIn), usdc(), amount);
-
-        uint256 balanceAfterZap = _usdc.balanceOf(address(_silo));
-
-        console.log("balanceAfterZap", balanceAfterZap);
-        console.log("initialTokenOutBalance", initialTokenOutBalance);
-
-        depositValue = balanceAfterZap - initialTokenOutBalance;
     }
 
+    /**
+     * @dev Allows users to zap tokens into USDC and create a deposit
+     * @param tokenIn The token to zap (can be any ERC20 or ETH)
+     * @param amount The amount of tokens to zap
+     * @return depositId The unique identifier for the created deposit
+     */
+    function zapAndDepositWithPermit(
+        IERC20 tokenIn,
+        uint256 amount,
+        PermitParams calldata permitParams
+    ) external payable whenNotPaused returns (bytes32 depositId) {
+        require(address(tokenIn) != address(0), "Invalid token");
+        require(amount != 0, "Invalid amount");
+
+        if (tokenIn.allowance(_msgSender(), address(this)) < amount) {
+            _execPermit(tokenIn, _msgSender(), address(this), permitParams);
+        }
+
+        uint256 depositValue = _processDeposit(tokenIn, amount);
+        depositId = _recordDeposit(depositValue);
+
+        emit ZapAndDeposit(router(), address(tokenIn), depositValue);
+    }
+
+    /**
+     * @dev Allows users to zap tokens into USDC and create a deposit
+     * @param tokenIn The token to zap (can be any ERC20 or ETH)
+     * @param amount The amount of tokens to zap
+     * @return depositId The unique identifier for the created deposit
+     */
     function zapAndDeposit(IERC20 tokenIn, uint256 amount) external payable whenNotPaused returns (bytes32 depositId) {
         require(address(tokenIn) != address(0), "Invalid token");
         require(amount != 0, "Invalid amount");
@@ -189,15 +374,10 @@ contract Zapper is AccessControl, Ownable, Pausable {
         emit ZapAndDeposit(router(), address(tokenIn), depositValue);
     }
 
-    function _processDeposit(IERC20 tokenIn, uint256 amount) internal returns (uint256 depositValue) {
-        if (tokenIn == _usdc) {
-            tokenIn.safeTransferFrom(_msgSender(), address(_silo), amount);
-            depositValue = amount;
-        } else {
-            depositValue = _zapIn(tokenIn, amount);
-        }
-    }
-
+    /**
+     * @dev Allows users to withdraw their deposit before it's approved
+     * @param depositId The unique identifier of the deposit to withdraw
+     */
     function withdrawDeposit(bytes32 depositId) external whenNotPaused {
         Deposit storage deposit = _approvedDeposits[depositId];
 
@@ -210,12 +390,17 @@ contract Zapper is AccessControl, Ownable, Pausable {
         _removePendingDeposit(depositId);
 
         // Return USDC to user
-        require(_usdc.balanceOf(address(this)) >= refundAmount, "Insufficient USDC balance");
-        _usdc.safeTransfer(_msgSender(), refundAmount);
+        require(_usdc.balanceOf(address(silo())) >= refundAmount, "Insufficient USDC balance");
+        _usdc.safeTransferFrom(address(silo()), _msgSender(), refundAmount);
 
         emit DepositWithdrawn(depositId, _msgSender(), refundAmount);
     }
 
+    /**
+     * @dev Allows vault curators to approve a specific deposit
+     * @param depositId The unique identifier of the deposit to approve
+     * @param approvedAmount The amount to approve (must be <= total deposit amount)
+     */
     function approveDeposit(
         bytes32 depositId,
         uint256 approvedAmount
@@ -233,6 +418,10 @@ contract Zapper is AccessControl, Ownable, Pausable {
         emit DepositApproved(depositId, approvedAmount);
     }
 
+    /**
+     * @dev Allows vault curators to decline a deposit and refund the user
+     * @param depositId The unique identifier of the deposit to decline
+     */
     function declineDeposit(bytes32 depositId) external whenNotPaused whenEpochActive onlyRole(VAULT_CURATOR_ROLE) {
         Deposit storage deposit = _approvedDeposits[depositId];
 
@@ -241,6 +430,7 @@ contract Zapper is AccessControl, Ownable, Pausable {
 
         uint256 refundAmount = deposit.amount;
         address user = deposit.user;
+
         delete _approvedDeposits[depositId];
         _removePendingDeposit(depositId);
 
@@ -251,6 +441,10 @@ contract Zapper is AccessControl, Ownable, Pausable {
         emit DepositDeclined(depositId, user, refundAmount);
     }
 
+    /**
+     * @dev Allows vault curators to approve multiple deposits proportionally
+     * @param targetTotalAmount The total amount to approve across all pending deposits
+     */
     function approveDepositsProportionally(
         uint256 targetTotalAmount
     ) external whenNotPaused whenEpochActive onlyRole(VAULT_CURATOR_ROLE) {
@@ -258,8 +452,8 @@ contract Zapper is AccessControl, Ownable, Pausable {
         require(_pendingDepositIds.length > 0, "No pending deposits");
 
         // Calculate total pending deposits
-        uint256 totalPendingAmount = 0;
-        uint256 validDeposits = 0;
+        uint256 totalPendingAmount;
+        uint256 validDeposits;
 
         for (uint256 i = 0; i < _pendingDepositIds.length; i++) {
             Deposit storage deposit = _approvedDeposits[_pendingDepositIds[i]];
@@ -275,13 +469,16 @@ contract Zapper is AccessControl, Ownable, Pausable {
         // Calculate proportion (scaled by 1e18 for precision)
         uint256 proportion = (targetTotalAmount * 1e18) / totalPendingAmount;
 
+        bytes32 depositId;
+        uint256 approvedAmount;
+
         // Approve deposits proportionally
         for (uint256 i = 0; i < _pendingDepositIds.length; i++) {
-            bytes32 depositId = _pendingDepositIds[i];
+            depositId = _pendingDepositIds[i];
             Deposit storage deposit = _approvedDeposits[depositId];
 
             if (deposit.user != address(0) && !deposit.approved) {
-                uint256 approvedAmount = (deposit.amount * proportion) / 1e18;
+                approvedAmount = (deposit.amount * proportion) / 1e18;
                 if (approvedAmount > 0) {
                     deposit.approved = true;
                     deposit.approvedAmount = approvedAmount;
@@ -293,6 +490,11 @@ contract Zapper is AccessControl, Ownable, Pausable {
         emit ProportionalApproval(targetTotalAmount, totalPendingAmount, proportion);
     }
 
+    /**
+     * @dev Allows users to claim their approved deposits and receive vault shares
+     * @param depositId The unique identifier of the deposit to claim
+     * @return shares The number of vault shares received
+     */
     function claimDeposit(bytes32 depositId) external whenNotPaused whenEpochActive returns (uint256 shares) {
         Deposit storage deposit = _approvedDeposits[depositId];
         uint256 currentCopperPrice = getCopperPrice();
@@ -305,13 +507,20 @@ contract Zapper is AccessControl, Ownable, Pausable {
         uint256 approvedAmount = deposit.approvedAmount;
         uint256 totalAmount = deposit.amount;
 
-        // Calculate refund for unapproved portion
-        uint256 refundAmount = totalAmount - approvedAmount;
-
-        delete _approvedDeposits[depositId];
+        // If the deposit is fully approved, remove it from the pending deposits
+        if (totalAmount - approvedAmount == 0) {
+            delete _approvedDeposits[depositId];
+            _removePendingDeposit(depositId);
+        } else {
+            deposit.amount = totalAmount - approvedAmount;
+            deposit.approvedAmount = 0;
+            deposit.approved = false;
+        }
 
         // Convert approved USDC amount to CUP value using copper price
         uint256 cupValue = approvedAmount * currentCopperPrice;
+
+        console.log("cupValue", cupValue);
 
         require(_cup.balanceOf(address(this)) >= cupValue, "Insufficient CUP balance");
 
@@ -319,39 +528,44 @@ contract Zapper is AccessControl, Ownable, Pausable {
         _cup.approve(address(_vault), cupValue);
         shares = _vault.deposit(cupValue, _msgSender());
 
-        // Refund unapproved portion to user
-        if (refundAmount > 0) {
-            require(_usdc.balanceOf(address(this)) >= refundAmount, "Insufficient USDC balance for refund");
-            _usdc.safeTransfer(_msgSender(), refundAmount);
-        }
-
         emit DepositClaimed(depositId, _msgSender(), shares);
     }
 
-    function withdraw() external onlyOwner {
-        require(_usdc.balanceOf(address(this)) > 0, "Insufficient USDC balance");
+    /**
+     * @dev Allows the contract owner to withdraw USDC from the silo
+     * @param amount The amount of USDC to withdraw
+     */
+    function withdraw(uint256 amount) external onlyOwner {
+        require(_usdc.balanceOf(address(silo())) >= amount, "Insufficient USDC balance");
 
-        uint256 balance = _usdc.balanceOf(address(this));
+        _usdc.safeTransferFrom(silo(), owner(), amount);
 
-        _usdc.safeTransfer(owner(), balance);
-
-        emit Withdraw(owner(), balance);
+        emit Withdraw(owner(), amount);
     }
 
-    function redeem() external returns (uint256 usdcToWithdraw) {
+    /**
+     * @dev Allows users to redeem their vault shares for USDC
+     * @param sharesToRedeem The number of vault shares to redeem
+     * @return usdcToWithdraw The amount of USDC received
+     */
+    function redeem(uint256 sharesToRedeem) external returns (uint256 usdcToWithdraw) {
+        require(sharesToRedeem > 0, "Shares to redeem must be greater than 0");
+
         uint256 ownedShares = _vault.balanceOf(_msgSender());
+        require(ownedShares >= sharesToRedeem, "Insufficient shares to redeem");
 
-        IERC20(address(_vault)).safeTransferFrom(_msgSender(), address(this), ownedShares);
+        IERC20(address(_vault)).safeTransferFrom(_msgSender(), address(this), sharesToRedeem);
 
-        _vault.approve(address(_vault), ownedShares);
+        _vault.approve(address(_vault), sharesToRedeem);
 
-        uint256 withdrawnCup = _vault.redeem(ownedShares, address(this), address(this));
+        uint256 withdrawnCup = _vault.redeem(sharesToRedeem, address(this), address(this));
 
         uint256 copperPrice = getCopperPrice();
-
         require(copperPrice > 0, "Copper price is 0");
 
         usdcToWithdraw = withdrawnCup / copperPrice;
+
+        _usdc.safeTransferFrom(address(_silo), address(this), usdcToWithdraw);
 
         require(_usdc.balanceOf(address(this)) >= usdcToWithdraw, "Insufficient USDC balance");
 
@@ -360,51 +574,35 @@ contract Zapper is AccessControl, Ownable, Pausable {
         emit Withdraw(_msgSender(), usdcToWithdraw);
     }
 
+    /**
+     * @dev Returns the current copper price from the oracle
+     * @return price The copper price (scaled down by 10^8)
+     */
     function getCopperPrice() public view returns (uint256 price) {
         price = _copperPriceConsumer.price() / 10 ** 8;
     }
 
     /**
-     * @dev The `pause` function is used to pause the `VaultZapper` contract.
+     * @dev Returns the deposit information for a given deposit ID
+     * @param depositId The unique identifier of the deposit
+     * @return The deposit information
      */
-    function pause() external onlyOwner {
-        _pause();
-    }
-
-    /**
-     * @dev The `unpause` function is used to unpause the `VaultZapper`
-     * contract.
-     */
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-
-    function router() public view returns (address) {
-        return address(_router);
-    }
-
-    function usdc() public view returns (address) {
-        return address(_usdc);
-    }
-
-    function silo() public view returns (address) {
-        return address(_silo);
-    }
-
-    // View functions for deposit management
     function getDeposit(bytes32 depositId) external view returns (Deposit memory) {
         return _approvedDeposits[depositId];
     }
 
-    function getPendingDepositsCount() external view returns (uint256) {
-        return _pendingDepositIds.length;
-    }
-
+    /**
+     * @dev Returns all pending deposit IDs
+     * @return Array of pending deposit IDs
+     */
     function getPendingDepositIds() external view returns (bytes32[] memory) {
         return _pendingDepositIds;
     }
 
-    // ?????????
+    /**
+     * @dev Returns the total amount of all pending deposits
+     * @return totalAmount The total amount of pending deposits in USDC
+     */
     function getTotalPendingAmount() external view returns (uint256 totalAmount) {
         for (uint256 i = 0; i < _pendingDepositIds.length; i++) {
             Deposit storage deposit = _approvedDeposits[_pendingDepositIds[i]];
@@ -412,5 +610,43 @@ contract Zapper is AccessControl, Ownable, Pausable {
                 totalAmount += deposit.amount;
             }
         }
+    }
+
+    /**
+     * @dev Pauses the contract, preventing new deposits and withdrawals
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @dev Unpauses the contract, allowing new deposits and withdrawals
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /**
+     * @dev Returns the address of the Uniswap V2 router
+     * @return The router address
+     */
+    function router() public view returns (address) {
+        return address(_router);
+    }
+
+    /**
+     * @dev Returns the address of the USDC token contract
+     * @return The USDC token address
+     */
+    function usdc() public view returns (address) {
+        return address(_usdc);
+    }
+
+    /**
+     * @dev Returns the address of the silo contract
+     * @return The silo contract address
+     */
+    function silo() public view returns (address) {
+        return address(_silo);
     }
 }

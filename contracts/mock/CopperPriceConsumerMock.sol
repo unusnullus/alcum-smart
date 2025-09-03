@@ -14,8 +14,8 @@ contract CopperPriceConsumerMock is ChainlinkClient, ICopperPriceConsumer {
     bytes32 private jobId;
     uint256 private fee; // Check fee inside job
 
-    constructor(address _oracle, bytes32 _jobId, uint256 _fee, address _link) {
-        price = 5;
+    constructor() {
+        price = 500000000;
     }
 
     function requestCopperPrice() public returns (bytes32 requestId) {

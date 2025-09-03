@@ -6,7 +6,7 @@ interface IEpochManager {
 
     function epochStart() external view returns (uint256);
 
-    function EPOCH_DURATION() external view returns (uint256);
+    function epochDuration() external view returns (uint256);
 
     function nextEpoch() external;
 

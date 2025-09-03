@@ -151,9 +151,9 @@ User Action                    Contract Function
 - **depositId**: Unique identifier generated when deposit is created
 
 ### Important Addresses
-- **Zapper Contract**: `0x7F1e09F92b20ee09F0A535Aa2a068d39af27e6f3`
-- **CUP Token**: `0x9E1cC5d32cA6a9F3d2286B6b66193DaB14413a39`
-- **xCUP Vault**: `0x56940642432323bD3050675CcE1ff7E45C498afc`
+- **Zapper Contract**: `0xD10B1B9eC5E0bd43107CCb501AC3a5E8Cbc2b358`
+- **CUP Token**: `0xa7bE870C21b79EcA2E16baaB1294436e37aD72D6`
+- **xCUP Vault**: `0x3d47C937F0706dB77339aa1c26aBCc12C644c882`
 - **Copper Price Consumer**: `0xdAfD3DB6a8EaD46d912935cE0eb1277539eecAeC`
 
 ## What Happens Behind the Scenes

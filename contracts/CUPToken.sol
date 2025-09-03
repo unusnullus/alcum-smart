@@ -12,8 +12,6 @@ contract CUPToken is ERC20, AccessControl, Ownable {
 
     constructor() ERC20("CUP", "CUP") Ownable(_msgSender()) {
         _grantRole(DEFAULT_ADMIN_ROLE, _msgSender());
-
-        _mint(_msgSender(), 100000000000e6);
     }
 
     function mint(address account, uint256 value) external onlyRole(MINTER_ROLE) {
