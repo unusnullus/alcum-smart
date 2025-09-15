@@ -102,6 +102,88 @@ Important
 - If using mainnet/testnet fork, set `RPC_URL` to a reliable endpoint (Infura/Alchemy/etc.).
 - Hardhat warns on unsupported Node.js versions; Node 20 LTS is recommended.
 
+## Visual Architecture
+
+### System Overview
+
+```mermaid
+flowchart LR
+  subgraph Users
+    U[User EOA]
+    B[Backend Host EOA]
+    C[Curator EOA]
+  end
+
+  subgraph Protocol
+    Z[Zapper]
+    S[Silo (USDC)]
+    R[Uniswap V2 Router]
+    V[xCUP (ERC-4626) Vault]
+    T[CUPToken]
+    E[EpochManager]
+    O[Copper Price Consumer]
+    SE[SettlementEngine]
+    HA[HostAdapter]
+  end
+
+  %% User deposit path (on-chain)
+  U -- zapAndDeposit(token,amount) --> Z
+  Z -- swap --> R
+  R -- USDC --> S
+  C -- approveDeposit/approveProportionally --> Z
+  Z -- price --> O
+  Z -- deposit CUP --> V
+  V -- mint xCUP --> U
+
+  %% Redeem path
+  U -- redeem(shares) --> Z
+  Z -- redeem --> V
+  V -- return CUP --> Z
+  Z -- convert via price --> O
+  Z -- USDC --> S
+  Z -- USDC payout --> U
+
+  %% Host-to-host external path
+  B -- registerExternalDepositFor --> HA
+  HA -- forward (HOST_INTEGRATION_ROLE) --> Z
+  C -- approveExternalDepositWithPrice --> HA
+  HA -- forward --> Z
+  U -- claimDeposit --> Z
+  Z -- mint xCUP to beneficiary --> V
+
+  %% Epoch and revenue
+  Z --- E
+  SE -- distribute revenue --> V
+  SE -- mint CUP (role) --> T
+```
+
+### Async Approval & Claim Timeline
+
+```mermaid
+sequenceDiagram
+  participant User
+  participant Zapper
+  participant Router
+  participant Silo
+  participant Curator
+  participant Oracle
+  participant Vault
+
+  User->>Zapper: zapAndDeposit(token, amount)
+  Zapper->>Router: swap token->USDC
+  Router-->>Silo: transfer USDC
+  Zapper-->>User: emit ZapAndDeposit (pending deposit)
+
+  Curator->>Zapper: approveDeposit(...)
+  Zapper-->>Curator: emit DepositApproved
+
+  User->>Zapper: claimDeposit(depositId)
+  Zapper->>Oracle: getCopperPrice()
+  Zapper->>Vault: deposit CUP, mint xCUP to user
+  Vault-->>User: xCUP shares
+  Zapper-->>User: emit DepositClaimed
+```
+
 ## Support & Contributing
 
 Issues and contributions are welcome.
