@@ -411,9 +411,25 @@ async function main() {
     .filter(Boolean);
   console.log("register tx hash:", rc1.transactionHash);
 
-  // You may also grab the depositId from Zapper's ExternalDepositRegistered event using Zapper ABI
-  // For simplicity, assume you track depositId off-chain (returned by call):
-  const depositId = await hostAdapterHost.registerExternalDepositFor.staticCall(beneficiary, usdcAmount, tag);
+  // Extract depositId from event logs (e.g., ExternalDepositRegistered)
+  // You may need to use the Zapper ABI if the event is emitted by Zapper, not HostAdapter
+  // Example assumes hostAdapterHost.interface has the event, otherwise use the correct ABI:
+  let depositId;
+  for (const log of rc1.logs) {
+    let parsed;
+    try {
+      parsed = hostAdapterHost.interface.parseLog(log);
+    } catch {
+      continue;
+    }
+    if (parsed && parsed.name === "ExternalDepositRegistered") {
+      depositId = parsed.args.depositId;
+      break;
+    }
+  }
+  if (!depositId) {
+    throw new Error("depositId not found in logs");
+  }
   console.log("depositId:", depositId);
 
   // 2) Approve with price snapshot (curator)
