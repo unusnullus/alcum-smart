@@ -108,53 +108,43 @@ Important
 
 ```mermaid
 flowchart LR
-  subgraph Users
-    U[User EOA]
-    B[Backend Host EOA]
-    C[Curator EOA]
-  end
+  U[User EOA]
+  B[Backend Host EOA]
+  C[Curator EOA]
+  Z[Zapper]
+  S[Silo USDC]
+  R[Uniswap V2 Router]
+  V[xCUP Vault]
+  T[CUPToken]
+  E[EpochManager]
+  O[Copper Price Consumer]
+  SE[SettlementEngine]
+  HA[HostAdapter]
 
-  subgraph Protocol
-    Z[Zapper]
-    S[Silo (USDC)]
-    R[Uniswap V2 Router]
-    V[xCUP (ERC-4626) Vault]
-    T[CUPToken]
-    E[EpochManager]
-    O[Copper Price Consumer]
-    SE[SettlementEngine]
-    HA[HostAdapter]
-  end
+  U -->|zapAndDeposit| Z
+  Z -->|swap| R
+  R -->|USDC| S
+  C -->|approve*| Z
+  Z -->|price| O
+  Z -->|deposit CUP| V
+  V -->|mint xCUP| U
 
-  %% User deposit path (on-chain)
-  U -- zapAndDeposit(token,amount) --> Z
-  Z -- swap --> R
-  R -- USDC --> S
-  C -- approveDeposit/approveProportionally --> Z
-  Z -- price --> O
-  Z -- deposit CUP --> V
-  V -- mint xCUP --> U
+  U -->|redeem| Z
+  Z -->|redeem| V
+  V -->|return CUP| Z
+  Z -->|USDC| S
+  Z -->|payout| U
 
-  %% Redeem path
-  U -- redeem(shares) --> Z
-  Z -- redeem --> V
-  V -- return CUP --> Z
-  Z -- convert via price --> O
-  Z -- USDC --> S
-  Z -- USDC payout --> U
+  B -->|registerExternalDepositFor| HA
+  HA -->|forward| Z
+  C -->|approveExternalDepositWithPrice| HA
+  HA -->|forward| Z
+  U -->|claimDeposit| Z
+  Z -->|mint xCUP to beneficiary| V
 
-  %% Host-to-host external path
-  B -- registerExternalDepositFor --> HA
-  HA -- forward (HOST_INTEGRATION_ROLE) --> Z
-  C -- approveExternalDepositWithPrice --> HA
-  HA -- forward --> Z
-  U -- claimDeposit --> Z
-  Z -- mint xCUP to beneficiary --> V
-
-  %% Epoch and revenue
   Z --- E
-  SE -- distribute revenue --> V
-  SE -- mint CUP (role) --> T
+  SE -->|distribute revenue| V
+  SE -->|mint CUP| T
 ```
 
 ### Async Approval & Claim Timeline
