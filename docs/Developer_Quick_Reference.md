@@ -262,3 +262,258 @@ const allowance = await token.allowance(userAddress, zapperAddress);
 - GitHub Issues: [Repository Issues](https://github.com/your-repo/issues)
 - Discord: [Community Channel](https://discord.gg/your-channel)
 - Documentation: [Project Docs](https://docs.your-project.com) 
+
+## External Depositor (HostAdapter) Integration
+
+This section explains the host-to-host integration that allows a backend service to register “external deposits” without on-chain USDC movement, have curators approve the deposit with a price snapshot, and enable a designated EOA beneficiary to claim xCUP at a later stage.
+
+Key components:
+- `contracts/Zapper.sol`: main protocol contract (extended to support external deposits)
+- `contracts/HostAdapter.sol`: isolated adapter that forwards calls to `Zapper` using dedicated roles
+
+Important properties:
+- No USDC is transferred on `registerExternalDepositFor`. It records numbers only.
+- Approval stores a price snapshot and a fixed CUP amount to mint on claim.
+- Claim mints xCUP to the designated `beneficiary` EOA.
+- Registrations are logically irreversible after approval: once approved, you cannot alter amount/tag/beneficiary (except where explicitly allowed prior to approval). After claim, the record is finalized.
+
+### Roles and Access
+- In `Zapper`:
+  - `HOST_INTEGRATION_ROLE`: allowed to register external deposits and update beneficiary prior to approval
+  - `VAULT_CURATOR_ROLE`: allowed to approve deposits (including external with a price snapshot)
+- In `HostAdapter`:
+  - `HOST_OPERATOR_ROLE`: allowed to call register/update functions on the adapter
+  - `CURATOR_OPERATOR_ROLE`: allowed to approve external deposits via the adapter
+
+Granting roles (example):
+1) Grant the adapter the integration role on `Zapper` so it can forward calls:
+   - Zapper: `grantRole(HOST_INTEGRATION_ROLE, hostAdapterAddress)`
+2) Grant your operations EOAs roles on the adapter:
+   - HostAdapter: `grantRole(HOST_OPERATOR_ROLE, backendEOA)`
+   - HostAdapter: `grantRole(CURATOR_OPERATOR_ROLE, curatorEOA)`
+
+### On-chain Interface
+
+In `Zapper`:
+```solidity
+// Register external deposit (no token movement)
+function registerExternalDepositFor(address beneficiary, uint256 usdcAmount, bytes32 tag)
+  external returns (bytes32 depositId);
+
+// Update beneficiary before approval
+function setDepositBeneficiary(bytes32 depositId, address beneficiary) external;
+
+// Approve with price snapshot; records fixed CUP amount for claim
+function approveExternalDepositWithPrice(bytes32 depositId, uint256 approvedUsdc, uint256 price) external;
+
+// Claim (by user or beneficiary); mints xCUP to beneficiary
+function claimDeposit(bytes32 depositId) external returns (uint256 shares);
+```
+
+In `HostAdapter` (for isolation):
+```solidity
+function registerExternalDepositFor(address beneficiary, uint256 usdcAmount, bytes32 tag)
+  external onlyRole(HOST_OPERATOR_ROLE) returns (bytes32 depositId);
+
+function setDepositBeneficiary(bytes32 depositId, address beneficiary)
+  external onlyRole(HOST_OPERATOR_ROLE);
+
+function approveExternalDepositWithPrice(bytes32 depositId, uint256 approvedUsdc, uint256 price)
+  external onlyRole(CURATOR_OPERATOR_ROLE);
+```
+
+### Events to Monitor
+```solidity
+// Emitted by Zapper when external deposit is registered
+event ExternalDepositRegistered(address indexed createdBy, address indexed beneficiary, bytes32 indexed depositId, bytes32 tag, uint256 usdcAmount);
+
+// Standard approval event (for both normal and external deposits)
+event DepositApproved(bytes32 depositId, uint256 approvedAmount);
+
+// Rich claim event with full context
+event DepositClaimedFor(bytes32 indexed depositId, address indexed user, address indexed beneficiary, address claimedBy, bytes32 tag, uint256 shares);
+```
+
+### End-to-End Flow (External)
+1. Backend (host) registers an external deposit with a beneficiary and tag using `HostAdapter.registerExternalDepositFor`.
+2. Curator approves the external deposit using `HostAdapter.approveExternalDepositWithPrice`, providing:
+   - `approvedUsdc`: amount of USDC-equivalent to approve
+   - `price`: the copper price snapshot used to compute fixed CUP
+3. Beneficiary (or originator) calls `Zapper.claimDeposit(depositId)` and receives xCUP minted to the `beneficiary` address.
+
+Irreversibility notes:
+- Before approval: beneficiary can be adjusted by host via `setDepositBeneficiary`.
+- After approval: deposit amounts and beneficiary are locked for that `depositId`.
+- After claim: the process is finalized; you cannot unclaim.
+
+Operational requirements:
+- Zapper must hold or be able to mint sufficient CUP to fund the vault deposit at claim time.
+- Epoch must be active (claim guarded by epoch checks).
+
+### Security Guidance
+- Use separate EOAs for host operator and curator operator.
+- Restrict `HOST_OPERATOR_ROLE` and `CURATOR_OPERATOR_ROLE` to the adapter; restrict `HOST_INTEGRATION_ROLE` to the adapter on Zapper.
+- Log and reconcile `ExternalDepositRegistered` ↔ `DepositApproved` ↔ `DepositClaimedFor` with your backend tracking IDs (`tag`).
+- Snapshot price carefully (data source governance, integrity, and precision).
+
+---
+
+## How-To: Build, Sign, and Send Transactions
+
+Below are examples for calling `HostAdapter.registerExternalDepositFor` and `HostAdapter.approveExternalDepositWithPrice` via Node.js (Ethers v6), Java (web3j), and raw JSON-RPC using Infura.
+
+Assumptions:
+- Network: Sepolia (replace with your target)
+- RPC: `https://sepolia.infura.io/v3/<INFURA_PROJECT_ID>`
+- Addresses: `hostAdapterAddress`, `zapperAddress`, `xcupAddress` already deployed
+
+### Node.js (Ethers v6)
+```bash
+npm install ethers
+```
+
+```javascript
+import { ethers } from "ethers";
+
+const INFURA_ID = process.env.INFURA_ID; // "<INFURA_PROJECT_ID>"
+const RPC_URL = `https://sepolia.infura.io/v3/${INFURA_ID}`;
+
+// Backend operator (has HOST_OPERATOR_ROLE on HostAdapter)
+const PRIVATE_KEY_HOST = process.env.PRIVATE_KEY_HOST;
+// Curator operator (has CURATOR_OPERATOR_ROLE on HostAdapter)
+const PRIVATE_KEY_CURATOR = process.env.PRIVATE_KEY_CURATOR;
+
+const hostAdapterAddress = "0xYourHostAdapter";
+
+// Minimal ABI for HostAdapter
+const hostAdapterAbi = [
+  "function registerExternalDepositFor(address beneficiary, uint256 usdcAmount, bytes32 tag) external returns (bytes32)",
+  "function approveExternalDepositWithPrice(bytes32 depositId, uint256 approvedUsdc, uint256 price) external"
+];
+
+async function main() {
+  const provider = new ethers.JsonRpcProvider(RPC_URL);
+
+  // 1) Register external deposit (host)
+  const hostWallet = new ethers.Wallet(PRIVATE_KEY_HOST, provider);
+  const hostAdapterHost = new ethers.Contract(hostAdapterAddress, hostAdapterAbi, hostWallet);
+
+  const beneficiary = "0xBeneficiaryEOA";
+  const usdcAmount = 1000n * 10n ** 6n; // 1000 USDC with 6 decimals
+  const tag = ethers.encodeBytes32String("ORDER-12345");
+
+  const tx1 = await hostAdapterHost.registerExternalDepositFor(beneficiary, usdcAmount, tag);
+  const rc1 = await tx1.wait();
+  const depositRegistered = rc1.logs
+    .map(l => {
+      try { return hostAdapterHost.interface.parseLog(l); } catch { return null; }
+    })
+    .filter(Boolean);
+  console.log("register tx hash:", rc1.transactionHash);
+
+  // You may also grab the depositId from Zapper's ExternalDepositRegistered event using Zapper ABI
+  // For simplicity, assume you track depositId off-chain (returned by call):
+  const depositId = await hostAdapterHost.registerExternalDepositFor.staticCall(beneficiary, usdcAmount, tag);
+  console.log("depositId:", depositId);
+
+  // 2) Approve with price snapshot (curator)
+  const curatorWallet = new ethers.Wallet(PRIVATE_KEY_CURATOR, provider);
+  const hostAdapterCurator = new ethers.Contract(hostAdapterAddress, hostAdapterAbi, curatorWallet);
+
+  const approvedUsdc = usdcAmount; // approve full amount
+  const price = 500n; // example price scaling (match protocol expectations)
+
+  const tx2 = await hostAdapterCurator.approveExternalDepositWithPrice(depositId, approvedUsdc, price);
+  await tx2.wait();
+  console.log("approved tx hash:", tx2.hash);
+}
+
+main().catch(console.error);
+```
+
+### Java (web3j)
+```xml
+<!-- Maven -->
+<dependency>
+  <groupId>org.web3j</groupId>
+  <artifactId>core</artifactId>
+  <version>4.10.3</version>
+<\/dependency>
+```
+
+```java
+import org.web3j.protocol.Web3j;
+import org.web3j.protocol.http.HttpService;
+import org.web3j.crypto.Credentials;
+import org.web3j.tx.gas.DefaultGasProvider;
+import org.web3j.abi.FunctionEncoder;
+import org.web3j.abi.datatypes.Function;
+import org.web3j.abi.datatypes.Address;
+import org.web3j.abi.datatypes.generated.Bytes32;
+import org.web3j.abi.datatypes.generated.Uint256;
+import org.web3j.protocol.core.methods.request.Transaction;
+import org.web3j.protocol.core.methods.response.EthSendTransaction;
+import java.math.BigInteger;
+import java.util.Arrays;
+
+public class HostAdapterClient {
+  public static void main(String[] args) throws Exception {
+    String infuraId = System.getenv("INFURA_ID");
+    String rpcUrl = "https://sepolia.infura.io/v3/" + infuraId;
+    Web3j web3 = Web3j.build(new HttpService(rpcUrl));
+
+    String privateKeyHost = System.getenv("PRIVATE_KEY_HOST");
+    Credentials hostCreds = Credentials.create(privateKeyHost);
+
+    String hostAdapter = "0xYourHostAdapter";
+    String beneficiary = "0xBeneficiaryEOA";
+    BigInteger usdcAmount = new BigInteger("1000000000"); // 1000e6
+    byte[] tagBytes = Arrays.copyOf("ORDER-12345".getBytes(), 32);
+
+    // 1) encode registerExternalDepositFor
+    Function registerFn = new Function(
+      "registerExternalDepositFor",
+      Arrays.asList(new Address(beneficiary), new Uint256(usdcAmount), new Bytes32(tagBytes)),
+      Arrays.asList()
+    );
+    String data = FunctionEncoder.encode(registerFn);
+
+    Transaction tx = Transaction.createFunctionCallTransaction(
+      hostCreds.getAddress(), null, DefaultGasProvider.GAS_PRICE, DefaultGasProvider.GAS_LIMIT, hostAdapter, BigInteger.ZERO, data
+    );
+
+    EthSendTransaction sent = web3.ethSendTransaction(tx).send();
+    System.out.println("register tx hash: " + sent.getTransactionHash());
+  }
+}
+```
+
+### Raw JSON-RPC
+
+Build and send a raw signed transaction to Infura.
+
+1) Build the transaction data for `registerExternalDepositFor(address,uint256,bytes32)` using an ABI encoder (e.g., `ethers`, `web3j`).
+2) Sign offline with your private key, getting `0x<signed_raw_tx>`.
+3) Submit via JSON-RPC:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "eth_sendRawTransaction",
+  "params": ["0xSIGNED_RAW_TRANSACTION"],
+  "id": 1
+}
+```
+
+Infura endpoint:
+```
+POST https://sepolia.infura.io/v3/<INFURA_PROJECT_ID>
+Content-Type: application/json
+```
+
+### Common Pitfalls
+- Ensure the adapter has been granted `HOST_INTEGRATION_ROLE` on `Zapper`.
+- Ensure the operator EOAs have roles on `HostAdapter`.
+- Use consistent price scaling across approval/claim (match protocol’s `price` scaling).
+- xCUP mint at claim requires sufficient CUP available to `Zapper`.
+- The external registration call itself does not transfer USDC; it’s an accounting/authorization step.

@@ -50,6 +50,8 @@ contract Zapper is
 
     /// @dev Role identifier for vault curators who can approve/decline deposits
     bytes32 public constant VAULT_CURATOR_ROLE = keccak256("VAULT_CURATOR_ROLE");
+    /// @dev Role identifier for host-to-host integrations (e.g., backend adapter)
+    bytes32 public constant HOST_INTEGRATION_ROLE = keccak256("HOST_INTEGRATION_ROLE");
 
     /// @dev CUP token contract address
     IERC20 private _cup;
@@ -80,11 +82,20 @@ contract Zapper is
      * @param approved Whether the deposit has been approved
      */
     struct Deposit {
-        address user;
-        bytes32 depositId;
-        uint256 amount;
-        uint256 approvedAmount;
-        bool approved;
+        address user;            // originator (payer) for on-chain deposits
+        bytes32 depositId;       // unique identifier
+        uint256 amount;          // pending USDC value
+        uint256 approvedAmount;  // approved USDC value
+        bool approved;           // approved flag
+
+        // Extended fields for host-to-host external deposits
+        address beneficiary;     // who will receive xCUP on claim
+        address createdBy;       // who initiated the deposit (EOA/adapter)
+        address claimedBy;       // who executed the claim
+        bool isExternal;         // true if created via external adapter flow
+        bytes32 tag;             // integration tag/ID for marking
+        uint256 approvedCupAmount; // fixed CUP amount approved (for external)
+        uint256 priceSnapshot;     // price used for approval (for external)
     }
 
     /**
@@ -110,6 +121,16 @@ contract Zapper is
      * @param shares The number of vault shares received
      */
     event DepositClaimed(bytes32 depositId, address user, uint256 shares);
+
+    /// @dev Richer claim event for external/beneficiary based flows
+    event DepositClaimedFor(
+        bytes32 indexed depositId,
+        address indexed user,
+        address indexed beneficiary,
+        address claimedBy,
+        bytes32 tag,
+        uint256 shares
+    );
 
     /**
      * @dev Emitted when a vault curator approves a deposit
@@ -156,6 +177,15 @@ contract Zapper is
      * @param amount The amount of tokens zapped and deposited
      */
     event ZapAndDeposit(address indexed router, address indexed tokenIn, uint256 amount);
+
+    /// @dev Emitted when an external deposit is registered (no token movement)
+    event ExternalDepositRegistered(
+        address indexed createdBy,
+        address indexed beneficiary,
+        bytes32 indexed depositId,
+        bytes32 tag,
+        uint256 usdcAmount
+    );
 
     /**
      * @dev
@@ -244,7 +274,40 @@ contract Zapper is
             depositId: depositId,
             amount: amount,
             approvedAmount: 0,
-            approved: false
+            approved: false,
+            beneficiary: address(0),
+            createdBy: _msgSender(),
+            claimedBy: address(0),
+            isExternal: false,
+            tag: bytes32(0),
+            approvedCupAmount: 0,
+            priceSnapshot: 0
+        });
+        _pendingDepositIds.push(depositId);
+    }
+
+    /**
+     * @dev Records a new external deposit (no token transfer) with beneficiary and tag
+     */
+    function _recordExternalDeposit(uint256 usdcAmount, address beneficiary_, bytes32 tag_)
+        internal
+        returns (bytes32 depositId)
+    {
+        require(beneficiary_ != address(0), "Invalid beneficiary");
+        depositId = keccak256(abi.encodePacked(_msgSender(), block.timestamp, usdcAmount, beneficiary_, tag_));
+        _approvedDeposits[depositId] = Deposit({
+            user: _msgSender(),
+            depositId: depositId,
+            amount: usdcAmount,
+            approvedAmount: 0,
+            approved: false,
+            beneficiary: beneficiary_,
+            createdBy: _msgSender(),
+            claimedBy: address(0),
+            isExternal: true,
+            tag: tag_,
+            approvedCupAmount: 0,
+            priceSnapshot: 0
         });
         _pendingDepositIds.push(depositId);
     }
@@ -375,6 +438,34 @@ contract Zapper is
     }
 
     /**
+     * @dev Host-to-host integration: register an external deposit for a beneficiary with a tag
+     * No token movement occurs here; values are informational until approval/claim.
+     */
+    function registerExternalDepositFor(
+        address beneficiary_,
+        uint256 usdcAmount,
+        bytes32 tag_
+    ) external whenNotPaused onlyRole(HOST_INTEGRATION_ROLE) returns (bytes32 depositId) {
+        require(usdcAmount > 0, "Invalid amount");
+        depositId = _recordExternalDeposit(usdcAmount, beneficiary_, tag_);
+        emit ExternalDepositRegistered(_msgSender(), beneficiary_, depositId, tag_, usdcAmount);
+    }
+
+    /**
+     * @dev Optional: allow host to update beneficiary before approval
+     */
+    function setDepositBeneficiary(bytes32 depositId, address beneficiary_)
+        external
+        whenNotPaused
+        onlyRole(HOST_INTEGRATION_ROLE)
+    {
+        require(beneficiary_ != address(0), "Invalid beneficiary");
+        Deposit storage d = _approvedDeposits[depositId];
+        require(d.user != address(0) && !d.approved, "Not pending");
+        d.beneficiary = beneficiary_;
+    }
+
+    /**
      * @dev Allows users to withdraw their deposit before it's approved
      * @param depositId The unique identifier of the deposit to withdraw
      */
@@ -416,6 +507,31 @@ contract Zapper is
         deposit.approvedAmount = approvedAmount;
 
         emit DepositApproved(depositId, approvedAmount);
+    }
+
+    /**
+     * @dev Approve an external deposit with an explicit price snapshot.
+     * Records a fixed CUP amount to be used on claim.
+     */
+    function approveExternalDepositWithPrice(
+        bytes32 depositId,
+        uint256 approvedUsdc,
+        uint256 price
+    ) external whenNotPaused whenEpochActive onlyRole(VAULT_CURATOR_ROLE) {
+        Deposit storage deposit = _approvedDeposits[depositId];
+        require(deposit.user != address(0), "Deposit not found");
+        require(deposit.isExternal, "Not external deposit");
+        require(!deposit.approved, "Deposit already approved");
+        require(approvedUsdc > 0, "Approved amount must be greater than 0");
+        require(approvedUsdc <= deposit.amount, "Approved amount exceeds deposit amount");
+        require(price > 0, "Invalid price");
+
+        deposit.approved = true;
+        deposit.approvedAmount = approvedUsdc;
+        deposit.priceSnapshot = price;
+        deposit.approvedCupAmount = approvedUsdc * price;
+
+        emit DepositApproved(depositId, approvedUsdc);
     }
 
     /**
@@ -499,9 +615,10 @@ contract Zapper is
         Deposit storage deposit = _approvedDeposits[depositId];
         uint256 currentCopperPrice = getCopperPrice();
 
-        require(deposit.user == _msgSender(), "Invalid user");
+        // Allow either original user or designated beneficiary to claim
+        address beneficiary_ = deposit.beneficiary == address(0) ? deposit.user : deposit.beneficiary;
+        require(_msgSender() == deposit.user || _msgSender() == beneficiary_, "Not authorized to claim");
         require(deposit.approved, "Deposit not approved");
-        require(currentCopperPrice > 0, "Copper price is 0");
         require(deposit.approvedAmount > 0, "No approved amount");
 
         uint256 approvedAmount = deposit.approvedAmount;
@@ -517,8 +634,15 @@ contract Zapper is
             deposit.approved = false;
         }
 
-        // Convert approved USDC amount to CUP value using copper price
-        uint256 cupValue = approvedAmount * currentCopperPrice;
+        // Determine CUP amount to deposit
+        uint256 cupValue;
+        if (deposit.isExternal) {
+            require(deposit.approvedCupAmount > 0 && deposit.priceSnapshot > 0, "No snapshot");
+            cupValue = deposit.approvedCupAmount;
+        } else {
+            require(currentCopperPrice > 0, "Copper price is 0");
+            cupValue = approvedAmount * currentCopperPrice;
+        }
 
         console.log("cupValue", cupValue);
 
@@ -526,9 +650,12 @@ contract Zapper is
 
         // Deposit CUP to vault and get xCUP shares
         _cup.approve(address(_vault), cupValue);
-        shares = _vault.deposit(cupValue, _msgSender());
+        shares = _vault.deposit(cupValue, beneficiary_);
 
-        emit DepositClaimed(depositId, _msgSender(), shares);
+        // mark claimer and emit events
+        deposit.claimedBy = _msgSender();
+        emit DepositClaimed(depositId, beneficiary_, shares);
+        emit DepositClaimedFor(depositId, deposit.user, beneficiary_, _msgSender(), deposit.tag, shares);
     }
 
     /**
