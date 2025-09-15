@@ -454,7 +454,7 @@ main().catch(console.error);
   <groupId>org.web3j</groupId>
   <artifactId>core</artifactId>
   <version>4.10.3</version>
-<\/dependency>
+</dependency>
 ```
 
 ```java
