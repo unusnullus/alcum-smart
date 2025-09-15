@@ -5,9 +5,14 @@ libs = ['node_modules', 'lib']
 test = 'test'
 cache_path  = 'cache_forge'
 solc = "0.8.24"
+ast = true
 
 remappings = [
     "forge-std/=lib/forge-std/src/",
     "@contracts/=contracts/",
     "@test/=test/",
+]
+
+fs_permissions = [
+    { access = "read", path = "./out" }
 ]
