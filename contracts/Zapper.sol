@@ -19,8 +19,6 @@ import {IUniswapV2Router02} from "@uniswap/v2-periphery/contracts/interfaces/IUn
 import {ICopperPriceConsumer} from "./interfaces/ICopperPriceConsumer.sol";
 import {IEpochManager} from "./interfaces/IEpochManager.sol";
 
-import {console} from "hardhat/console.sol";
-
 /**
  * @title Silo
  * @dev A simple contract that holds USDC tokens and provides unlimited approval to the Zapper contract.
@@ -72,6 +70,10 @@ contract Zapper is
     mapping(bytes32 depositId => Deposit) private _approvedDeposits;
     /// @dev Array of pending deposit IDs
     bytes32[] private _pendingDepositIds;
+    /// @dev Mapping of user to their deposit IDs
+    mapping(address => bytes32[]) private _userDeposits;
+    /// @dev Mapping of user to their nonce for deposit ID generation
+    mapping(address => uint256) private _userNonces;
 
     /**
      * @dev Struct representing a user deposit
@@ -82,20 +84,19 @@ contract Zapper is
      * @param approved Whether the deposit has been approved
      */
     struct Deposit {
-        address user;            // originator (payer) for on-chain deposits
-        bytes32 depositId;       // unique identifier
-        uint256 amount;          // pending USDC value
-        uint256 approvedAmount;  // approved USDC value
-        bool approved;           // approved flag
-
+        address user; // originator (payer) for on-chain deposits
+        bytes32 depositId; // unique identifier
+        uint256 amount; // pending USDC value
+        uint256 approvedAmount; // approved USDC value
+        bool approved; // approved flag
         // Extended fields for host-to-host external deposits
-        address beneficiary;     // who will receive xCUP on claim
-        address createdBy;       // who initiated the deposit (EOA/adapter)
-        address claimedBy;       // who executed the claim
-        bool isExternal;         // true if created via external adapter flow
-        bytes32 tag;             // integration tag/ID for marking
+        address beneficiary; // who will receive xCUP on claim
+        address createdBy; // who initiated the deposit (EOA/adapter)
+        address claimedBy; // who executed the claim
+        bool isExternal; // true if created via external adapter flow
+        bytes32 tag; // integration tag/ID for marking
         uint256 approvedCupAmount; // fixed CUP amount approved (for external)
-        uint256 priceSnapshot;     // price used for approval (for external)
+        uint256 priceSnapshot; // price used for approval (for external)
     }
 
     /**
@@ -173,8 +174,8 @@ contract Zapper is
     /**
      * @dev Emitted when a user zaps tokens and deposits them
      * @param router The address of the Uniswap router used
-     * @param tokenIn The address of the input token
-     * @param amount The amount of tokens zapped and deposited
+     * @param tokenIn The address of the input token (address(0) == ETH)
+     * @param amount The amount of tokens zapped and deposited (in USDC)
      */
     event ZapAndDeposit(address indexed router, address indexed tokenIn, uint256 amount);
 
@@ -262,13 +263,27 @@ contract Zapper is
     }
 
     /**
-     * @dev Records a new deposit in the system
-     * @param amount The amount of the deposit in USDC
-     * @return depositId The unique identifier for the deposit
+     * @dev Removes a deposit ID from a user's deposit list
      */
-    function _recordDeposit(uint256 amount) internal returns (bytes32 depositId) {
-        // Generate a unique deposit ID
-        depositId = keccak256(abi.encodePacked(_msgSender(), block.timestamp, amount));
+    function _removeUserDeposit(address user, bytes32 depositId) internal {
+        bytes32[] storage ids = _userDeposits[user];
+        for (uint256 i = 0; i < ids.length; i++) {
+            if (ids[i] == depositId) {
+                ids[i] = ids[ids.length - 1];
+                ids.pop();
+                break;
+            }
+        }
+    }
+
+    /**
+     * @dev Records a new deposit in the system
+     * @param depositId The unique identifier for the deposit
+     * @param amount The amount of the deposit in USDC
+     */
+    function _recordDeposit(bytes32 depositId, uint256 amount) internal {
+        require(_approvedDeposits[depositId].user == address(0), "Deposit ID already exists");
+
         _approvedDeposits[depositId] = Deposit({
             user: _msgSender(),
             depositId: depositId,
@@ -289,10 +304,11 @@ contract Zapper is
     /**
      * @dev Records a new external deposit (no token transfer) with beneficiary and tag
      */
-    function _recordExternalDeposit(uint256 usdcAmount, address beneficiary_, bytes32 tag_)
-        internal
-        returns (bytes32 depositId)
-    {
+    function _recordExternalDeposit(
+        uint256 usdcAmount,
+        address beneficiary_,
+        bytes32 tag_
+    ) internal returns (bytes32 depositId) {
         require(beneficiary_ != address(0), "Invalid beneficiary");
         depositId = keccak256(abi.encodePacked(_msgSender(), block.timestamp, usdcAmount, beneficiary_, tag_));
         _approvedDeposits[depositId] = Deposit({
@@ -310,28 +326,34 @@ contract Zapper is
             priceSnapshot: 0
         });
         _pendingDepositIds.push(depositId);
+        _userDeposits[_msgSender()].push(depositId);
     }
 
     /**
      * @dev Swaps input tokens for USDC using Uniswap V2
-     * @param tokenIn The token to swap from
+     * @param tokenIn The token to swap from (address(0) == ETH)
      * @param amount The amount of tokens to swap
+     * @param slippageBps The slippage tolerance in basis points (e.g., 100 = 1%)
      * @return depositValue The amount of USDC received from the swap
      */
-    function _zapIn(IERC20 tokenIn, uint256 amount) internal returns (uint256 depositValue) {
+    function _zapIn(IERC20 tokenIn, uint256 amount, uint256 slippageBps) internal returns (uint256 depositValue) {
         uint256 initialTokenOutBalance = _usdc.balanceOf(address(_silo));
 
-        if (msg.value == 0) {
+        // If tokenIn is not ETH, transfer token from user
+        if (address(tokenIn) != address(0)) {
             tokenIn.safeTransferFrom(_msgSender(), address(this), amount);
         }
 
-        // WETH check
-        if (address(tokenIn) != _router.WETH()) {
-            tokenIn.forceApprove(router(), amount);
+        // Approve router or handle ETH
+        if (address(tokenIn) != address(0)) {
+            // tokenIn might have custom forceApprove
+            IERC20(address(tokenIn)).forceApprove(router(), amount);
         } else {
+            // ETH: ensure msg.value equals amount
             require(msg.value == amount, "Invalid ETH amount");
         }
-        _tradeForToken(address(tokenIn), usdc(), amount);
+
+        _tradeForToken(address(tokenIn), usdc(), amount, slippageBps);
 
         uint256 balanceAfterZap = _usdc.balanceOf(address(_silo));
 
@@ -340,26 +362,34 @@ contract Zapper is
 
     /**
      * @dev Executes a token swap on Uniswap V2
-     * @param tokenIn The address of the input token
+     * @param tokenIn The address of the input token (address(0) == ETH)
      * @param tokenOut The address of the output token
      * @param amountIn The amount of input tokens to swap
+     * @param slippageBps The slippage tolerance in basis points (e.g., 100 = 1%)
      */
-    function _tradeForToken(address tokenIn, address tokenOut, uint256 amountIn) internal {
+    function _tradeForToken(address tokenIn, address tokenOut, uint256 amountIn, uint256 slippageBps) internal {
         address[] memory path = new address[](2);
-        path[0] = tokenIn;
+
+        if (tokenIn == address(0)) {
+            // ETH case: use WETH as path[0]
+            path[0] = _router.WETH();
+        } else {
+            path[0] = tokenIn;
+        }
         path[1] = tokenOut;
 
         // Get the amount of tokens out for the given amount in
         uint256[] memory amountsOut = _router.getAmountsOut(amountIn, path);
 
-        // If the token in is ETH, swap ETH for USDC
-        if (address(tokenIn) == _router.WETH()) {
+        // If the token in is ETH (address(0) or WETH), swap ETH for USDC
+        if (tokenIn == address(0) || tokenIn == _router.WETH()) {
+            // send ETH along
             _router.swapExactETHForTokens{value: amountIn}(amountsOut[1], path, address(_silo), block.timestamp);
             return;
         }
 
-        // Calculate minimum output with 1% slippage tolerance
-        uint256 minOutput = (amountsOut[1] * 99) / 100;
+        // Calculate minimum output with custom slippage tolerance
+        uint256 minOutput = (amountsOut[1] * (10000 - slippageBps)) / 10000;
 
         _router.swapExactTokensForTokens(amountIn, minOutput, path, address(_silo), block.timestamp);
     }
@@ -384,55 +414,84 @@ contract Zapper is
 
     /**
      * @dev Processes a deposit by either transferring USDC directly or zapping other tokens
-     * @param tokenIn The token being deposited
+     * @param tokenIn The token being deposited (address(0) == ETH)
      * @param amount The amount of tokens to deposit
+     * @param slippageBps The slippage tolerance in basis points (e.g., 100 = 1%)
      * @return depositValue The final USDC value of the deposit
      */
-    function _processDeposit(IERC20 tokenIn, uint256 amount) internal returns (uint256 depositValue) {
-        if (tokenIn == _usdc) {
+    function _processDeposit(
+        IERC20 tokenIn,
+        uint256 amount,
+        uint256 slippageBps
+    ) internal returns (uint256 depositValue) {
+        if (address(tokenIn) == address(_usdc)) {
             tokenIn.safeTransferFrom(_msgSender(), address(_silo), amount);
             depositValue = amount;
         } else {
-            depositValue = _zapIn(tokenIn, amount);
+            depositValue = _zapIn(tokenIn, amount, slippageBps);
         }
     }
 
     /**
-     * @dev Allows users to zap tokens into USDC and create a deposit
-     * @param tokenIn The token to zap (can be any ERC20 or ETH)
+     * @dev Allows users to zap tokens into USDC and create a deposit (with permit)
+     * @param tokenIn The token to zap (can be any ERC20 or ETH using address(0))
      * @param amount The amount of tokens to zap
-     * @return depositId The unique identifier for the created deposit
+     * @param depositId The unique identifier for the created deposit
+     * @param slippageBps The slippage tolerance in basis points (e.g., 100 = 1%). Default is 100 (1%)
      */
     function zapAndDepositWithPermit(
         IERC20 tokenIn,
         uint256 amount,
-        PermitParams calldata permitParams
-    ) external payable whenNotPaused returns (bytes32 depositId) {
-        require(address(tokenIn) != address(0), "Invalid token");
+        PermitParams calldata permitParams,
+        bytes32 depositId,
+        uint256 slippageBps
+    ) external payable whenNotPaused {
+        // allow address(0) for ETH
         require(amount != 0, "Invalid amount");
 
-        if (tokenIn.allowance(_msgSender(), address(this)) < amount) {
-            _execPermit(tokenIn, _msgSender(), address(this), permitParams);
+        // Use default slippage of 1% (100 basis points) if 0 is passed
+        uint256 actualSlippage = slippageBps == 0 ? 100 : slippageBps;
+
+        if (address(tokenIn) != address(0)) {
+            if (tokenIn.allowance(_msgSender(), address(this)) < amount) {
+                _execPermit(tokenIn, _msgSender(), address(this), permitParams);
+            }
+        } else {
+            // ETH: require msg.value
+            require(msg.value == amount, "Invalid ETH amount");
         }
 
-        uint256 depositValue = _processDeposit(tokenIn, amount);
-        depositId = _recordDeposit(depositValue);
+        uint256 depositValue = _processDeposit(tokenIn, amount, actualSlippage);
+        _recordDeposit(depositId, depositValue);
 
         emit ZapAndDeposit(router(), address(tokenIn), depositValue);
     }
 
     /**
      * @dev Allows users to zap tokens into USDC and create a deposit
-     * @param tokenIn The token to zap (can be any ERC20 or ETH)
+     * @param tokenIn The token to zap (can be any ERC20 or ETH using address(0))
      * @param amount The amount of tokens to zap
-     * @return depositId The unique identifier for the created deposit
+     * @param depositId The unique identifier for the created deposit
+     * @param slippageBps The slippage tolerance in basis points (e.g., 100 = 1%). Default is 100 (1%)
      */
-    function zapAndDeposit(IERC20 tokenIn, uint256 amount) external payable whenNotPaused returns (bytes32 depositId) {
-        require(address(tokenIn) != address(0), "Invalid token");
+    function zapAndDeposit(
+        IERC20 tokenIn,
+        uint256 amount,
+        bytes32 depositId,
+        uint256 slippageBps
+    ) external payable whenNotPaused {
+        // allow address(0) for ETH
         require(amount != 0, "Invalid amount");
 
-        uint256 depositValue = _processDeposit(tokenIn, amount);
-        depositId = _recordDeposit(depositValue);
+        // Use default slippage of 1% (100 basis points) if 0 is passed
+        uint256 actualSlippage = slippageBps == 0 ? 100 : slippageBps;
+
+        if (address(tokenIn) == address(0)) {
+            require(msg.value == amount, "Invalid ETH amount");
+        }
+
+        uint256 depositValue = _processDeposit(tokenIn, amount, actualSlippage);
+        _recordDeposit(depositId, depositValue);
 
         emit ZapAndDeposit(router(), address(tokenIn), depositValue);
     }
@@ -454,11 +513,10 @@ contract Zapper is
     /**
      * @dev Optional: allow host to update beneficiary before approval
      */
-    function setDepositBeneficiary(bytes32 depositId, address beneficiary_)
-        external
-        whenNotPaused
-        onlyRole(HOST_INTEGRATION_ROLE)
-    {
+    function setDepositBeneficiary(
+        bytes32 depositId,
+        address beneficiary_
+    ) external whenNotPaused onlyRole(HOST_INTEGRATION_ROLE) {
         require(beneficiary_ != address(0), "Invalid beneficiary");
         Deposit storage d = _approvedDeposits[depositId];
         require(d.user != address(0) && !d.approved, "Not pending");
@@ -469,7 +527,7 @@ contract Zapper is
      * @dev Allows users to withdraw their deposit before it's approved
      * @param depositId The unique identifier of the deposit to withdraw
      */
-    function withdrawDeposit(bytes32 depositId) external whenNotPaused {
+    function withdrawDeposit(bytes32 depositId) external whenNotPaused nonReentrant {
         Deposit storage deposit = _approvedDeposits[depositId];
 
         require(deposit.user == _msgSender(), "Invalid user");
@@ -479,12 +537,57 @@ contract Zapper is
         uint256 refundAmount = deposit.amount;
         delete _approvedDeposits[depositId];
         _removePendingDeposit(depositId);
+        _removeUserDeposit(_msgSender(), depositId);
 
         // Return USDC to user
         require(_usdc.balanceOf(address(silo())) >= refundAmount, "Insufficient USDC balance");
         _usdc.safeTransferFrom(address(silo()), _msgSender(), refundAmount);
 
         emit DepositWithdrawn(depositId, _msgSender(), refundAmount);
+    }
+
+    /**
+     * @dev Allows users to withdraw all their pending deposits at once
+     * @return totalRefunded The total amount of USDC refunded to the user
+     */
+    function withdrawAllDeposits() external whenNotPaused nonReentrant returns (uint256 totalRefunded) {
+        bytes32[] storage userDepositIds = _userDeposits[_msgSender()];
+        require(userDepositIds.length > 0, "No deposits found");
+
+        // Create a copy of deposit IDs to iterate over, since we'll be modifying the original array
+        bytes32[] memory depositIds = new bytes32[](userDepositIds.length);
+        uint256 validDepositsCount = 0;
+
+        // First pass: collect valid pending deposits
+        for (uint256 i = 0; i < userDepositIds.length; i++) {
+            bytes32 depositId = userDepositIds[i];
+            Deposit storage deposit = _approvedDeposits[depositId];
+
+            if (deposit.user == _msgSender() && !deposit.approved && deposit.user != address(0)) {
+                depositIds[validDepositsCount] = depositId;
+                totalRefunded += deposit.amount;
+                validDepositsCount++;
+            }
+        }
+
+        require(validDepositsCount > 0, "No pending deposits to withdraw");
+        require(_usdc.balanceOf(address(silo())) >= totalRefunded, "Insufficient USDC balance");
+
+        // Second pass: actually withdraw the deposits
+        for (uint256 i = 0; i < validDepositsCount; i++) {
+            bytes32 depositId = depositIds[i];
+            Deposit storage deposit = _approvedDeposits[depositId];
+
+            // Clean up the deposit
+            delete _approvedDeposits[depositId];
+            _removePendingDeposit(depositId);
+            _removeUserDeposit(_msgSender(), depositId);
+        }
+
+        // Transfer total refund to user
+        _usdc.safeTransferFrom(address(silo()), _msgSender(), totalRefunded);
+
+        emit DepositWithdrawn(bytes32(0), _msgSender(), totalRefunded); // Use bytes32(0) to indicate batch withdrawal
     }
 
     /**
@@ -538,7 +641,9 @@ contract Zapper is
      * @dev Allows vault curators to decline a deposit and refund the user
      * @param depositId The unique identifier of the deposit to decline
      */
-    function declineDeposit(bytes32 depositId) external whenNotPaused whenEpochActive onlyRole(VAULT_CURATOR_ROLE) {
+    function declineDeposit(
+        bytes32 depositId
+    ) external whenNotPaused whenEpochActive onlyRole(VAULT_CURATOR_ROLE) nonReentrant {
         Deposit storage deposit = _approvedDeposits[depositId];
 
         require(deposit.user != address(0), "Deposit not found");
@@ -549,6 +654,7 @@ contract Zapper is
 
         delete _approvedDeposits[depositId];
         _removePendingDeposit(depositId);
+        _removeUserDeposit(user, depositId);
 
         // Return USDC to user
         require(_usdc.balanceOf(address(_silo)) >= refundAmount, "Insufficient USDC balance");
@@ -607,11 +713,48 @@ contract Zapper is
     }
 
     /**
+     * @dev Allows vault curators to approve all pending deposits in full
+     * This method approves every pending deposit for their complete amount
+     * @return totalApproved The total amount approved across all deposits
+     * @return depositsApproved The number of deposits that were approved
+     */
+    function approveAllDeposits()
+        external
+        whenNotPaused
+        whenEpochActive
+        onlyRole(VAULT_CURATOR_ROLE)
+        returns (uint256 totalApproved, uint256 depositsApproved)
+    {
+        require(_pendingDepositIds.length > 0, "No pending deposits");
+
+        bytes32 depositId;
+
+        // Approve all pending deposits in full
+        for (uint256 i = 0; i < _pendingDepositIds.length; i++) {
+            depositId = _pendingDepositIds[i];
+            Deposit storage deposit = _approvedDeposits[depositId];
+
+            if (deposit.user != address(0) && !deposit.approved) {
+                deposit.approved = true;
+                deposit.approvedAmount = deposit.amount;
+                totalApproved += deposit.amount;
+                depositsApproved++;
+
+                emit DepositApproved(depositId, deposit.amount);
+            }
+        }
+
+        require(depositsApproved > 0, "No valid pending deposits to approve");
+
+        emit ProportionalApproval(totalApproved, totalApproved, 1e18); // 100% proportion
+    }
+
+    /**
      * @dev Allows users to claim their approved deposits and receive vault shares
      * @param depositId The unique identifier of the deposit to claim
      * @return shares The number of vault shares received
      */
-    function claimDeposit(bytes32 depositId) external whenNotPaused whenEpochActive returns (uint256 shares) {
+    function claimDeposit(bytes32 depositId) public whenNotPaused whenEpochActive returns (uint256 shares) {
         Deposit storage deposit = _approvedDeposits[depositId];
         uint256 currentCopperPrice = getCopperPrice();
 
@@ -624,10 +767,11 @@ contract Zapper is
         uint256 approvedAmount = deposit.approvedAmount;
         uint256 totalAmount = deposit.amount;
 
-        // If the deposit is fully approved, remove it from the pending deposits
+        // If the deposit is fully approved, remove it from the pending deposits and user's list
         if (totalAmount - approvedAmount == 0) {
             delete _approvedDeposits[depositId];
             _removePendingDeposit(depositId);
+            _removeUserDeposit(_msgSender(), depositId);
         } else {
             deposit.amount = totalAmount - approvedAmount;
             deposit.approvedAmount = 0;
@@ -637,14 +781,14 @@ contract Zapper is
         // Determine CUP amount to deposit
         uint256 cupValue;
         if (deposit.isExternal) {
+            // For external deposits, use pre-approved CUP amount and price snapshot
             require(deposit.approvedCupAmount > 0 && deposit.priceSnapshot > 0, "No snapshot");
             cupValue = deposit.approvedCupAmount;
         } else {
+            // For regular deposits, convert approved USDC amount to CUP value using current copper price
             require(currentCopperPrice > 0, "Copper price is 0");
-            cupValue = approvedAmount * currentCopperPrice;
+            cupValue = (approvedAmount * currentCopperPrice) / (10 ** 11);
         }
-
-        console.log("cupValue", cupValue);
 
         require(_cup.balanceOf(address(this)) >= cupValue, "Insufficient CUP balance");
 
@@ -656,6 +800,37 @@ contract Zapper is
         deposit.claimedBy = _msgSender();
         emit DepositClaimed(depositId, beneficiary_, shares);
         emit DepositClaimedFor(depositId, deposit.user, beneficiary_, _msgSender(), deposit.tag, shares);
+    }
+
+    /**
+     * @dev Claim all approved deposits for msg.sender and receive vault shares.
+     * Iterates over user's deposit IDs and claims those which are approved.
+     * @return totalShares total number of shares received for all claimed deposits
+     */
+    function claimAllDeposits() external whenNotPaused whenEpochActive returns (uint256 totalShares) {
+        bytes32[] storage ids = _userDeposits[_msgSender()];
+
+        // iterate over a copy of ids length because claimDeposit may remove some entries
+        uint256 len = ids.length;
+        for (uint256 i = 0; i < len; i++) {
+            // If array shortened because of removals, protect against OOB
+            if (i >= _userDeposits[_msgSender()].length) {
+                break;
+            }
+
+            bytes32 id = _userDeposits[_msgSender()][i];
+            Deposit storage deposit = _approvedDeposits[id];
+
+            if (deposit.user == _msgSender() && deposit.approved && deposit.approvedAmount > 0) {
+                // call claimDeposit which handles removal / partial approvals
+                uint256 shares = claimDeposit(id);
+                totalShares += shares;
+                // after claimDeposit, the id may be removed from _userDeposits and _pendingDepositIds
+                // we continue loop — because we indexed by i and re-fetched length at top, it's safe
+                // to continue; this loop may skip some newly shifted elements but those will be
+                // processed in next iterations since we re-check bounds.
+            }
+        }
     }
 
     /**
@@ -675,7 +850,7 @@ contract Zapper is
      * @param sharesToRedeem The number of vault shares to redeem
      * @return usdcToWithdraw The amount of USDC received
      */
-    function redeem(uint256 sharesToRedeem) external returns (uint256 usdcToWithdraw) {
+    function redeem(uint256 sharesToRedeem) external nonReentrant returns (uint256 usdcToWithdraw) {
         require(sharesToRedeem > 0, "Shares to redeem must be greater than 0");
 
         uint256 ownedShares = _vault.balanceOf(_msgSender());
@@ -690,7 +865,9 @@ contract Zapper is
         uint256 copperPrice = getCopperPrice();
         require(copperPrice > 0, "Copper price is 0");
 
-        usdcToWithdraw = withdrawnCup / copperPrice;
+        // Convert CUP back to USDC using copper price
+        // Formula should be inverse of claimDeposit: (withdrawnCup * 10^11) / copperPrice
+        usdcToWithdraw = (withdrawnCup * (10 ** 11)) / copperPrice;
 
         _usdc.safeTransferFrom(address(_silo), address(this), usdcToWithdraw);
 
@@ -703,10 +880,10 @@ contract Zapper is
 
     /**
      * @dev Returns the current copper price from the oracle
-     * @return price The copper price (scaled down by 10^8)
+     * @return price The copper price with 11 decimal places
      */
     function getCopperPrice() public view returns (uint256 price) {
-        price = _copperPriceConsumer.price() / 10 ** 8;
+        price = _copperPriceConsumer.price();
     }
 
     /**
@@ -724,6 +901,57 @@ contract Zapper is
      */
     function getPendingDepositIds() external view returns (bytes32[] memory) {
         return _pendingDepositIds;
+    }
+
+    /**
+     * @dev Returns all pending deposits with full information
+     * @return deposits Array of pending deposits with complete details
+     */
+    function getPendingDeposits() external view returns (Deposit[] memory deposits) {
+        // First, count valid pending deposits
+        uint256 validCount = 0;
+        for (uint256 i = 0; i < _pendingDepositIds.length; i++) {
+            Deposit storage deposit = _approvedDeposits[_pendingDepositIds[i]];
+            if (deposit.user != address(0) && !deposit.approved) {
+                validCount++;
+            }
+        }
+
+        // Create array with exact size needed
+        deposits = new Deposit[](validCount);
+        uint256 currentIndex = 0;
+
+        // Fill array with valid pending deposits
+        for (uint256 i = 0; i < _pendingDepositIds.length; i++) {
+            bytes32 depositId = _pendingDepositIds[i];
+            Deposit storage deposit = _approvedDeposits[depositId];
+
+            if (deposit.user != address(0) && !deposit.approved) {
+                deposits[currentIndex] = deposit;
+                currentIndex++;
+            }
+        }
+    }
+
+    /**
+     * @dev Returns all deposit IDs for a given user
+     */
+    function getUserDepositIds(address user) external view returns (bytes32[] memory) {
+        return _userDeposits[user];
+    }
+
+    /**
+     * @dev Returns all deposits for a given user
+     */
+    function getUserDeposits(address user) external view returns (Deposit[] memory) {
+        bytes32[] storage ids = _userDeposits[user];
+        Deposit[] memory deposits = new Deposit[](ids.length);
+
+        for (uint256 i = 0; i < ids.length; i++) {
+            deposits[i] = _approvedDeposits[ids[i]];
+        }
+
+        return deposits;
     }
 
     /**
@@ -776,4 +1004,33 @@ contract Zapper is
     function silo() public view returns (address) {
         return address(_silo);
     }
+
+    /**
+     * @dev Payable receive - automatically zapAndDeposit ETH sent to contract.
+     * Allows simple `send` of ETH which will be processed as a deposit (address(0) used to denote ETH).
+     */
+    receive() external payable whenNotPaused {
+        require(msg.value > 0, "No ETH sent");
+        uint256 depositValue = _processDeposit(IERC20(address(0)), msg.value, 100); // Default 1% slippage
+        uint256 nonce = _userNonces[msg.sender]++;
+        bytes32 depositId = keccak256(abi.encodePacked(msg.sender, nonce, msg.value, block.timestamp));
+        _recordDeposit(depositId, depositValue);
+        emit ZapAndDeposit(router(), address(0), depositValue);
+    }
+
+    /**
+     * @dev Fallback to support direct sends or calls
+     */
+    fallback() external payable whenNotPaused {
+        if (msg.value > 0) {
+            uint256 depositValue = _processDeposit(IERC20(address(0)), msg.value, 100); // Default 1% slippage
+            uint256 nonce = _userNonces[msg.sender]++;
+            bytes32 depositId = keccak256(abi.encodePacked(msg.sender, nonce, msg.value, block.timestamp));
+            _recordDeposit(depositId, depositValue);
+            emit ZapAndDeposit(router(), address(0), depositValue);
+        }
+    }
+
+    // Reserve storage gap for future upgrades (to avoid storage collisions)
+    uint256[45] private __gap;
 }

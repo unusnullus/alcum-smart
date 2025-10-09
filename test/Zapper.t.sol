@@ -66,7 +66,13 @@ contract ZapperTest is Test {
 
         // Deploy contracts
         vm.startPrank(owner);
-        cupToken = new CUPToken();
+        // Deploy CUP token using upgradeable pattern
+        address cupTokenProxy = Upgrades.deployTransparentProxy(
+            "CUPToken.sol:CUPToken",
+            owner,
+            abi.encodeCall(CUPToken.initialize, ())
+        );
+        cupToken = CUPToken(cupTokenProxy);
 
         erc20Mock = new ERC20Mock("TST", "TST", 18);
 

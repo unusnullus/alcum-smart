@@ -120,8 +120,13 @@ contract FullFlowIntegrationTest is Test {
         // Deploy price consumer
         priceConsumer = new CopperPriceConsumerMock();
 
-        // Deploy CUP token
-        cupToken = new CUPToken();
+        // Deploy CUP token using upgradeable pattern
+        address cupTokenProxy = Upgrades.deployTransparentProxy(
+            "CUPToken.sol:CUPToken",
+            owner,
+            abi.encodeCall(CUPToken.initialize, ())
+        );
+        cupToken = CUPToken(cupTokenProxy);
 
         // Deploy xCUP vault
         address xcupProxy = Upgrades.deployTransparentProxy(

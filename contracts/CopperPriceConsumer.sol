@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
 import {ChainlinkClient} from "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
 import {Chainlink} from "@chainlink/contracts/src/v0.8/Chainlink.sol";
 
 import {ICopperPriceConsumer} from "./interfaces/ICopperPriceConsumer.sol";
-import {console} from "hardhat/console.sol";
 
-contract CopperPriceConsumer is ChainlinkClient, ICopperPriceConsumer, Ownable {
+contract CopperPriceConsumer is Initializable, ChainlinkClient, ICopperPriceConsumer, OwnableUpgradeable {
     using Chainlink for Chainlink.Request;
 
     // Decimal precision for price storage (8 decimals)
@@ -21,7 +21,25 @@ contract CopperPriceConsumer is ChainlinkClient, ICopperPriceConsumer, Ownable {
     bytes32 private jobId;
     uint256 private fee;
 
-    constructor(address _oracle, bytes32 _jobId, uint256 _fee, address _link) Ownable(msg.sender) {
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
+     * @notice Initializes the CopperPriceConsumer contract
+     * @dev This function replaces the constructor for upgradeable contracts
+     * @param _oracle The Chainlink oracle address
+     * @param _jobId The job ID for the price request
+     * @param _fee The fee for the price request
+     * @param _link The LINK token address
+     */
+    function initialize(address _oracle, bytes32 _jobId, uint256 _fee, address _link) public initializer {
+        require(_oracle != address(0), "Invalid oracle address");
+        require(_link != address(0), "Invalid LINK token address");
+
+        __Ownable_init(_msgSender());
+
         _setChainlinkToken(_link);
 
         oracle = _oracle;
@@ -51,4 +69,7 @@ contract CopperPriceConsumer is ChainlinkClient, ICopperPriceConsumer, Ownable {
     function getPriceAsDecimal() public view returns (uint256) {
         return price / PRICE_MULTIPLIER;
     }
+
+    // Reserve storage gap for future upgrades (to avoid storage collisions)
+    uint256[50] private __gap;
 }
