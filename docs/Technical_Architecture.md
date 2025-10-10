@@ -1,168 +1,325 @@
-# Zapper System - Technical Architecture
+# Alcum Protocol - Technical Architecture
 
 ## System Overview
 
-The Zapper system is a DeFi (Decentralized Finance) application that enables users to invest in copper-backed assets through a streamlined token conversion and vault deposit process. The system consists of multiple smart contracts working together to provide a seamless investment experience.
+The Alcum Protocol is a comprehensive DeFi (Decentralized Finance) platform that enables users to invest in copper-backed assets through a sophisticated ecosystem of smart contracts. The protocol combines real-world copper trading operations with blockchain technology, providing users with exposure to copper markets through tokenized assets and vault-based investment strategies.
+
+The system manages the complete lifecycle from user deposits through various tokens, curator-approved investments, copper trading operations, revenue settlement, and profit distribution back to investors.
 
 ## Architecture Diagram
 
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   User Wallet   │    │   Zapper        │    │   xCUP Vault    │
-│                 │    │   Contract      │    │                 │
-│ ┌─────────────┐ │    │ ┌─────────────┐ │    │ ┌─────────────┐ │
-│ │ Various     │ │    │ │ Currency    │ │    │ │ Investment  │ │
-│ │ Tokens      │ │    │ │ Conversion  │ │    │ │ Shares      │ │
-│ │ (BTC, ETH,  │ │    │ │ Logic       │ │    │ │ (xCUP)      │ │
-│ │  USDC, etc) │ │    │ │             │ │    │ │             │ │
-│ └─────────────┘ │    │ └─────────────┘ │    │ └─────────────┘ │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-         │                       │                       │
-         │                       │                       │
-         ▼                       ▼                       ▼
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Uniswap       │    │   Copper Price  │    │   CUP Token     │
-│   Router        │    │   Consumer      │    │                 │
-│                 │    │                 │    │                 │
-│ ┌─────────────┐ │    │ ┌─────────────┐ │    │ ┌─────────────┐ │
-│ │ Token Swap  │ │    │ │ Price Feed  │ │    │ │ Copper-     │ │
-│ │ Engine       │ │    │ │ Integration │ │    │ │ Backed      │ │
-│ │             │ │    │ │             │ │    │ │ Currency    │ │
-│ └─────────────┘ │    │ └─────────────┘ │    │ └─────────────┘ │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
+                    ALCUM PROTOCOL ARCHITECTURE
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              USER LAYER                                    │
+├─────────────────┬─────────────────┬─────────────────┬─────────────────────┤
+│   Direct Users  │  Host Systems   │   Curators      │   Protocol Admin    │
+│   (Web3 Wallet) │  (HostAdapter)  │  (Approval)     │   (Management)      │
+└─────────────────┴─────────────────┴─────────────────┴─────────────────────┘
+         │                 │                 │                 │
+         ▼                 ▼                 ▼                 ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           PROTOCOL LAYER                                   │
+├─────────────────┬─────────────────┬─────────────────┬─────────────────────┤
+│     Zapper      │   xCUP Vault    │  EpochManager   │  SettlementEngine   │
+│   (Entry Point) │  (ERC4626)      │  (Time Cycles)  │  (Revenue Mgmt)     │
+│                 │                 │                 │                     │
+│ • Token Swaps   │ • Share Mgmt    │ • Epoch Control │ • Revenue Recording │
+│ • Deposit Mgmt  │ • Controlled    │ • Time Windows  │ • NAV Calculation   │
+│ • Approval Flow │   Redemption    │ • Cycle Advance │ • Profit Distrib.   │
+└─────────────────┴─────────────────┴─────────────────┴─────────────────────┘
+         │                 │                 │                 │
+         ▼                 ▼                 ▼                 ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          ASSET LAYER                                       │
+├─────────────────┬─────────────────┬─────────────────┬─────────────────────┤
+│   CUP Token     │   USDC/Stables  │  External Tokens│   Copper Inventory  │
+│  (Copper Rep.)  │   (Base Currency)│  (ETH, BTC, etc)│   (Physical Assets) │
+└─────────────────┴─────────────────┴─────────────────┴─────────────────────┘
+         │                 │                 │                 │
+         ▼                 ▼                 ▼                 ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        INFRASTRUCTURE LAYER                                │
+├─────────────────┬─────────────────┬─────────────────┬─────────────────────┤
+│  Chainlink      │   Uniswap V2    │   OpenZeppelin  │   Real World        │
+│  (Price Oracle) │  (DEX/Swaps)    │  (Security)     │  (Copper Trading)   │
+└─────────────────┴─────────────────┴─────────────────┴─────────────────────┘
 ```
 
 ## Core Components
 
 ### 1. Zapper Contract (`Zapper.sol`)
 
-**Purpose**: Main entry point for user interactions and investment processing.
+**Purpose**: Main entry point for user interactions and investment processing with curator approval system.
 
 **Key Functions**:
-- `zapAndDeposit()`: Primary function for converting tokens and depositing to vault
-- `approveDeposit()`: Curator function to approve large deposits
-- `claimDeposit()`: User function to claim approved deposits
-- `getCopperPrice()`: Retrieves current copper price from oracle
+
+-   `zapAndDeposit()`: Converts various tokens to USDC and creates deposit requests
+-   `zapAndDepositWithPermit()`: Same as above but with ERC20 permit for gasless approvals
+-   `approveDeposit()`: Curator function to approve individual deposits
+-   `approveDepositsProportionally()`: Curator function for batch proportional approvals
+-   `approveAllDeposits()`: Curator function to approve all pending deposits
+-   `claimDeposit()`: User function to claim approved deposits and receive xCUP shares
+-   `claimAllDeposits()`: User function to claim all their approved deposits
+-   `registerExternalDepositFor()`: Host integration function for external deposits
+-   `redeem()`: Convert xCUP shares back to USDC
+-   `getCopperPrice()`: Retrieves current copper price from oracle
 
 **Security Features**:
-- Role-based access control (RBAC)
-- Pausable functionality for emergencies
-- Input validation and balance checks
-- Slippage protection (1% tolerance)
+
+-   Role-based access control with VAULT_CURATOR_ROLE and HOST_INTEGRATION_ROLE
+-   Pausable functionality for emergencies
+-   ReentrancyGuard protection
+-   Epoch-based time windows for deposits
+-   Input validation and balance checks
+-   Slippage protection (configurable, default 1%)
 
 **State Management**:
+
 ```solidity
-mapping(bytes32 depositId => Deposit) private _approvedDeposits;
 struct Deposit {
-    address user;
-    bytes32 depositId;
-    uint256 amount;
-    bool approved;
+    address user;              // originator (payer) for on-chain deposits
+    bytes32 depositId;         // unique identifier
+    uint256 amount;            // pending USDC value
+    uint256 approvedAmount;    // approved USDC value
+    bool approved;             // approved flag
+    address beneficiary;       // who will receive xCUP on claim
+    address createdBy;         // who initiated the deposit
+    address claimedBy;         // who executed the claim
+    bool isExternal;           // true if created via external adapter flow
+    bytes32 tag;               // integration tag/ID for marking
+    uint256 approvedCupAmount; // fixed CUP amount approved (for external)
+    uint256 priceSnapshot;     // price used for approval (for external)
 }
 ```
 
 ### 2. CUP Token (`CUPToken.sol`)
 
-**Purpose**: ERC-20 token representing copper-backed value.
+**Purpose**: ERC-20 token representing refined copper assets in the Alcum ecosystem.
 
 **Characteristics**:
-- 6 decimal places (like USDC)
-- Mintable and burnable by authorized roles
-- Access control for minting/burning operations
-- Initial supply: 1000e6 tokens
+
+-   6 decimal places (aligned with USDC precision)
+-   Mintable and burnable by authorized roles
+-   Upgradeable contract pattern
+-   Access control for minting/burning operations
 
 **Roles**:
-- `MINTER_ROLE`: Can create new tokens
-- `BURNER_ROLE`: Can destroy tokens
-- `DEFAULT_ADMIN_ROLE`: Can manage roles
+
+-   `MINTER_ROLE`: Can create new tokens (typically SettlementEngine)
+-   `BURNER_ROLE`: Can destroy tokens (for redemption processes)
+-   `DEFAULT_ADMIN_ROLE`: Can manage roles and contract administration
+
+**Key Functions**:
+
+-   `mint()`: Creates new tokens for revenue distribution
+-   `burn()`: Destroys tokens during redemption
+-   `decimals()`: Returns 6 (matching USDC precision)
 
 ### 3. xCUP Vault (`xCUP.sol`)
 
-**Purpose**: ERC-4626 compliant vault for managing copper investments.
+**Purpose**: ERC-4626 compliant vault for managing copper investments with controlled redemption access.
 
 **Features**:
-- Standard vault interface for deposits/withdrawals
-- Share-based ownership model
-- Automatic share calculation
-- Integration with CUP token
 
-### 4. Copper Price Consumer (`CopperPriceConsumerMock.sol`)
+-   Standard ERC4626 vault interface for deposits/withdrawals
+-   Share-based ownership model with automatic calculation
+-   Controlled redemption (only REDEEMER_ROLE can withdraw/redeem)
+-   Integration with copper price oracles and Uniswap for price calculations
+-   Pausable functionality for emergency situations
 
-**Purpose**: Provides real-time copper price data to the system.
+**Key Functions**:
 
-**Current Implementation**:
-- Mock price feed returning $5 per unit
-- Chainlink-compatible interface
-- Extensible for real price feeds
+-   `withdraw()`: Withdraws assets by burning shares (restricted to REDEEMER_ROLE)
+-   `redeem()`: Redeems shares for underlying assets (restricted to REDEEMER_ROLE)
+-   `getXcupPriceInToken()`: Calculates xCUP price in various tokens
+-   `getTokenToXcupExchangeRate()`: Calculates exchange rates for deposits
+-   `getCopperPrice()`: Retrieves current copper price
 
-**Future Integration**:
-- Chainlink oracle integration
-- Multiple price source support
-- Fallback mechanisms
+**Price Integration**:
+
+-   Copper price consumer for real-time pricing
+-   Uniswap V2 router for token exchange rates
+-   USDC as base currency for calculations
+-   WETH integration for ETH price calculations
+
+### 4. Copper Price Consumer (`CopperPriceConsumer.sol`)
+
+**Purpose**: Chainlink oracle consumer for fetching copper spot prices.
+
+**Features**:
+
+-   Chainlink oracle integration for reliable price data
+-   Manual price updates for emergency situations or testing
+-   Price freshness validation (configurable max age)
+-   Role-based access control for price updates
+
+**Key Functions**:
+
+-   `requestCopperPrice()`: Requests latest price from Chainlink oracle
+-   `fulfill()`: Oracle callback to receive price data
+-   `updatePrice()`: Manual price update (PRICE_UPDATER_ROLE)
+-   `getPriceAsDecimal()`: Returns human-readable price
+-   `isPriceFresh()`: Checks if price data is not stale
+
+**Configuration**:
+
+-   Oracle address, job ID, and fee management
+-   Price precision: 8 decimals
+-   Default max age: 24 hours
 
 ### 5. Settlement Engine (`SettlementEngine.sol`)
 
-**Purpose**: Manages final settlement and asset conversion processes.
+**Purpose**: Manages epoch-based copper trading revenue settlement and NAV calculations.
 
-**Responsibilities**:
-- Asset conversion coordination
-- Settlement verification
-- Accounting and record keeping
+**Core Responsibilities**:
+
+-   Records epoch revenue data from copper trading operations
+-   Calculates and maintains Net Asset Value (NAV) components
+-   Settles epoch revenues and updates retained earnings
+-   Distributes net revenues by minting CUP tokens to the vault
+-   Tracks copper inventory, cash reserves, and liabilities
+
+**Key Functions**:
+
+-   `recordEpochRevenue()`: Records trading results for an epoch
+-   `settleEpochRevenue()`: Marks epoch as settled and updates retained earnings
+-   `distributeRevenueToVault()`: Mints CUP tokens to vault based on net revenue
+-   `updateNAV()`: Updates Net Asset Value components
+-   `calculateEpochROI()`: Calculates return on investment for epochs
+-   `getNAVSummary()`: Provides comprehensive NAV analysis
+
+**NAV Components**:
+
+```solidity
+struct NAVComponents {
+    uint256 cupInWarehouse;     // Refined copper inventory (CUP tokens)
+    uint256 copperSpotPrice;    // Current copper spot price (8 decimals)
+    uint256 cupInTransit;       // Copper being processed (CUP tokens)
+    uint256 retainedEarnings;   // Accumulated profits (USDC, 6 decimals)
+    uint256 stablecoinBalance;  // Cash reserves (USDC, 6 decimals)
+    uint256 liabilities;        // Outstanding obligations (USDC, 6 decimals)
+}
+```
+
+**Revenue Tracking**:
+
+```solidity
+struct EpochRevenue {
+    uint256 epochId;
+    uint256 netRevenue;         // Final revenue after costs
+    uint256 originalNetRevenue; // Original revenue for analytics
+    uint256 cupPurchased;       // Raw copper purchased
+    uint256 cupSold;            // Refined copper sold
+    uint256 averagePurchasePrice;
+    uint256 averageSalePrice;
+    bool isSettled;
+}
+```
+
+### 6. Epoch Manager (`EpochManager.sol`)
+
+**Purpose**: Manages time-based epochs for organizing trading activities and revenue settlement cycles.
+
+**Features**:
+
+-   Fixed-duration epochs (typically 7 days)
+-   Epoch progression control
+-   Time-based operation windows
+-   Integration with other protocol contracts
+
+**Key Functions**:
+
+-   `nextEpoch()`: Advances to the next epoch (owner only)
+-   `currentEpochId()`: Returns current epoch identifier
+-   `timeLeftInEpoch()`: Calculates remaining time in current epoch
+-   `isEpochActive()`: Checks if current epoch is still active
+-   `setEpochDuration()`: Updates duration for future epochs
+
+### 7. Host Adapter (`HostAdapter.sol`)
+
+**Purpose**: Isolated adapter for host-to-host integrations with role separation.
+
+**Features**:
+
+-   Middleware layer between external systems and Zapper
+-   Role-based access control for different operations
+-   External deposit registration and management
+-   Beneficiary management for deposits
+
+**Key Functions**:
+
+-   `registerExternalDepositFor()`: Registers external deposits (HOST_OPERATOR_ROLE)
+-   `setDepositBeneficiary()`: Updates beneficiary before approval (HOST_OPERATOR_ROLE)
+-   `approveExternalDepositWithPrice()`: Approves with price snapshot (CURATOR_OPERATOR_ROLE)
+
+**Roles**:
+
+-   `HOST_OPERATOR_ROLE`: Backend operators for deposit registration
+-   `CURATOR_OPERATOR_ROLE`: Curators for deposit approval with pricing
 
 ## Data Flow
 
 ### Investment Process Flow
 
 1. **User Initiation**
-   ```
-   User calls zapAndDeposit(tokenIn, amount)
-   ```
+
+    ```
+    User calls zapAndDeposit(tokenIn, amount)
+    ```
 
 2. **Input Validation**
-   ```solidity
-   require(address(tokenIn) != address(0), "Invalid input token address");
-   require(amount != 0, "Invalid amount");
-   ```
+
+    ```solidity
+    require(address(tokenIn) != address(0), "Invalid input token address");
+    require(amount != 0, "Invalid amount");
+    ```
 
 3. **Currency Conversion**
-   - If input is USDC: Direct processing
-   - If other token: Convert via Uniswap router
-   - Apply 1% slippage protection
+
+    - If input is USDC: Direct processing
+    - If other token: Convert via Uniswap router
+    - Apply 1% slippage protection
 
 4. **Price Calculation**
-   ```solidity
-   uint256 currentCopperPrice = getCopperPrice();
-   uint256 depositValue = amount * currentCopperPrice;
-   ```
+
+    ```solidity
+    uint256 currentCopperPrice = getCopperPrice();
+    uint256 depositValue = amount * currentCopperPrice;
+    ```
 
 5. **Vault Deposit**
-   ```solidity
-   _cup.approve(address(_vault), depositValue);
-   shares = _vault.deposit(depositValue, _msgSender());
-   ```
+    ```solidity
+    _cup.approve(address(_vault), depositValue);
+    shares = _vault.deposit(depositValue, _msgSender());
+    ```
 
 ### Approval Process Flow
 
 1. **Deposit Request**
-   - Generate unique deposit ID
-   - Store deposit information
-   - Emit events for tracking
+
+    - Generate unique deposit ID
+    - Store deposit information
+    - Emit events for tracking
 
 2. **Curator Review**
-   - Curator reviews deposit request
-   - Approves or declines based on criteria
-   - Updates deposit status
+
+    - Curator reviews deposit request
+    - Approves or declines based on criteria
+    - Updates deposit status
 
 3. **User Claim**
-   - User claims approved deposits
-   - Tokens are transferred to vault
-   - User receives xCUP shares
+    - User claims approved deposits
+    - Tokens are transferred to vault
+    - User receives xCUP shares
 
 ## Security Architecture
 
 ### Access Control
 
 **Role-Based Permissions**:
+
 ```solidity
 bytes32 public constant VAULT_CURATOR_ROLE = keccak256("VAULT_CURATOR_ROLE");
 bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
@@ -180,12 +337,14 @@ bytes32 public constant BURNER_ROLE = keccak256("BURNER_ROLE");
 ### Input Validation
 
 **Address Validation**:
+
 ```solidity
 require(cup != address(0), "Invalid CUP address");
 require(vault != address(0), "Invalid Vault address");
 ```
 
 **Amount Validation**:
+
 ```solidity
 require(amount != 0, "Invalid amount");
 require(depositValue > 0, "Deposit value is too low");
@@ -194,6 +353,7 @@ require(depositValue > 0, "Deposit value is too low");
 ### Slippage Protection
 
 **Implementation**:
+
 ```solidity
 uint256 minOutput = amounts[1] * 99 / 100; // 1% slippage tolerance
 ```
@@ -203,6 +363,7 @@ uint256 minOutput = amounts[1] * 99 / 100; // 1% slippage tolerance
 ### Emergency Controls
 
 **Pausable Functionality**:
+
 ```solidity
 function pause() external onlyOwner {
     _pause();
@@ -218,32 +379,35 @@ function unpause() external onlyOwner {
 ### External Dependencies
 
 1. **Uniswap V2 Router**
-   - Token swapping functionality
-   - Price calculation
-   - Liquidity provision
+
+    - Token swapping functionality
+    - Price calculation
+    - Liquidity provision
 
 2. **Chainlink Oracle** (Future)
-   - Real-time copper price feeds
-   - Decentralized price data
-   - Multiple source aggregation
+
+    - Real-time copper price feeds
+    - Decentralized price data
+    - Multiple source aggregation
 
 3. **ERC-4626 Vault Standard**
-   - Standardized vault interface
-   - Interoperability with other DeFi protocols
-   - Consistent user experience
+    - Standardized vault interface
+    - Interoperability with other DeFi protocols
+    - Consistent user experience
 
 ### Internal Dependencies
 
 1. **OpenZeppelin Contracts**
-   - AccessControl for role management
-   - Pausable for emergency controls
-   - SafeERC20 for secure token transfers
-   - Ownable for ownership management
+
+    - AccessControl for role management
+    - Pausable for emergency controls
+    - SafeERC20 for secure token transfers
+    - Ownable for ownership management
 
 2. **ERC-20 Standard**
-   - Token compatibility
-   - Standard transfer functions
-   - Approval mechanisms
+    - Token compatibility
+    - Standard transfer functions
+    - Approval mechanisms
 
 ## Gas Optimization
 
@@ -260,7 +424,7 @@ function unpause() external onlyOwner {
 // Optimized transfer function
 function _transferTokenInAndApprove(IERC20 tokenIn, uint256 amount) internal {
     tokenIn.safeTransferFrom(_msgSender(), address(this), amount);
-    
+
     if (tokenIn.allowance(address(this), router()) < amount) {
         tokenIn.forceApprove(router(), amount);
     }
@@ -270,19 +434,22 @@ function _transferTokenInAndApprove(IERC20 tokenIn, uint256 amount) internal {
 ## Testing Strategy
 
 ### Unit Tests
-- Individual contract function testing
-- Edge case validation
-- Gas consumption analysis
+
+-   Individual contract function testing
+-   Edge case validation
+-   Gas consumption analysis
 
 ### Integration Tests
-- End-to-end workflow testing
-- Cross-contract interaction validation
-- Real-world scenario simulation
+
+-   End-to-end workflow testing
+-   Cross-contract interaction validation
+-   Real-world scenario simulation
 
 ### Security Tests
-- Access control validation
-- Reentrancy attack prevention
-- Overflow/underflow protection
+
+-   Access control validation
+-   Reentrancy attack prevention
+-   Overflow/underflow protection
 
 ## Deployment Strategy
 
@@ -329,46 +496,49 @@ event DepositApproved(bytes32 depositId);
 
 ### Proxy Pattern Considerations
 
-- Use upgradeable proxy pattern for main contracts
-- Maintain state compatibility across upgrades
-- Implement proper upgrade validation
+-   Use upgradeable proxy pattern for main contracts
+-   Maintain state compatibility across upgrades
+-   Implement proper upgrade validation
 
 ### Backward Compatibility
 
-- Maintain existing function signatures
-- Preserve state variable layout
-- Ensure event compatibility
+-   Maintain existing function signatures
+-   Preserve state variable layout
+-   Ensure event compatibility
 
 ## Risk Management
 
 ### Technical Risks
 
 1. **Smart Contract Vulnerabilities**
-   - Regular security audits
-   - Bug bounty programs
-   - Formal verification
+
+    - Regular security audits
+    - Bug bounty programs
+    - Formal verification
 
 2. **Oracle Failures**
-   - Multiple price feed sources
-   - Fallback mechanisms
-   - Emergency pause functionality
+
+    - Multiple price feed sources
+    - Fallback mechanisms
+    - Emergency pause functionality
 
 3. **Network Congestion**
-   - Gas optimization
-   - Batch processing
-   - Priority fee management
+    - Gas optimization
+    - Batch processing
+    - Priority fee management
 
 ### Economic Risks
 
 1. **Price Manipulation**
-   - Slippage protection
-   - Minimum transaction sizes
-   - Curator oversight
+
+    - Slippage protection
+    - Minimum transaction sizes
+    - Curator oversight
 
 2. **Liquidity Issues**
-   - Sufficient liquidity pools
-   - Emergency withdrawal mechanisms
-   - Diversified asset backing
+    - Sufficient liquidity pools
+    - Emergency withdrawal mechanisms
+    - Diversified asset backing
 
 ## Future Enhancements
 
@@ -390,4 +560,4 @@ event DepositApproved(bytes32 depositId);
 
 The Zapper system provides a robust, secure, and user-friendly platform for copper-backed investments. The modular architecture ensures maintainability and extensibility while the comprehensive security measures protect user funds and system integrity.
 
-The system is designed to scale with user growth while maintaining performance and security standards. Regular audits, monitoring, and community feedback will ensure continuous improvement and reliability. 
+The system is designed to scale with user growth while maintaining performance and security standards. Regular audits, monitoring, and community feedback will ensure continuous improvement and reliability.

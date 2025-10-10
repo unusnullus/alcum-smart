@@ -1,8 +1,16 @@
-# Zapper Contract - User Guide
+# Zapper Contract - Comprehensive User Guide
 
 ## What is the Zapper?
 
-The Zapper is a smart contract that helps you invest in copper-backed assets by converting your cryptocurrencies into CUP tokens and then depositing them into the xCUP vault. It's like a bridge that automatically converts your digital money into copper investments.
+The Zapper is a sophisticated DeFi protocol contract that enables seamless investment in copper-backed assets. It serves as a comprehensive bridge that converts various cryptocurrencies (USDC, ETH, and other ERC20 tokens) into CUP tokens and deposits them into the xCUP vault through a curator-approved process.
+
+### Key Features:
+- **Multi-token Support**: Accept USDC, ETH, and various ERC20 tokens
+- **Automated Swapping**: Integrate with Uniswap V2 for token conversions
+- **Curator Approval System**: Professional oversight for deposit approvals
+- **Flexible Claiming**: Support for both individual and batch operations
+- **External Integrations**: Host-to-host deposit flows for institutional use
+- **Price Protection**: Slippage protection and price snapshot mechanisms
 
 ## Core Components
 
@@ -32,50 +40,102 @@ The Zapper is a smart contract that helps you invest in copper-backed assets by 
 
 ## Core Functions and How They Work
 
-### 1. `zapAndDeposit(tokenIn, amount)`
-**Purpose**: Main function to convert tokens and invest in the vault
+### 1. `zapAndDeposit(tokenIn, amount, depositId, slippageBps)`
+**Purpose**: Primary function to convert tokens and create a deposit for curator approval
 
-**What it does**:
-1. Takes your input token (any ERC-20) and amount
-2. Converts it to USDC via Uniswap
-3. Calculates CUP amount based on copper price
-4. Deposits CUP into xCUP vault
-5. Returns xCUP shares to you
+**Enhanced Process Flow**:
+1. Validates input parameters and applies slippage protection
+2. Converts input token to USDC via Uniswap V2 (if not USDC)
+3. Transfers USDC to Silo contract for secure storage
+4. Creates deposit record with unique ID for curator review
+5. Emits events for frontend tracking and integration
 
 **Parameters**:
-- `tokenIn`: Address of the token you're investing (e.g., USDC, ETH, BTC)
-- `amount`: How much you want to invest (in token decimals)
+- `tokenIn`: Token address (ERC20) or address(0) for ETH
+- `amount`: Amount in token's native decimals
+- `depositId`: Unique identifier for the deposit (must be unique)
+- `slippageBps`: Slippage tolerance in basis points (100 = 1%, 0 = use default)
+
+**PRECONDITIONS**:
+- amount > 0
+- For ETH: msg.value must equal amount
+- For ERC20s: sufficient balance and approval required
+- depositId must be unique
+- Contract must not be paused
 
 **Example**:
 ```javascript
-// Invest 100 USDC
-await zapper.zapAndDeposit(usdcAddress, 100000000); // 100 USDC with 6 decimals
+// Invest 100 USDC with 1% slippage
+const depositId = ethers.utils.keccak256(ethers.utils.toUtf8Bytes("my_deposit_1"));
+await zapper.zapAndDeposit(usdcAddress, 100000000, depositId, 100);
+
+// Invest ETH with default slippage
+const ethDepositId = ethers.utils.keccak256(ethers.utils.toUtf8Bytes("eth_deposit_1"));
+await zapper.zapAndDeposit("0x0000000000000000000000000000000000000000", 
+  ethers.utils.parseEther("1"), ethDepositId, 0, { value: ethers.utils.parseEther("1") });
 ```
 
-### 2. `approveDeposit(depositId)`
-**Purpose**: Curator function to approve large investments
+### 2. `approveDeposit(depositId, approvedAmount)`
+**Purpose**: Curator function to approve deposits with flexible amounts
 
-**What it does**:
-1. Reviews a pending deposit request
-2. Approves or declines based on criteria
-3. Updates deposit status for user to claim
+**Enhanced Functionality**:
+1. Reviews pending deposit for compliance and legitimacy
+2. Can approve full or partial amounts based on vault capacity
+3. Enables risk management through controlled approvals
+4. Supports both individual and batch approval workflows
 
 **Parameters**:
-- `depositId`: Unique identifier for the deposit request
+- `depositId`: Unique identifier for the deposit
+- `approvedAmount`: Amount to approve (can be ≤ total deposit amount)
 
-**Who can call**: Only users with `VAULT_CURATOR_ROLE`
+**PRECONDITIONS**:
+- Caller must have VAULT_CURATOR_ROLE
+- Current epoch must be active
+- Deposit must exist and not be already approved
+- approvedAmount must be > 0 and ≤ deposit.amount
+
+**Who can call**: Only vault curators
+
+**Example**:
+```javascript
+// Approve full deposit
+await zapper.connect(curator).approveDeposit(depositId, 100000000);
+
+// Approve partial deposit (50% of 100 USDC)
+await zapper.connect(curator).approveDeposit(depositId, 50000000);
+```
 
 ### 3. `claimDeposit(depositId)`
-**Purpose**: User function to claim approved deposits
+**Purpose**: User function to claim approved deposits and receive xCUP shares
 
-**What it does**:
-1. Checks if deposit is approved
-2. Transfers CUP tokens to vault
-3. Issues xCUP shares to user
-4. Clears the deposit record
+**Enhanced Process**:
+1. Validates user authorization (original depositor or beneficiary)
+2. Calculates CUP amount using current copper price (or snapshot for external)
+3. Handles partial claims (remaining amount stays pending)
+4. Deposits CUP tokens to vault and receives xCUP shares
+5. Transfers shares to beneficiary and emits comprehensive events
 
 **Parameters**:
-- `depositId`: Unique identifier for the deposit request
+- `depositId`: Unique identifier for the approved deposit
+
+**PRECONDITIONS**:
+- Current epoch must be active
+- Deposit must be approved with amount > 0
+- Caller must be authorized (user or beneficiary)
+- Contract must have sufficient CUP balance
+- For regular deposits: copper price > 0
+
+**Returns**: Number of xCUP vault shares received
+
+**Example**:
+```javascript
+// Claim approved deposit
+const shares = await zapper.connect(user).claimDeposit(depositId);
+console.log(`Received ${shares} xCUP shares`);
+
+// For external deposits, beneficiary can claim
+const shares = await zapper.connect(beneficiary).claimDeposit(externalDepositId);
+```
 
 ### 4. `getCopperPrice()`
 **Purpose**: Gets current copper price from oracle
@@ -89,20 +149,22 @@ await zapper.zapAndDeposit(usdcAddress, 100000000); // 100 USDC with 6 decimals
 
 ## Investment Flows
 
-### Flow 1: Direct Investment (Small Amounts)
+### Flow 1: Standard User Deposit Flow
 
 ```
-User Action                    Contract Function
-     ↓                              ↓
-1. Approve USDC              token.approve(zapper, amount)
-     ↓                              ↓
-2. Zap and Deposit           zapper.zapAndDeposit(usdc, amount)
-     ↓                              ↓
-3. Convert to CUP            Calculate based on copper price
-     ↓                              ↓
-4. Deposit to Vault          vault.deposit(cupAmount, user)
-     ↓                              ↓
-5. Receive Shares            User gets xCUP shares
+User Action                    Contract Function                    State Changes
+     ↓                              ↓                                    ↓
+1. Approve Token             token.approve(zapper, amount)         User allowance set
+     ↓                              ↓                                    ↓
+2. Zap and Deposit           zapper.zapAndDeposit(...)             USDC in Silo, deposit pending
+     ↓                              ↓                                    ↓
+3. Wait for Approval         [Curator Review Process]              Deposit in pending queue
+     ↓                              ↓                                    ↓
+4. Curator Approves          zapper.approveDeposit(...)            Deposit marked approved
+     ↓                              ↓                                    ↓
+5. User Claims               zapper.claimDeposit(...)              CUP → Vault, xCUP to user
+     ↓                              ↓                                    ↓
+6. Receive Shares            User has xCUP shares                  Investment complete
 ```
 
 **Step-by-Step Process**:
@@ -112,24 +174,38 @@ User Action                    Contract Function
 4. **Deposit to vault**: CUP tokens go to xCUP vault
 5. **Receive shares**: You get xCUP tokens representing your investment
 
-### Flow 2: Approval Required (Large Amounts)
+### Flow 2: External/Host Integration Flow
 
 ```
-User Action                    Contract Function
-     ↓                              ↓
-1. Approve Token             token.approve(zapper, amount)
-     ↓                              ↓
-2. Zap and Deposit           zapper.zapAndDeposit(token, amount)
-     ↓                              ↓
-3. Generate Deposit ID       Create unique depositId
-     ↓                              ↓
-4. Wait for Approval         Curator reviews deposit
-     ↓                              ↓
-5. Curator Approves          zapper.approveDeposit(depositId)
-     ↓                              ↓
-6. User Claims               zapper.claimDeposit(depositId)
-     ↓                              ↓
-7. Receive Shares            User gets xCUP shares
+Integration Action             Contract Function                    State Changes
+     ↓                              ↓                                    ↓
+1. Register Deposit          zapper.registerExternalDepositFor()   External deposit created
+     ↓                              ↓                                    ↓
+2. Update Beneficiary        zapper.setDepositBeneficiary()        Beneficiary set/updated
+     ↓                              ↓                                    ↓
+3. Curator Review            [Review Process]                      Pending approval
+     ↓                              ↓                                    ↓
+4. Approve with Price        zapper.approveExternalDepositWith...  Price snapshot locked
+     ↓                              ↓                                    ↓
+5. Beneficiary Claims        zapper.claimDeposit(...)              Fixed CUP amount used
+     ↓                              ↓                                    ↓
+6. Receive Shares            Beneficiary has xCUP shares           Integration complete
+```
+
+### Flow 3: Batch Operations Flow
+
+```
+Curator Action                 Contract Function                    Efficiency Benefits
+     ↓                              ↓                                    ↓
+1. Review All Pending        zapper.getPendingDeposits()           Comprehensive overview
+     ↓                              ↓                                    ↓
+2. Proportional Approval     zapper.approveDepositsProportionally() Fair distribution
+     ↓                              ↓                                    ↓
+3. OR Full Approval          zapper.approveAllDeposits()           Complete batch approval
+     ↓                              ↓                                    ↓
+4. Users Claim All           zapper.claimAllDeposits()             Batch claiming
+     ↓                              ↓                                    ↓
+5. Mass Distribution         Multiple xCUP transfers               Efficient processing
 ```
 
 **Step-by-Step Process**:
@@ -150,11 +226,26 @@ User Action                    Contract Function
 ### For `approveDeposit(depositId)` and `claimDeposit(depositId)`
 - **depositId**: Unique identifier generated when deposit is created
 
-### Important Addresses
-- **Zapper Contract**: `0xD10B1B9eC5E0bd43107CCb501AC3a5E8Cbc2b358`
-- **CUP Token**: `0xa7bE870C21b79EcA2E16baaB1294436e37aD72D6`
-- **xCUP Vault**: `0x3d47C937F0706dB77339aa1c26aBCc12C644c882`
-- **Copper Price Consumer**: `0xdAfD3DB6a8EaD46d912935cE0eb1277539eecAeC`
+### Contract Addresses & Integration Info
+
+**Core Contracts:**
+- **Zapper Contract**: `[TO BE DEPLOYED]`
+- **CUP Token**: `[TO BE DEPLOYED]`
+- **xCUP Vault**: `[TO BE DEPLOYED]`
+- **Copper Price Consumer**: `[TO BE DEPLOYED]`
+- **Epoch Manager**: `[TO BE DEPLOYED]`
+
+**Key Constants:**
+- **Default Slippage**: 100 basis points (1%)
+- **Epoch Duration**: 30 days (configurable)
+- **USDC Decimals**: 6
+- **CUP Decimals**: 6
+- **Copper Price Decimals**: 8
+
+**Role Identifiers:**
+- **VAULT_CURATOR_ROLE**: `keccak256("VAULT_CURATOR_ROLE")`
+- **HOST_INTEGRATION_ROLE**: `keccak256("HOST_INTEGRATION_ROLE")`
+- **DEFAULT_ADMIN_ROLE**: `0x00` (Owner role)
 
 ## What Happens Behind the Scenes
 
@@ -202,61 +293,133 @@ User Action                    Contract Function
    delete _approvedDeposits[depositId];
    ```
 
-## Safety Features
+## Security Features & Safeguards
 
-### 1. Slippage Protection
-- **1% tolerance** on token swaps
-- **Prevents bad trades** due to price movements
-- **Automatic calculation** of minimum output
+### 1. Advanced Slippage Protection
+- **Configurable tolerance** (default 1%, customizable per transaction)
+- **MEV attack prevention** through minimum output calculations
+- **Sandwich attack resistance** via slippage bounds
+- **Price impact monitoring** for large swaps
 
-### 2. Input Validation
-- **Checks token addresses** are valid
-- **Ensures amounts** are greater than zero
-- **Validates user permissions** for each function
+### 2. Comprehensive Input Validation
+- **Zero-address protection** for all address parameters
+- **Amount boundary checks** (> 0, within reasonable limits)
+- **Deposit ID uniqueness** enforcement
+- **ETH value matching** for native ETH deposits
+- **Token approval verification** before operations
 
-### 3. Role-Based Access
-- **Only curators** can approve deposits
-- **Only deposit owners** can claim their deposits
-- **Only owner** can pause/unpause system
+### 3. Multi-Layer Access Control
+- **Role-based permissions** (Owner, Curator, Host Integration)
+- **Time-based restrictions** (epoch-active operations)
+- **Deposit ownership validation** (only owners can withdraw/claim)
+- **Beneficiary authorization** (external deposit flexibility)
 
-### 4. Emergency Controls
-- **Pause function** for emergencies
-- **Protects user funds** during issues
-- **Allows maintenance** and updates
+### 4. Reentrancy Protection
+- **ReentrancyGuard** on all state-changing functions
+- **External call isolation** in critical operations
+- **State updates before external calls** pattern
+- **Safe token transfer practices** throughout
 
-## Common Use Cases
+### 5. Emergency & Operational Controls
+- **Pausable functionality** for emergency stops
+- **Owner withdrawal capabilities** for fund management
+- **Epoch-based timing controls** for operational windows
+- **Price oracle validation** before critical operations
 
-### Case 1: Small Investment (Direct)
+### 6. Data Integrity Safeguards
+- **Deposit state consistency** across all mappings
+- **Array integrity maintenance** (swap-and-pop patterns)
+- **Event emission** for all state changes
+- **Comprehensive error messages** for debugging
+
+## Common Use Cases & Examples
+
+### Case 1: Standard USDC Investment
 ```javascript
 // 1. Approve USDC
 await usdc.approve(zapperAddress, 100000000); // 100 USDC
 
-// 2. Invest directly
-const tx = await zapper.zapAndDeposit(usdcAddress, 100000000);
+// 2. Create unique deposit ID
+const depositId = ethers.utils.keccak256(
+  ethers.utils.defaultAbiCoder.encode(
+    ['address', 'uint256', 'uint256'],
+    [userAddress, Date.now(), 100000000]
+  )
+);
+
+// 3. Zap and deposit with slippage protection
+const tx = await zapper.zapAndDeposit(usdcAddress, 100000000, depositId, 100);
 const receipt = await tx.wait();
 
-// 3. Get shares from event
-const event = receipt.events.find(e => e.event === 'ZapInAndDeposit');
-const shares = event.args.shares;
+// 4. Wait for curator approval (monitor events)
+zapper.on('DepositApproved', (approvedDepositId, approvedAmount) => {
+  if (approvedDepositId === depositId) {
+    console.log(`Deposit approved for ${approvedAmount} USDC`);
+  }
+});
+
+// 5. Claim when approved
+const shares = await zapper.claimDeposit(depositId);
+console.log(`Received ${shares} xCUP shares`);
 ```
 
-### Case 2: Large Investment (Approval Required)
+### Case 2: ETH Investment with Automatic Processing
 ```javascript
-// 1. Approve token
-await token.approve(zapperAddress, largeAmount);
+// 1. Direct ETH send (uses receive function)
+const tx = await user.sendTransaction({
+  to: zapperAddress,
+  value: ethers.utils.parseEther('1.0')
+});
 
-// 2. Create deposit (returns depositId)
-const tx = await zapper.zapAndDeposit(tokenAddress, largeAmount);
-const receipt = await tx.wait();
+// 2. OR explicit zap function
+const depositId = ethers.utils.keccak256(ethers.utils.toUtf8Bytes('eth_deposit_1'));
+const tx = await zapper.zapAndDeposit(
+  '0x0000000000000000000000000000000000000000', // ETH
+  ethers.utils.parseEther('1.0'),
+  depositId,
+  200, // 2% slippage for ETH
+  { value: ethers.utils.parseEther('1.0') }
+);
 
-// 3. Get depositId from event
-const event = receipt.events.find(e => e.event === 'ZapIn');
-const depositId = event.args.depositId;
+// 3. Monitor and claim as above
+```
 
-// 4. Wait for curator approval (off-chain)
+### Case 3: Batch Operations (Curator)
+```javascript
+// 1. Get all pending deposits
+const pendingDeposits = await zapper.getPendingDeposits();
+console.log(`${pendingDeposits.length} deposits pending approval`);
 
-// 5. Claim after approval
-const shares = await zapper.claimDeposit(depositId);
+// 2. Approve proportionally (50% of total)
+const totalPending = await zapper.getTotalPendingAmount();
+const targetApproval = totalPending.div(2);
+await zapper.connect(curator).approveDepositsProportionally(targetApproval);
+
+// 3. OR approve all deposits
+await zapper.connect(curator).approveAllDeposits();
+
+// 4. Users can batch claim
+const totalShares = await zapper.connect(user).claimAllDeposits();
+```
+
+### Case 4: External Integration Flow
+```javascript
+// 1. Host system registers deposit
+const tag = ethers.utils.keccak256(ethers.utils.toUtf8Bytes('integration_ref_123'));
+const depositId = await zapper.connect(hostIntegration)
+  .registerExternalDepositFor(beneficiaryAddress, 5000000000, tag); // 5000 USDC
+
+// 2. Update beneficiary if needed
+await zapper.connect(hostIntegration)
+  .setDepositBeneficiary(depositId, newBeneficiaryAddress);
+
+// 3. Curator approves with price snapshot
+const priceSnapshot = 450000000; // $4.50 with 8 decimals
+await zapper.connect(curator)
+  .approveExternalDepositWithPrice(depositId, 5000000000, priceSnapshot);
+
+// 4. Beneficiary claims with locked price
+const shares = await zapper.connect(beneficiary).claimDeposit(depositId);
 ```
 
 ## Error Handling
@@ -293,21 +456,146 @@ const xcupShares = await xcupVault.balanceOf(userAddress);
 const copperPrice = await zapper.getCopperPrice();
 ```
 
-### Track Events
+### Event Monitoring & Integration
 ```javascript
-// Listen for deposit events
-zapper.on("ZapInAndDeposit", (router, tokenIn, amount, shares) => {
-    console.log(`Invested ${amount} of ${tokenIn} for ${shares} shares`);
+// Comprehensive event monitoring
+zapper.on('ZapAndDeposit', (router, tokenIn, amount, event) => {
+  console.log(`Deposit created: ${amount} of token ${tokenIn}`);
 });
 
-// Listen for approval events
-zapper.on("DepositApproved", (depositId) => {
-    console.log(`Deposit ${depositId} approved`);
+zapper.on('DepositApproved', (depositId, approvedAmount, event) => {
+  console.log(`Deposit ${depositId} approved for ${approvedAmount}`);
+});
+
+zapper.on('DepositClaimed', (depositId, user, shares, event) => {
+  console.log(`User ${user} claimed ${shares} shares for deposit ${depositId}`);
+});
+
+zapper.on('DepositClaimedFor', (depositId, user, beneficiary, claimedBy, tag, shares) => {
+  console.log(`External deposit ${depositId} claimed by ${claimedBy} for beneficiary ${beneficiary}`);
+});
+
+zapper.on('ProportionalApproval', (totalApproved, totalDeposited, proportion) => {
+  const percentage = proportion.mul(100).div(ethers.utils.parseEther('1'));
+  console.log(`Proportional approval: ${percentage}% (${totalApproved}/${totalDeposited})`);
+});
+
+zapper.on('ExternalDepositRegistered', (createdBy, beneficiary, depositId, tag, usdcAmount) => {
+  console.log(`External deposit registered: ${usdcAmount} USDC for ${beneficiary}`);
+});
+
+// Error handling
+zapper.on('error', (error) => {
+  console.error('Zapper contract error:', error);
 });
 ```
 
+## Advanced Features
+
+### Gasless Transactions (ERC20 Permit)
+```javascript
+// Use permit for gasless approvals
+const permitParams = {
+  value: amount,
+  deadline: Math.floor(Date.now() / 1000) + 3600, // 1 hour
+  v: signature.v,
+  r: signature.r,
+  s: signature.s
+};
+
+await zapper.zapAndDepositWithPermit(
+  tokenAddress, amount, permitParams, depositId, slippageBps
+);
+```
+
+### Withdrawal & Exit Strategies
+```javascript
+// Withdraw pending deposit before approval
+await zapper.withdrawDeposit(depositId);
+
+// Withdraw all pending deposits
+const totalRefunded = await zapper.withdrawAllDeposits();
+
+// Redeem xCUP shares for USDC
+const usdcReceived = await zapper.redeem(sharesToRedeem);
+```
+
+### Price & Market Information
+```javascript
+// Get current copper price
+const copperPrice = await zapper.getCopperPrice();
+console.log(`Current copper price: $${copperPrice / 1e8}`);
+
+// Get deposit information
+const deposit = await zapper.getDeposit(depositId);
+console.log('Deposit details:', {
+  user: deposit.user,
+  amount: deposit.amount,
+  approved: deposit.approved,
+  approvedAmount: deposit.approvedAmount,
+  isExternal: deposit.isExternal,
+  beneficiary: deposit.beneficiary
+});
+
+// Get user's deposits
+const userDepositIds = await zapper.getUserDepositIds(userAddress);
+const userDeposits = await zapper.getUserDeposits(userAddress);
+```
+
+## Best Practices
+
+### For Users
+1. **Always use unique deposit IDs** to avoid collisions
+2. **Monitor gas prices** before transactions, especially for ETH swaps
+3. **Set appropriate slippage** based on market conditions
+4. **Keep track of deposit IDs** for claiming later
+5. **Monitor epoch timing** for claim operations
+
+### For Integrators
+1. **Implement proper error handling** for all contract calls
+2. **Use event monitoring** for real-time updates
+3. **Validate all inputs** before contract interactions
+4. **Handle partial approvals** in your UI logic
+5. **Implement retry mechanisms** for failed transactions
+
+### For Curators
+1. **Review deposits thoroughly** before approval
+2. **Use batch operations** for efficiency
+3. **Consider vault capacity** when approving
+4. **Monitor epoch timing** for approval windows
+5. **Use proportional approvals** for fair distribution
+
+## Troubleshooting
+
+### Common Issues
+
+**"Epoch not active"**
+- Wait for next epoch or check epoch timing
+- Some operations only work during active epochs
+
+**"Deposit ID already exists"**
+- Use a different, unique deposit ID
+- Consider adding timestamp or nonce to ID generation
+
+**"Insufficient allowance"**
+- Approve sufficient tokens before deposit
+- Check token balance and allowance
+
+**"Copper price is 0"**
+- Oracle issue, wait for price update
+- Contact system administrators
+
+**"Invalid ETH amount"**
+- Ensure msg.value matches amount parameter for ETH deposits
+
 ## Conclusion
 
-The Zapper system provides a streamlined way to invest in copper-backed assets. The core flow is simple: approve tokens → zap and deposit → receive shares. For large investments, there's an additional approval step for security.
+The enhanced Zapper system provides a comprehensive, secure, and flexible platform for investing in copper-backed assets. With features like:
 
-The system automatically handles currency conversion, price calculations, and vault deposits, making it easy for users to gain exposure to copper markets through their existing cryptocurrencies. 
+- **Multi-token support** for diverse investment options
+- **Curator approval system** for professional oversight
+- **Batch operations** for operational efficiency
+- **External integrations** for institutional use
+- **Advanced security features** for user protection
+
+The system enables both individual and institutional investors to gain exposure to copper markets through their existing cryptocurrencies, with professional oversight and comprehensive risk management. 

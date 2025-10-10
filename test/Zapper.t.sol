@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.24;
+pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {console} from "forge-std/console.sol";
@@ -622,8 +622,8 @@ contract ZapperTest is Test {
         });
 
         vm.prank(owner);
-        vm.expectRevert("Invalid token");
-        zapper.zapAndDepositWithPermit(IERC20(address(0)), amountToDeposit, permitParams);
+        vm.expectRevert("Invalid amount");
+        zapper.zapAndDepositWithPermit(IERC20(address(0)), amountToDeposit, permitParams, keccak256("test"), 100);
     }
 
     function testZapAndDepositWithPermitRevertWhenPaused() public {
@@ -641,6 +641,6 @@ contract ZapperTest is Test {
 
         vm.prank(owner);
         vm.expectRevert();
-        zapper.zapAndDepositWithPermit(usdc, amountToDeposit, permitParams);
+        zapper.zapAndDepositWithPermit(usdc, amountToDeposit, permitParams, keccak256("test"), 100);
     }
 }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.24;
+pragma solidity ^0.8.24;
 
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
@@ -21,12 +21,21 @@ import {IEpochManager} from "./interfaces/IEpochManager.sol";
 
 /**
  * @title Silo
- * @dev A simple contract that holds USDC tokens and provides unlimited approval to the Zapper contract.
- * This contract acts as a vault for USDC tokens during the zapping process.
+ * @notice A simple contract that holds USDC tokens and provides unlimited approval to the Zapper contract
+ * @dev This contract acts as a temporary vault for USDC tokens during the zapping process.
+ *      It automatically approves the Zapper contract to spend its USDC balance, enabling
+ *      seamless token operations without requiring separate approval transactions.
  */
 contract Silo {
     using SafeERC20 for IERC20;
 
+    /**
+     * @notice Initializes the Silo with unlimited approval for the Zapper
+     * @dev Grants unlimited spending approval to the deploying Zapper contract.
+     *      This eliminates the need for separate approval transactions during zapping.
+     *
+     * @param token The USDC token contract to approve spending for
+     */
     constructor(IERC20 token) {
         token.forceApprove(msg.sender, type(uint256).max);
     }
@@ -34,8 +43,13 @@ contract Silo {
 
 /**
  * @title Zapper
- * @dev A DeFi protocol contract that allows users to zap (swap) various tokens into USDC and deposit them into a vault.
- * The contract manages deposits through an approval system where vault curators can approve or decline deposits.
+ * @notice A DeFi protocol contract that allows users to zap various tokens into the xCUP vault
+ * @dev This contract enables users to deposit various tokens (USDC, ETH, etc.) which are converted
+ *      to USDC and then processed through an approval system. Vault curators can approve or decline
+ *      deposits before they are converted to CUP tokens and deposited into the xCUP vault.
+ *
+ *      The contract supports both direct deposits and external deposits (for host-to-host integrations).
+ *      It integrates with Uniswap for token swaps and uses a Silo contract for USDC management.
  */
 contract Zapper is
     Initializable,
@@ -46,42 +60,73 @@ contract Zapper is
 {
     using SafeERC20 for IERC20;
 
-    /// @dev Role identifier for vault curators who can approve/decline deposits
+    /// @notice Role identifier for vault curators who can approve/decline deposits
+    /// @dev Granted to addresses that can approve user deposits for vault entry
     bytes32 public constant VAULT_CURATOR_ROLE = keccak256("VAULT_CURATOR_ROLE");
-    /// @dev Role identifier for host-to-host integrations (e.g., backend adapter)
+
+    /// @notice Role identifier for host-to-host integrations (e.g., backend adapter)
+    /// @dev Granted to external systems that can register deposits on behalf of users
     bytes32 public constant HOST_INTEGRATION_ROLE = keccak256("HOST_INTEGRATION_ROLE");
 
-    /// @dev CUP token contract address
+    /// @notice CUP token contract for vault deposits
+    /// @dev The underlying asset of the xCUP vault
     IERC20 private _cup;
-    /// @dev USDC token contract address
+
+    /// @notice USDC token contract for deposit processing
+    /// @dev Primary stablecoin used for deposit value calculations
     IERC20 private _usdc;
-    /// @dev xCUP vault contract (ERC4626 compliant)
+
+    /// @notice xCUP vault contract (ERC4626 compliant)
+    /// @dev The target vault where approved deposits are sent
     IERC4626 private _vault;
-    /// @dev Uniswap V2 router for token swaps
+
+    /// @notice Uniswap V2 router for token swaps
+    /// @dev Used to convert various tokens to USDC during zapping
     IUniswapV2Router02 private _router;
-    /// @dev Copper price oracle consumer
+
+    /// @notice Copper price oracle consumer
+    /// @dev Provides copper spot prices for CUP token conversions
     ICopperPriceConsumer private _copperPriceConsumer;
-    /// @dev Silo contract that holds USDC during operations
+
+    /// @notice Silo contract that holds USDC during operations
+    /// @dev Temporary storage for USDC tokens with pre-approved spending
     Silo private _silo;
-    /// @dev Epoch manager for time-based operations
+
+    /// @notice Epoch manager for time-based operations
+    /// @dev Controls when deposits can be made based on epoch timing
     IEpochManager private _epochManager;
 
-    /// @dev Mapping of deposit IDs to deposit information
+    /// @notice Mapping of deposit IDs to deposit information
+    /// @dev Stores all deposit data indexed by unique deposit ID
     mapping(bytes32 depositId => Deposit) private _approvedDeposits;
-    /// @dev Array of pending deposit IDs
+
+    /// @notice Array of pending deposit IDs awaiting curator approval
+    /// @dev Used to iterate over pending deposits for batch operations
     bytes32[] private _pendingDepositIds;
-    /// @dev Mapping of user to their deposit IDs
+
+    /// @notice Mapping of user addresses to their deposit IDs
+    /// @dev Allows users to query all their deposits
     mapping(address => bytes32[]) private _userDeposits;
-    /// @dev Mapping of user to their nonce for deposit ID generation
+
+    /// @notice Mapping of user addresses to their nonce for deposit ID generation
+    /// @dev Ensures unique deposit IDs for each user
     mapping(address => uint256) private _userNonces;
 
     /**
-     * @dev Struct representing a user deposit
-     * @param user The address of the user who made the deposit
+     * @notice Struct representing a user deposit with comprehensive tracking
+     * @dev Contains all necessary information for deposit lifecycle management
+     * @param user The address of the user who made the deposit (originator/payer)
      * @param depositId Unique identifier for the deposit
-     * @param amount Total amount deposited in USDC
-     * @param approvedAmount Amount approved by vault curators
-     * @param approved Whether the deposit has been approved
+     * @param amount Total amount deposited in USDC (6 decimals)
+     * @param approvedAmount Amount approved by vault curators in USDC
+     * @param approved Whether the deposit has been approved by curators
+     * @param beneficiary Who will receive xCUP tokens on claim (for external deposits)
+     * @param createdBy Who initiated the deposit (EOA or adapter contract)
+     * @param claimedBy Who executed the claim transaction
+     * @param isExternal True if created via external adapter flow
+     * @param tag Integration-specific identifier for tracking
+     * @param approvedCupAmount Fixed CUP amount approved (for external deposits with price snapshot)
+     * @param priceSnapshot Copper price used for approval (for external deposits)
      */
     struct Deposit {
         address user; // originator (payer) for on-chain deposits
@@ -100,12 +145,13 @@ contract Zapper is
     }
 
     /**
-     * @dev Struct for permit parameters (currently unused but reserved for future use)
-     * @param value The permit value
-     * @param deadline The permit deadline
-     * @param v The v component of the signature
-     * @param r The r component of the signature
-     * @param s The s component of the signature
+     * @notice Struct for ERC20 permit parameters to enable gasless approvals
+     * @dev Used with ERC20Permit tokens to allow users to approve and deposit in one transaction
+     * @param value The amount to approve for spending
+     * @param deadline The timestamp after which the permit is no longer valid
+     * @param v The recovery identifier of the signature (27 or 28)
+     * @param r The first 32 bytes of the signature
+     * @param s The second 32 bytes of the signature
      */
     struct PermitParams {
         uint256 value;
@@ -116,14 +162,23 @@ contract Zapper is
     }
 
     /**
-     * @dev Emitted when a user claims their approved deposit and receives vault shares
+     * @notice Emitted when a user claims their approved deposit and receives vault shares
      * @param depositId The unique identifier of the deposit
      * @param user The address of the user claiming the deposit
      * @param shares The number of vault shares received
      */
-    event DepositClaimed(bytes32 depositId, address user, uint256 shares);
+    event DepositClaimed(bytes32 indexed depositId, address indexed user, uint256 shares);
 
-    /// @dev Richer claim event for external/beneficiary based flows
+    /**
+     * @notice Emitted when an external deposit is claimed with beneficiary details
+     * @dev Provides comprehensive tracking for external/host-to-host deposit flows
+     * @param depositId The unique identifier of the deposit
+     * @param user The original user who initiated the deposit
+     * @param beneficiary The address that received the xCUP tokens
+     * @param claimedBy The address that executed the claim transaction
+     * @param tag The integration-specific identifier
+     * @param shares The number of vault shares received
+     */
     event DepositClaimedFor(
         bytes32 indexed depositId,
         address indexed user,
@@ -134,33 +189,33 @@ contract Zapper is
     );
 
     /**
-     * @dev Emitted when a vault curator approves a deposit
+     * @notice Emitted when a vault curator approves a deposit
      * @param depositId The unique identifier of the deposit
-     * @param approvedAmount The amount approved for the deposit
+     * @param approvedAmount The amount approved for the deposit in USDC
      */
-    event DepositApproved(bytes32 depositId, uint256 approvedAmount);
+    event DepositApproved(bytes32 indexed depositId, uint256 approvedAmount);
 
     /**
-     * @dev Emitted when a vault curator declines a deposit and refunds the user
+     * @notice Emitted when a vault curator declines a deposit and refunds the user
      * @param depositId The unique identifier of the deposit
      * @param user The address of the user whose deposit was declined
-     * @param refundAmount The amount refunded to the user
+     * @param refundAmount The amount refunded to the user in USDC
      */
-    event DepositDeclined(bytes32 depositId, address user, uint256 refundAmount);
+    event DepositDeclined(bytes32 indexed depositId, address indexed user, uint256 refundAmount);
 
     /**
-     * @dev Emitted when a user withdraws their deposit before approval
-     * @param depositId The unique identifier of the deposit
+     * @notice Emitted when a user withdraws their deposit before approval
+     * @param depositId The unique identifier of the deposit (bytes32(0) for batch withdrawals)
      * @param user The address of the user withdrawing the deposit
-     * @param amount The amount withdrawn
+     * @param amount The amount withdrawn in USDC
      */
-    event DepositWithdrawn(bytes32 depositId, address user, uint256 amount);
+    event DepositWithdrawn(bytes32 indexed depositId, address indexed user, uint256 amount);
 
     /**
-     * @dev Emitted when deposits are approved proportionally
-     * @param totalApproved Total amount approved across all deposits
-     * @param totalDeposited Total amount deposited across all pending deposits
-     * @param proportion The proportion used for approval (scaled by 1e18)
+     * @notice Emitted when deposits are approved proportionally
+     * @param totalApproved Total amount approved across all deposits in USDC
+     * @param totalDeposited Total amount deposited across all pending deposits in USDC
+     * @param proportion The proportion used for approval (scaled by 1e18, where 1e18 = 100%)
      */
     event ProportionalApproval(uint256 totalApproved, uint256 totalDeposited, uint256 proportion);
 
@@ -194,7 +249,16 @@ contract Zapper is
     error PermitFailed();
 
     /**
-     * @dev Modifier that ensures the epoch is active
+
+    /**
+     * @notice Modifier that ensures the epoch is active for time-sensitive operations
+     * @dev Prevents operations that require active epoch timing from executing when epoch has ended.
+     *      This is critical for maintaining the protocol's time-based deposit and approval cycles.
+     *
+     * Requirements:
+     * - Current epoch must have time remaining (timeLeftInEpoch() > 0)
+     *
+     * @custom:security This modifier protects against operations outside of valid epoch windows
      * @custom:revert "Epoch not active" if the epoch has ended
      */
     modifier whenEpochActive() {
@@ -208,28 +272,32 @@ contract Zapper is
     }
 
     /**
-     * @dev Initializes the Zapper contract with required addresses and configurations
-     * @param cup The address of the CUP token contract
-     * @param usdc The address of the USDC token contract
-     * @param vault The address of the xCUP vault contract (ERC4626)
-     * @param router The address of the Uniswap V2 router
-     * @param copperPriceConsumer The address of the copper price oracle consumer
-     * @param epochManager The address of the epoch manager contract
+     * @notice Initializes the Zapper contract with all required dependencies and configurations
+     * @dev This function sets up the complete Zapper ecosystem including token contracts,
+     *      DEX integration, price oracles, and timing mechanisms. It also creates the Silo
+     *      contract for USDC management and establishes proper access controls.
+     *
+     * @param cup_ The address of the CUP token contract (underlying vault asset)
+     * @param usdc_ The address of the USDC token contract (primary stablecoin for deposits)
+     * @param vault_ The address of the xCUP vault contract (ERC4626 compliant)
+     * @param router_ The address of the Uniswap V2 router (for token swaps)
+     * @param copperPriceConsumer_ The address of the copper price oracle consumer
+     * @param epochManager_ The address of the epoch manager contract (timing control)
      */
     function initialize(
-        address cup,
-        address usdc,
-        address vault,
-        address router,
-        address copperPriceConsumer,
-        address epochManager
+        address cup_,
+        address usdc_,
+        address vault_,
+        address router_,
+        address copperPriceConsumer_,
+        address epochManager_
     ) public initializer {
-        require(cup != address(0), "Invalid CUP address");
-        require(usdc != address(0), "Invalid USDC address");
-        require(vault != address(0), "Invalid Vault address");
-        require(router != address(0), "Invalid Router address");
-        require(copperPriceConsumer != address(0), "Invalid Copper Price Consumer address");
-        require(epochManager != address(0), "Invalid Epoch Manager address");
+        require(cup_ != address(0), "Invalid CUP address");
+        require(usdc_ != address(0), "Invalid USDC address");
+        require(vault_ != address(0), "Invalid Vault address");
+        require(router_ != address(0), "Invalid Router address");
+        require(copperPriceConsumer_ != address(0), "Invalid Copper Price Consumer address");
+        require(epochManager_ != address(0), "Invalid Epoch Manager address");
 
         __AccessControl_init();
         __Ownable_init(_msgSender());
@@ -238,48 +306,73 @@ contract Zapper is
 
         _grantRole(DEFAULT_ADMIN_ROLE, _msgSender());
 
-        _cup = IERC20(cup);
-        _usdc = IERC20(usdc);
-        _vault = IERC4626(vault);
-        _router = IUniswapV2Router02(router);
-        _copperPriceConsumer = ICopperPriceConsumer(copperPriceConsumer);
+        _cup = IERC20(cup_);
+        _usdc = IERC20(usdc_);
+        _vault = IERC4626(vault_);
+        _router = IUniswapV2Router02(router_);
+        _copperPriceConsumer = ICopperPriceConsumer(copperPriceConsumer_);
 
         _silo = new Silo(_usdc);
-        _epochManager = IEpochManager(epochManager);
+        _epochManager = IEpochManager(epochManager_);
     }
 
     /**
-     * @dev Removes a deposit ID from the pending deposits array
-     * @param depositId The deposit ID to remove
+     * @notice Removes a deposit ID from the pending deposits array using swap-and-pop pattern
+     * @dev This function maintains array integrity by swapping the target element with the last
+     *      element and then removing the last element. This avoids gaps in the array but
+     *      changes the order of elements.
+     *
+     * @param depositId The deposit ID to remove from pending deposits
      */
     function _removePendingDeposit(bytes32 depositId) internal {
+        // Iterate through the pending deposits array to find the target depositId
         for (uint256 i = 0; i < _pendingDepositIds.length; i++) {
             if (_pendingDepositIds[i] == depositId) {
                 _pendingDepositIds[i] = _pendingDepositIds[_pendingDepositIds.length - 1];
+
+                // Remove the last element (which is now duplicated)
                 _pendingDepositIds.pop();
+
+                // Exit early once found and removed
                 break;
             }
         }
     }
 
     /**
-     * @dev Removes a deposit ID from a user's deposit list
+     * @notice Removes a deposit ID from a user's personal deposit tracking list
+     * @dev Similar to _removePendingDeposit, this uses swap-and-pop pattern to maintain
+     *      array efficiency while removing elements. This is called when deposits are
+     *      claimed, withdrawn, or declined.
+     *
+     * @param user The user whose deposit list should be updated
+     * @param depositId The deposit ID to remove from the user's list
      */
     function _removeUserDeposit(address user, bytes32 depositId) internal {
+        // Get reference to user's deposit array for efficient access
         bytes32[] storage ids = _userDeposits[user];
+
+        // Search for the depositId in user's personal deposit list
         for (uint256 i = 0; i < ids.length; i++) {
             if (ids[i] == depositId) {
                 ids[i] = ids[ids.length - 1];
+
+                // Remove the last element (now duplicated)
                 ids.pop();
+
+                // Exit immediately after successful removal
                 break;
             }
         }
     }
 
     /**
-     * @dev Records a new deposit in the system
-     * @param depositId The unique identifier for the deposit
-     * @param amount The amount of the deposit in USDC
+     * @notice Records a new deposit in the system with comprehensive tracking
+     * @dev Creates a new Deposit struct and adds it to all relevant tracking mappings.
+     *      This function is the core deposit registration mechanism for regular user deposits.
+     *
+     * @param depositId The unique identifier for the deposit (must be unique)
+     * @param amount The amount of the deposit in USDC (6 decimals)
      */
     function _recordDeposit(bytes32 depositId, uint256 amount) internal {
         require(_approvedDeposits[depositId].user == address(0), "Deposit ID already exists");
@@ -302,7 +395,15 @@ contract Zapper is
     }
 
     /**
-     * @dev Records a new external deposit (no token transfer) with beneficiary and tag
+     * @notice Records a new external deposit for host-to-host integrations
+     * @dev Creates a deposit record without any token transfers. This is used for external
+     *      integrations where tokens are managed off-chain or by external systems.
+     *      The deposit includes beneficiary and tag information for integration tracking.
+     *
+     * @param usdcAmount The notional USDC amount for the deposit
+     * @param beneficiary_ The address that will receive xCUP tokens upon claim
+     * @param tag_ Integration-specific identifier for tracking
+     * @return depositId The generated unique identifier for this deposit
      */
     function _recordExternalDeposit(
         uint256 usdcAmount,
@@ -330,26 +431,32 @@ contract Zapper is
     }
 
     /**
-     * @dev Swaps input tokens for USDC using Uniswap V2
-     * @param tokenIn The token to swap from (address(0) == ETH)
-     * @param amount The amount of tokens to swap
-     * @param slippageBps The slippage tolerance in basis points (e.g., 100 = 1%)
-     * @return depositValue The amount of USDC received from the swap
+     * @notice Swaps input tokens for USDC using Uniswap V2 with slippage protection
+     * @dev This function handles the complete token-to-USDC conversion process including
+     *      token transfers, approvals, and DEX interactions. It supports both ERC20 tokens
+     *      and native ETH (represented as address(0)).
+     *
+     * @param tokenIn The token to swap from (address(0) for ETH)
+     * @param amount The amount of tokens to swap (in token's native decimals)
+     * @param slippageBps The slippage tolerance in basis points (100 = 1%, 1000 = 10%)
+     * @return depositValue The net amount of USDC received from the swap (6 decimals)
      */
     function _zapIn(IERC20 tokenIn, uint256 amount, uint256 slippageBps) internal returns (uint256 depositValue) {
         uint256 initialTokenOutBalance = _usdc.balanceOf(address(_silo));
 
-        // If tokenIn is not ETH, transfer token from user
+        // Handle token transfer based on input type (ERC20 vs ETH)
         if (address(tokenIn) != address(0)) {
+            // ERC20 token: Transfer from user to this contract for swap
             tokenIn.safeTransferFrom(_msgSender(), address(this), amount);
         }
 
-        // Approve router or handle ETH
+        // Handle router approval based on input type
         if (address(tokenIn) != address(0)) {
-            // tokenIn might have custom forceApprove
+            // ERC20 token: Approve Uniswap router to spend tokens
+            // Use forceApprove to handle tokens with non-standard approval behavior
             IERC20(address(tokenIn)).forceApprove(router(), amount);
         } else {
-            // ETH: ensure msg.value equals amount
+            // ETH case: Validate that msg.value matches the specified amount
             require(msg.value == amount, "Invalid ETH amount");
         }
 
@@ -361,27 +468,34 @@ contract Zapper is
     }
 
     /**
-     * @dev Executes a token swap on Uniswap V2
-     * @param tokenIn The address of the input token (address(0) == ETH)
-     * @param tokenOut The address of the output token
+     * @notice Executes a token swap on Uniswap V2 with automatic path routing
+     * @dev This function handles the low-level DEX interaction including path construction,
+     *      slippage calculation, and swap execution. It automatically handles ETH/WETH
+     *      conversion and applies slippage protection.
+     *
+     * @param tokenIn The address of the input token (address(0) for ETH)
+     * @param tokenOut The address of the output token (typically USDC)
      * @param amountIn The amount of input tokens to swap
-     * @param slippageBps The slippage tolerance in basis points (e.g., 100 = 1%)
+     * @param slippageBps The slippage tolerance in basis points (100 = 1%)
      */
     function _tradeForToken(address tokenIn, address tokenOut, uint256 amountIn, uint256 slippageBps) internal {
+        // Construct trading path for Uniswap V2 (direct pair assumed)
         address[] memory path = new address[](2);
 
+        // Handle ETH representation in trading path
         if (tokenIn == address(0)) {
-            // ETH case: use WETH as path[0]
+            // ETH case: Use WETH address for Uniswap routing
             path[0] = _router.WETH();
         } else {
+            // ERC20 token case: Use token address directly
             path[0] = tokenIn;
         }
         path[1] = tokenOut;
 
-        // Get the amount of tokens out for the given amount in
+        // Query expected output amounts from Uniswap router
         uint256[] memory amountsOut = _router.getAmountsOut(amountIn, path);
 
-        // If the token in is ETH (address(0) or WETH), swap ETH for USDC
+        // Handle ETH swaps specially (require ETH to be sent with transaction)
         if (tokenIn == address(0) || tokenIn == _router.WETH()) {
             // send ETH along
             _router.swapExactETHForTokens{value: amountIn}(amountsOut[1], path, address(_silo), block.timestamp);
@@ -395,7 +509,15 @@ contract Zapper is
     }
 
     /**
-     * @dev The `_executePermit` function is used to execute a permit.
+     * @notice Executes an ERC20 permit for gasless token approvals
+     * @dev This function enables users to approve token spending without a separate transaction
+     *      by using EIP-2612 permit functionality. It validates the permit signature and
+     *      ensures the approval was successful.
+     *
+     * @param token The ERC20Permit token contract
+     * @param owner The token owner granting the approval
+     * @param spender The address receiving the approval (typically this contract)
+     * @param permitParams The permit signature components and parameters
      */
     function _execPermit(IERC20 token, address owner, address spender, PermitParams calldata permitParams) internal {
         ERC20Permit(address(token)).permit(
@@ -433,11 +555,16 @@ contract Zapper is
     }
 
     /**
-     * @dev Allows users to zap tokens into USDC and create a deposit (with permit)
-     * @param tokenIn The token to zap (can be any ERC20 or ETH using address(0))
-     * @param amount The amount of tokens to zap
+     * @notice Allows users to zap tokens into USDC and create a deposit using gasless permit
+     * @dev This function combines ERC20 permit functionality with the zapping process,
+     *      enabling users to approve and deposit in a single transaction. It handles
+     *      both ERC20 tokens (with permit) and native ETH deposits.
+     *
+     * @param tokenIn The token to zap (ERC20 address or address(0) for ETH)
+     * @param amount The amount of tokens to zap (in token's native decimals)
+     * @param permitParams The ERC20 permit signature components
      * @param depositId The unique identifier for the created deposit
-     * @param slippageBps The slippage tolerance in basis points (e.g., 100 = 1%). Default is 100 (1%)
+     * @param slippageBps The slippage tolerance in basis points (0 = use default 100)
      */
     function zapAndDepositWithPermit(
         IERC20 tokenIn,
@@ -468,11 +595,15 @@ contract Zapper is
     }
 
     /**
-     * @dev Allows users to zap tokens into USDC and create a deposit
-     * @param tokenIn The token to zap (can be any ERC20 or ETH using address(0))
-     * @param amount The amount of tokens to zap
+     * @notice Allows users to zap tokens into USDC and create a deposit
+     * @dev This is the primary entry point for user deposits. It handles token swapping,
+     *      USDC conversion, and deposit registration in a single transaction. Supports
+     *      any ERC20 token or native ETH with configurable slippage protection.
+     *
+     * @param tokenIn The token to zap (ERC20 address or address(0) for ETH)
+     * @param amount The amount of tokens to zap (in token's native decimals)
      * @param depositId The unique identifier for the created deposit
-     * @param slippageBps The slippage tolerance in basis points (e.g., 100 = 1%). Default is 100 (1%)
+     * @param slippageBps The slippage tolerance in basis points (0 = use default 100)
      */
     function zapAndDeposit(
         IERC20 tokenIn,
@@ -497,8 +628,15 @@ contract Zapper is
     }
 
     /**
-     * @dev Host-to-host integration: register an external deposit for a beneficiary with a tag
-     * No token movement occurs here; values are informational until approval/claim.
+     * @notice Registers an external deposit for host-to-host integrations
+     * @dev This function enables external systems (like backend adapters) to register
+     *      deposits on behalf of users without any token transfers. The deposit is
+     *      purely informational until approved and claimed.
+     *
+     * @param beneficiary_ The address that will receive xCUP tokens upon claim
+     * @param usdcAmount The notional USDC amount for the deposit
+     * @param tag_ Integration-specific identifier for tracking and reconciliation
+     * @return depositId The generated unique identifier for this deposit
      */
     function registerExternalDepositFor(
         address beneficiary_,
@@ -511,7 +649,13 @@ contract Zapper is
     }
 
     /**
-     * @dev Optional: allow host to update beneficiary before approval
+     * @notice Allows host integrations to update the beneficiary of a pending deposit
+     * @dev This function provides flexibility for external integrations to modify
+     *      the beneficiary address before the deposit is approved by curators.
+     *      This is useful for correcting errors or handling dynamic beneficiary assignment.
+     *
+     * @param depositId The unique identifier of the deposit to update
+     * @param beneficiary_ The new beneficiary address for the deposit
      */
     function setDepositBeneficiary(
         bytes32 depositId,
@@ -524,7 +668,11 @@ contract Zapper is
     }
 
     /**
-     * @dev Allows users to withdraw their deposit before it's approved
+     * @notice Allows users to withdraw their deposit before curator approval
+     * @dev This function enables users to cancel their pending deposits and receive
+     *      a full refund of their USDC. This provides an exit mechanism before the
+     *      approval process is complete.
+     *
      * @param depositId The unique identifier of the deposit to withdraw
      */
     function withdrawDeposit(bytes32 depositId) external whenNotPaused nonReentrant {
@@ -547,7 +695,11 @@ contract Zapper is
     }
 
     /**
-     * @dev Allows users to withdraw all their pending deposits at once
+     * @notice Allows users to withdraw all their pending deposits in a single transaction
+     * @dev This function provides a convenient way for users to cancel all their pending
+     *      deposits at once, receiving a full refund for all unapproved deposits.
+     *      It uses a two-pass algorithm to safely handle array modifications.
+     *
      * @return totalRefunded The total amount of USDC refunded to the user
      */
     function withdrawAllDeposits() external whenNotPaused nonReentrant returns (uint256 totalRefunded) {
@@ -591,9 +743,13 @@ contract Zapper is
     }
 
     /**
-     * @dev Allows vault curators to approve a specific deposit
+     * @notice Allows vault curators to approve a specific deposit for vault entry
+     * @dev This function enables curators to review and approve individual deposits,
+     *      potentially for partial amounts. Approved deposits can then be claimed by
+     *      users to receive xCUP vault shares.
+     *
      * @param depositId The unique identifier of the deposit to approve
-     * @param approvedAmount The amount to approve (must be <= total deposit amount)
+     * @param approvedAmount The amount to approve in USDC (must be <= total deposit)
      */
     function approveDeposit(
         bytes32 depositId,
@@ -613,8 +769,14 @@ contract Zapper is
     }
 
     /**
-     * @dev Approve an external deposit with an explicit price snapshot.
-     * Records a fixed CUP amount to be used on claim.
+     * @notice Approves an external deposit with a fixed copper price snapshot
+     * @dev This function is specifically designed for external deposits where the
+     *      copper price needs to be locked at approval time rather than claim time.
+     *      This provides price certainty for external integrations.
+     *
+     * @param depositId The unique identifier of the external deposit
+     * @param approvedUsdc The USDC amount to approve
+     * @param price The copper price to use for CUP calculation (with 8 decimals)
      */
     function approveExternalDepositWithPrice(
         bytes32 depositId,
@@ -639,7 +801,11 @@ contract Zapper is
     }
 
     /**
-     * @dev Allows vault curators to decline a deposit and refund the user
+     * @notice Allows vault curators to decline a deposit and issue a full refund
+     * @dev This function enables curators to reject deposits that don't meet criteria
+     *      and automatically refund the full amount to the user. This provides a
+     *      mechanism for regulatory compliance and risk management.
+     *
      * @param depositId The unique identifier of the deposit to decline
      */
     function declineDeposit(
@@ -665,8 +831,12 @@ contract Zapper is
     }
 
     /**
-     * @dev Allows vault curators to approve multiple deposits proportionally
-     * @param targetTotalAmount The total amount to approve across all pending deposits
+     * @notice Allows vault curators to approve multiple deposits proportionally
+     * @dev This function enables curators to approve a specific total amount across
+     *      all pending deposits, with each deposit receiving a proportional share.
+     *      This is useful for managing vault capacity and fair distribution.
+     *
+     * @param targetTotalAmount The total USDC amount to approve across all deposits
      */
     function approveDepositsProportionally(
         uint256 targetTotalAmount
@@ -714,10 +884,13 @@ contract Zapper is
     }
 
     /**
-     * @dev Allows vault curators to approve all pending deposits in full
-     * This method approves every pending deposit for their complete amount
-     * @return totalApproved The total amount approved across all deposits
-     * @return depositsApproved The number of deposits that were approved
+     * @notice Allows vault curators to approve all pending deposits in full
+     * @dev This function provides a convenient way to approve all pending deposits
+     *      for their complete amounts. This is useful when vault has sufficient
+     *      capacity and all deposits meet approval criteria.
+     *
+     * @return totalApproved The total USDC amount approved across all deposits
+     * @return depositsApproved The number of individual deposits that were approved
      */
     function approveAllDeposits()
         external
@@ -751,9 +924,13 @@ contract Zapper is
     }
 
     /**
-     * @dev Allows users to claim their approved deposits and receive vault shares
+     * @notice Allows users to claim their approved deposits and receive xCUP vault shares
+     * @dev This function converts approved USDC deposits into CUP tokens and deposits
+     *      them into the xCUP vault, returning vault shares to the user or beneficiary.
+     *      It handles both regular and external deposits with different pricing mechanisms.
+     *
      * @param depositId The unique identifier of the deposit to claim
-     * @return shares The number of vault shares received
+     * @return shares The number of xCUP vault shares received by beneficiary
      */
     function claimDeposit(
         bytes32 depositId
@@ -806,9 +983,12 @@ contract Zapper is
     }
 
     /**
-     * @dev Claim all approved deposits for msg.sender and receive vault shares.
-     * Iterates over user's deposit IDs and claims those which are approved.
-     * @return totalShares total number of shares received for all claimed deposits
+     * @notice Claims all approved deposits for the caller in a single transaction
+     * @dev This function provides a convenient way to claim multiple approved deposits
+     *      at once, reducing gas costs and improving user experience. It safely handles
+     *      array modifications during iteration.
+     *
+     * @return totalShares The total number of xCUP vault shares received across all claims
      */
     function claimAllDeposits() external whenNotPaused whenEpochActive nonReentrant returns (uint256 totalShares) {
         bytes32[] storage ids = _userDeposits[_msgSender()];
@@ -837,8 +1017,12 @@ contract Zapper is
     }
 
     /**
-     * @dev Allows the contract owner to withdraw USDC from the silo
-     * @param amount The amount of USDC to withdraw
+     * @notice Allows the contract owner to withdraw USDC from the Silo for management purposes
+     * @dev This function provides the owner with the ability to withdraw USDC from the Silo
+     *      for operational purposes such as rebalancing, emergency management, or protocol
+     *      maintenance. This is an administrative function with significant privileges.
+     *
+     * @param amount The amount of USDC to withdraw from the Silo (6 decimals)
      */
     function withdraw(uint256 amount) external onlyOwner {
         require(_usdc.balanceOf(address(silo())) >= amount, "Insufficient USDC balance");
@@ -849,9 +1033,13 @@ contract Zapper is
     }
 
     /**
-     * @dev Allows users to redeem their vault shares for USDC
-     * @param sharesToRedeem The number of vault shares to redeem
-     * @return usdcToWithdraw The amount of USDC received
+     * @notice Allows users to redeem their xCUP vault shares for USDC
+     * @dev This function enables users to exit their vault position by redeeming xCUP
+     *      shares for the underlying CUP tokens, then converting them back to USDC
+     *      using the current copper price. This provides liquidity for vault investors.
+     *
+     * @param sharesToRedeem The number of xCUP vault shares to redeem
+     * @return usdcToWithdraw The amount of USDC received from redemption
      */
     function redeem(uint256 sharesToRedeem) external nonReentrant returns (uint256 usdcToWithdraw) {
         require(sharesToRedeem > 0, "Shares to redeem must be greater than 0");
@@ -882,33 +1070,49 @@ contract Zapper is
     }
 
     /**
-     * @dev Returns the current copper price from the oracle
-     * @return price The copper price with 11 decimal places
+     * @notice Returns the current copper price from the oracle
+     * @dev This function provides access to the current copper spot price used for
+     *      CUP token conversions. The price is fetched from the configured copper
+     *      price consumer contract which may use Chainlink or other oracle sources.
+     *
+     * @return price The current copper price with 8 decimal places
      */
     function getCopperPrice() public view returns (uint256 price) {
         price = _copperPriceConsumer.price();
     }
 
     /**
-     * @dev Returns the deposit information for a given deposit ID
-     * @param depositId The unique identifier of the deposit
-     * @return The deposit information
+     * @notice Returns complete deposit information for a given deposit ID
+     * @dev This function provides access to all stored information about a specific
+     *      deposit, including user details, amounts, approval status, and metadata.
+     *      Useful for frontend interfaces and integration systems.
+     *
+     * @param depositId The unique identifier of the deposit to query
+     * @return The complete Deposit struct with all information
      */
     function getDeposit(bytes32 depositId) external view returns (Deposit memory) {
         return _approvedDeposits[depositId];
     }
 
     /**
-     * @dev Returns all pending deposit IDs
-     * @return Array of pending deposit IDs
+     * @notice Returns all pending deposit IDs awaiting curator approval
+     * @dev This function provides a list of all deposit IDs that are currently
+     *      pending curator review and approval. Useful for curator interfaces
+     *      and batch processing operations.
+     *
+     * @return Array of bytes32 deposit IDs currently pending approval
      */
     function getPendingDepositIds() external view returns (bytes32[] memory) {
         return _pendingDepositIds;
     }
 
     /**
-     * @dev Returns all pending deposits with full information
-     * @return deposits Array of pending deposits with complete details
+     * @notice Returns all pending deposits with complete information
+     * @dev This function provides detailed information about all pending deposits,
+     *      including full Deposit structs. It filters out invalid entries and
+     *      returns only valid, unapproved deposits.
+     *
+     * @return deposits Array of complete Deposit structs for all pending deposits
      */
     function getPendingDeposits() external view returns (Deposit[] memory deposits) {
         // First, count valid pending deposits
@@ -1009,8 +1213,10 @@ contract Zapper is
     }
 
     /**
-     * @dev Payable receive - automatically zapAndDeposit ETH sent to contract.
-     * Allows simple `send` of ETH which will be processed as a deposit (address(0) used to denote ETH).
+     * @notice Automatically processes ETH sent directly to the contract as a deposit
+     * @dev This receive function enables users to simply send ETH to the contract
+     *      address and have it automatically processed as a deposit. It provides
+     *      a convenient way to deposit ETH without calling specific functions.
      */
     receive() external payable whenNotPaused {
         require(msg.value > 0, "No ETH sent");
@@ -1022,7 +1228,10 @@ contract Zapper is
     }
 
     /**
-     * @dev Fallback to support direct sends or calls
+     * @notice Fallback function to handle ETH sent with data or unknown function calls
+     * @dev This fallback function provides a safety net for ETH sent to the contract
+     *      with data or when calling non-existent functions. It processes any ETH
+     *      value as a deposit, similar to the receive function.
      */
     fallback() external payable whenNotPaused {
         if (msg.value > 0) {

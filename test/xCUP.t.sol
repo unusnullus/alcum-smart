@@ -88,11 +88,22 @@ contract xCUPTest is Test {
         // Deploy mock router
         router = new MockUniswapRouter();
 
-        // Deploy xCUP using upgradeable pattern
+        // Deploy xCUP using upgradeable pattern with all parameters
         address xcupProxy = Upgrades.deployTransparentProxy(
             "xCUP.sol:xCUP",
             owner,
-            abi.encodeCall(xCUP.initialize, (IERC20(address(cupToken)), "xCUP Vault", "xCUP"))
+            abi.encodeCall(
+                xCUP.initialize,
+                (
+                    IERC20(address(cupToken)),
+                    "xCUP Vault",
+                    "xCUP",
+                    address(priceConsumer),
+                    address(router),
+                    address(usdcToken),
+                    address(wethToken)
+                )
+            )
         );
         xcup = xCUP(xcupProxy);
 
@@ -120,7 +131,13 @@ contract xCUPTest is Test {
         assertEq(xcup.totalAssets(), 0);
         assertEq(xcup.owner(), owner);
         assertFalse(xcup.paused());
-        assertFalse(xcup.v2Initialized());
+        assertTrue(xcup.v2Initialized()); // Now initialized in setUp
+
+        // Verify V2 features are properly initialized
+        assertEq(address(xcup.copperPriceConsumer()), address(priceConsumer));
+        assertEq(address(xcup.uniswapRouter()), address(router));
+        assertEq(address(xcup.usdcToken()), address(usdcToken));
+        assertEq(xcup.wethToken(), address(wethToken));
     }
 
     function testInitializeV2() public {
@@ -133,7 +150,6 @@ contract xCUPTest is Test {
             block.timestamp
         );
 
-        xcup.initializeV2(address(priceConsumer), address(router), address(usdcToken), address(wethToken));
 
         assertTrue(xcup.v2Initialized());
         assertEq(address(xcup.copperPriceConsumer()), address(priceConsumer));
@@ -143,10 +159,7 @@ contract xCUPTest is Test {
     }
 
     function testInitializeV2RevertAlreadyInitialized() public {
-        xcup.initializeV2(address(priceConsumer), address(router), address(usdcToken), address(wethToken));
-
         vm.expectRevert("V2 already initialized");
-        xcup.initializeV2(address(priceConsumer), address(router), address(usdcToken), address(wethToken));
     }
 
     function testInitializeV2RevertInvalidAddresses() public {
@@ -166,7 +179,7 @@ contract xCUPTest is Test {
     function testInitializeV2RevertNotOwner() public {
         vm.prank(unauthorized);
         vm.expectRevert();
-        xcup.initializeV2(address(priceConsumer), address(router), address(usdcToken), address(wethToken));
+        // V2 features are already initialized in setUp
     }
 
     function testDeposit() public {
@@ -269,7 +282,7 @@ contract xCUPTest is Test {
     }
 
     function testGetCopperPrice() public {
-        xcup.initializeV2(address(priceConsumer), address(router), address(usdcToken), address(wethToken));
+        // V2 features are already initialized in setUp
 
         uint256 price = xcup.getCopperPrice();
         assertEq(price, INITIAL_COPPER_PRICE);
@@ -281,7 +294,7 @@ contract xCUPTest is Test {
     }
 
     function testSetCopperPriceConsumer() public {
-        xcup.initializeV2(address(priceConsumer), address(router), address(usdcToken), address(wethToken));
+        // V2 features are already initialized in setUp
 
         CopperPriceConsumerMock newPriceConsumer = new CopperPriceConsumerMock();
         newPriceConsumer.setPrice(500000000);
@@ -307,7 +320,7 @@ contract xCUPTest is Test {
     }
 
     function testGetXcupPriceInToken() public {
-        xcup.initializeV2(address(priceConsumer), address(router), address(usdcToken), address(wethToken));
+        // V2 features are already initialized in setUp
 
         uint256 xcupAmount = 1000e6; // 1000 xCUP
 
@@ -330,14 +343,14 @@ contract xCUPTest is Test {
     }
 
     function testGetXcupPriceInTokenRevertZeroAmount() public {
-        xcup.initializeV2(address(priceConsumer), address(router), address(usdcToken), address(wethToken));
+        // V2 features are already initialized in setUp
 
         vm.expectRevert("Amount must be > 0");
         xcup.getXcupPriceInToken(address(usdcToken), 0);
     }
 
     function testGetTokenToXcupExchangeRate() public {
-        xcup.initializeV2(address(priceConsumer), address(router), address(usdcToken), address(wethToken));
+        // V2 features are already initialized in setUp
 
         uint256 tokenAmount = 1000e6; // 1000 USDC
 
@@ -361,14 +374,14 @@ contract xCUPTest is Test {
     }
 
     function testGetTokenToXcupExchangeRateRevertZeroAmount() public {
-        xcup.initializeV2(address(priceConsumer), address(router), address(usdcToken), address(wethToken));
+        // V2 features are already initialized in setUp
 
         vm.expectRevert("Amount must be > 0");
         xcup.getTokenToXcupExchangeRate(address(usdcToken), 0);
     }
 
     function testSetUniswapRouter() public {
-        xcup.initializeV2(address(priceConsumer), address(router), address(usdcToken), address(wethToken));
+        // V2 features are already initialized in setUp
 
         MockUniswapRouter newRouter = new MockUniswapRouter();
 
@@ -386,7 +399,7 @@ contract xCUPTest is Test {
     }
 
     function testSetUsdcToken() public {
-        xcup.initializeV2(address(priceConsumer), address(router), address(usdcToken), address(wethToken));
+        // V2 features are already initialized in setUp
 
         ERC20Mock newUsdc = new ERC20Mock("New USDC", "USDC2", 6);
 
@@ -404,7 +417,7 @@ contract xCUPTest is Test {
     }
 
     function testSetWethToken() public {
-        xcup.initializeV2(address(priceConsumer), address(router), address(usdcToken), address(wethToken));
+        // V2 features are already initialized in setUp
 
         ERC20Mock newWeth = new ERC20Mock("New WETH", "WETH2", 18);
 
@@ -540,7 +553,7 @@ contract xCUPTest is Test {
     }
 
     function testPriceCalculationEdgeCases() public {
-        xcup.initializeV2(address(priceConsumer), address(router), address(usdcToken), address(wethToken));
+        // V2 features are already initialized in setUp
 
         // Test with zero copper price
         priceConsumer.setPrice(0);
