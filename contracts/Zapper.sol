@@ -632,7 +632,8 @@ contract Zapper is
         deposit.approved = true;
         deposit.approvedAmount = approvedUsdc;
         deposit.priceSnapshot = price;
-        deposit.approvedCupAmount = approvedUsdc * price;
+        // Calculate CUP amount using the same formula as in claimDeposit
+        deposit.approvedCupAmount = (approvedUsdc * price) / (10 ** 11);
 
         emit DepositApproved(depositId, approvedUsdc);
     }
@@ -754,7 +755,9 @@ contract Zapper is
      * @param depositId The unique identifier of the deposit to claim
      * @return shares The number of vault shares received
      */
-    function claimDeposit(bytes32 depositId) public whenNotPaused whenEpochActive returns (uint256 shares) {
+    function claimDeposit(
+        bytes32 depositId
+    ) public whenNotPaused whenEpochActive nonReentrant returns (uint256 shares) {
         Deposit storage deposit = _approvedDeposits[depositId];
         uint256 currentCopperPrice = getCopperPrice();
 
@@ -807,7 +810,7 @@ contract Zapper is
      * Iterates over user's deposit IDs and claims those which are approved.
      * @return totalShares total number of shares received for all claimed deposits
      */
-    function claimAllDeposits() external whenNotPaused whenEpochActive returns (uint256 totalShares) {
+    function claimAllDeposits() external whenNotPaused whenEpochActive nonReentrant returns (uint256 totalShares) {
         bytes32[] storage ids = _userDeposits[_msgSender()];
 
         // iterate over a copy of ids length because claimDeposit may remove some entries
