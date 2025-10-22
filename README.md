@@ -1,182 +1,276 @@
 # Alcum Smart Contracts
 
-> WARNING
-> - no audits have been done on this code base
-> - no warranties
-> - this code is in progress and intended for demonstration/starting your project. Do your own QA & audits before use in production
+## Overview
 
-## What is this?
+Alcum is a DeFi protocol that enables copper-backed value management through a comprehensive ecosystem of smart contracts. The protocol allows users to deposit various tokens (ETH, USDC, etc.) which are converted to copper-backed CUP tokens and deposited into an ERC-4626 vault, creating a bridge between traditional commodities and decentralized finance.
 
-On-chain contracts for the Alcum protocol:
-- `CUPToken`: protocol asset representing copper-backed value
-- `xCUP` (ERC-4626): vault that accepts CUP and mints vault shares
-- `Zapper`: user entry/exit that zaps assets to USDC, manages async approvals, and mints/burns xCUP on claim/redeem
-- `EpochManager`: tracks epoch windows gating approvals/claims
-- `SettlementEngine`: records revenue and distributes to the vault
-- `HostAdapter`: isolated adapter for host-to-host integrations to register external deposits without moving USDC on-chain
+### Key Features
 
-## How it works (high-level)
+-   **🔄 Token Zapping**: Convert any ERC-20 token to copper-backed CUP tokens
+-   **🏦 ERC-4626 Vault**: Standardized vault interface for CUP token deposits
+-   **⏰ Epoch Management**: Time-based trading cycles and revenue settlement
+-   **💰 Revenue Distribution**: Automated settlement and distribution of trading profits
+-   **🔗 Oracle Integration**: Real-time copper price feeds via Chainlink
+-   **🌐 Host Integration**: External system integration for off-chain deposits
 
-1) User flow (on-chain deposits)
-- User calls `Zapper.zapAndDeposit(token, amount)` (ETH/any ERC20). Zapper swaps to USDC and records a pending deposit.
-- Curator approves deposits (single or proportional) during an active epoch.
-- User calls `claimDeposit(depositId)`. Zapper converts approved USDC value to CUP (using price), deposits CUP into `xCUP`, and mints xCUP to the user.
-- User can later redeem xCUP for USDC via Zapper.
+## Architecture
 
-2) Host-to-host (external) flow (no on-chain USDC transfer at registration)
-- Backend (with `HOST_OPERATOR_ROLE` on `HostAdapter`) calls `registerExternalDepositFor(beneficiary, usdcAmount, tag)`.
-- Curator (with `CURATOR_OPERATOR_ROLE` on `HostAdapter`) calls `approveExternalDepositWithPrice(depositId, approvedUsdc, price)` to snapshot price and fix CUP amount.
-- Beneficiary (or originator) calls `Zapper.claimDeposit(depositId)` and receives xCUP minted to beneficiary.
+### Core Contracts
 
-See docs/Developer_Quick_Reference.md for a detailed integration guide, security notes, and code samples (Node.js, Java, JSON-RPC).
+| Contract                  | Purpose                                 | Key Features                                              |
+| ------------------------- | --------------------------------------- | --------------------------------------------------------- |
+| **`CUPToken`**            | Copper-backed ERC-20 token              | Mintable/burnable, 6 decimals, role-based access          |
+| **`xCUP`**                | ERC-4626 vault for CUP tokens           | Share-based deposits, controlled redemptions              |
+| **`Zapper`**              | Token conversion and deposit management | Multi-token support, async approvals, Uniswap integration |
+| **`EpochManager`**        | Time-based epoch management             | Configurable durations, epoch progression                 |
+| **`SettlementEngine`**    | Revenue tracking and distribution       | NAV calculations, profit distribution                     |
+| **`CopperPriceConsumer`** | Chainlink oracle integration            | Real-time copper prices, manual updates                   |
+| **`HostAdapter`**         | External system integration             | Off-chain deposit registration, role separation           |
+| **`Silo`**                | USDC temporary storage                  | Unlimited approvals, seamless operations                  |
+
+### Role-Based Access Control
+
+| Role                        | Contracts           | Permissions                          |
+| --------------------------- | ------------------- | ------------------------------------ |
+| **`DEFAULT_ADMIN_ROLE`**    | All contracts       | Full administrative control          |
+| **`VAULT_CURATOR_ROLE`**    | Zapper              | Approve/decline user deposits        |
+| **`HOST_INTEGRATION_ROLE`** | Zapper              | Register external deposits           |
+| **`HOST_OPERATOR_ROLE`**    | HostAdapter         | Register/update external deposits    |
+| **`CURATOR_OPERATOR_ROLE`** | HostAdapter         | Approve external deposits with price |
+| **`MINTER_ROLE`**           | CUPToken            | Mint new CUP tokens                  |
+| **`BURNER_ROLE`**           | CUPToken            | Burn CUP tokens                      |
+| **`REDEEMER_ROLE`**         | xCUP                | Redeem user shares                   |
+| **`REVENUE_MANAGER_ROLE`**  | SettlementEngine    | Manage revenue settlement            |
+| **`EPOCH_MANAGER_ROLE`**    | EpochManager        | Advance epochs, update duration      |
+| **`PRICE_UPDATER_ROLE`**    | CopperPriceConsumer | Manual price updates                 |
+
+## How It Works
+
+### 1. Direct User Flow (On-Chain)
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Zapper
+    participant Router
+    participant Silo
+    participant Curator
+    participant Oracle
+    participant Vault
+
+    User->>Zapper: zapAndDeposit(token, amount)
+    Zapper->>Router: swap token->USDC
+    Router-->>Silo: transfer USDC
+    Zapper-->>User: emit ZapAndDeposit (pending deposit)
+
+    Curator->>Zapper: approveDeposit(...)
+    Zapper-->>Curator: emit DepositApproved
+
+    User->>Zapper: claimDeposit(depositId)
+    Zapper->>Oracle: getCopperPrice()
+    Zapper->>Vault: deposit CUP, mint xCUP to user
+    Vault-->>User: xCUP shares
+    Zapper-->>User: emit DepositClaimed
+```
+
+### 2. Host-to-Host Flow (External)
+
+```mermaid
+sequenceDiagram
+    participant Backend
+    participant HostAdapter
+    participant Zapper
+    participant Curator
+    participant Beneficiary
+
+    Backend->>HostAdapter: registerExternalDepositFor(beneficiary, amount, tag)
+    HostAdapter->>Zapper: registerExternalDepositFor(...)
+    Zapper-->>HostAdapter: depositId
+    HostAdapter-->>Backend: depositId
+
+    Curator->>HostAdapter: approveExternalDepositWithPrice(depositId, amount, price)
+    HostAdapter->>Zapper: approveExternalDepositWithPrice(...)
+    Zapper-->>HostAdapter: approved
+
+    Beneficiary->>Zapper: claimDeposit(depositId)
+    Zapper->>Vault: deposit CUP, mint xCUP to beneficiary
+    Vault-->>Beneficiary: xCUP shares
+```
+
+### 3. Revenue Settlement Flow
+
+```mermaid
+sequenceDiagram
+    participant RevenueManager
+    participant SettlementEngine
+    participant CUPToken
+    participant Vault
+
+    RevenueManager->>SettlementEngine: recordEpochRevenue(copperInventory, cashReserves, liabilities)
+    SettlementEngine->>SettlementEngine: calculateNetRevenue()
+
+    RevenueManager->>SettlementEngine: settleEpochRevenue()
+    SettlementEngine->>CUPToken: mint(amount)
+    SettlementEngine->>Vault: deposit(amount)
+    Vault-->>Vault: distribute to shareholders
+```
 
 ## Requirements
 
-- Node.js 18+ (Hardhat recommends Node 20+)
-- Yarn (via Corepack or standalone)
-- Foundry (optional, for Forge tests): `curl -L https://foundry.paradigm.xyz | bash && foundryup`
+-   **Node.js 18+** (Hardhat recommends Node 20+)
+-   **Yarn** (via Corepack or standalone)
+-   **Foundry** (optional, for Forge tests):
+    ```bash
+    curl -L https://foundry.paradigm.xyz | bash && foundryup
+    ```
 
-## Quick start
+## Quick Start
 
-1) Install deps
-```
+### 1. Install Dependencies
+
+```bash
 yarn install --frozen-lockfile
 ```
 
-2) Environment
+### 2. Environment Setup
+
 Create `.env` with at least:
-```
+
+```env
 RPC_URL=https://ethereum-sepolia-rpc.publicnode.com
 PRIVATE_KEY=0xYOUR_PRIVATE_KEY
 COINMARKETCAP_API_KEY=
 ETHERSCAN_KEY=
 ```
 
-3) Compile
-```
+### 3. Compile Contracts
+
+```bash
 yarn compile
 ```
 
-4) Run tests
-- Hardhat (TypeScript):
-```
+### 4. Run Tests
+
+**Hardhat (TypeScript):**
+
+```bash
 yarn test
 ```
-- Foundry (Solidity):
-```
+
+**Foundry (Solidity):**
+
+```bash
 forge test -vvv
 ```
 
-5) Deploy (example Hardhat script)
-```
+### 5. Deploy
+
+```bash
 yarn deploy --network sepolia
 ```
 
-## External Depositor (HostAdapter) quick guide
+## Usage Examples
 
-Roles
-- Grant Zapper: `grantRole(HOST_INTEGRATION_ROLE, hostAdapterAddress)`
-- Grant HostAdapter: `grantRole(HOST_OPERATOR_ROLE, backendEOA)`, `grantRole(CURATOR_OPERATOR_ROLE, curatorEOA)`
+### Basic Zapping
 
-Flow
-1) Backend: `HostAdapter.registerExternalDepositFor(beneficiary, usdcAmount, tag)`
-2) Curator: `HostAdapter.approveExternalDepositWithPrice(depositId, approvedUsdc, price)`
-3) Beneficiary or originator: `Zapper.claimDeposit(depositId)` → xCUP minted to beneficiary
+```typescript
+// Zap ETH to xCUP
+await zapper.zapAndDeposit(ETH_ADDRESS, ethers.parseEther("1.0"));
 
-Irreversibility
-- Before approval, beneficiary can be adjusted by host.
-- After approval, deposit parameters are locked; after claim, the process is finalized.
-
-Important
-- Zapper must hold or be able to mint sufficient CUP for claims.
-- Claims require an active epoch.
-
-## Scripts
-
-- `yarn compile` – compile contracts
-- `yarn test` – run Hardhat tests
-- `yarn deploy` – run `scripts/deploy.ts`
-
-## Development tips
-
-- If using mainnet/testnet fork, set `RPC_URL` to a reliable endpoint (Infura/Alchemy/etc.).
-- Hardhat warns on unsupported Node.js versions; Node 20 LTS is recommended.
-
-## Visual Architecture
-
-### System Overview
-
-```mermaid
-flowchart LR
-  U[User EOA]
-  B[Backend Host EOA]
-  C[Curator EOA]
-  Z[Zapper]
-  S[Silo USDC]
-  R[Uniswap V2 Router]
-  V[xCUP Vault]
-  T[CUPToken]
-  E[EpochManager]
-  O[Copper Price Consumer]
-  SE[SettlementEngine]
-  HA[HostAdapter]
-
-  U -->|zapAndDeposit| Z
-  Z -->|swap| R
-  R -->|USDC| S
-  C -->|approve*| Z
-  Z -->|price| O
-  Z -->|deposit CUP| V
-  V -->|mint xCUP| U
-
-  U -->|redeem| Z
-  Z -->|redeem| V
-  V -->|return CUP| Z
-  Z -->|USDC| S
-  Z -->|payout| U
-
-  B -->|registerExternalDepositFor| HA
-  HA -->|forward| Z
-  C -->|approveExternalDepositWithPrice| HA
-  HA -->|forward| Z
-  U -->|claimDeposit| Z
-  Z -->|mint xCUP to beneficiary| V
-
-  Z --- E
-  SE -->|distribute revenue| V
-  SE -->|mint CUP| T
+// Zap USDC to xCUP
+await zapper.zapAndDeposit(USDC_ADDRESS, ethers.parseUnits("1000", 6));
 ```
 
-### Async Approval & Claim Timeline
+### Curator Operations
 
-```mermaid
-sequenceDiagram
-  participant User
-  participant Zapper
-  participant Router
-  participant Silo
-  participant Curator
-  participant Oracle
-  participant Vault
+```typescript
+// Approve a deposit
+await zapper.approveDeposit(depositId, approvedAmount);
 
-  User->>Zapper: zapAndDeposit(token, amount)
-  Zapper->>Router: swap token->USDC
-  Router-->>Silo: transfer USDC
-  Zapper-->>User: emit ZapAndDeposit (pending deposit)
-
-  Curator->>Zapper: approveDeposit(...)
-  Zapper-->>Curator: emit DepositApproved
-
-  User->>Zapper: claimDeposit(depositId)
-  Zapper->>Oracle: getCopperPrice()
-  Zapper->>Vault: deposit CUP, mint xCUP to user
-  Vault-->>User: xCUP shares
-  Zapper-->>User: emit DepositClaimed
+// Approve with proportional distribution
+await zapper.approveDepositsProportionally(totalApprovedAmount);
 ```
 
-## Support & Contributing
+### External Deposit Integration
 
-Issues and contributions are welcome.
+```typescript
+// Register external deposit
+const depositId = await hostAdapter.registerExternalDepositFor(beneficiary, usdcAmount, integrationTag);
+
+// Approve with price snapshot
+await hostAdapter.approveExternalDepositWithPrice(depositId, approvedAmount, copperPrice);
+```
+
+### Revenue Management
+
+```typescript
+// Record epoch revenue
+await settlementEngine.recordEpochRevenue(copperInventory, cashReserves, liabilities);
+
+// Settle and distribute
+await settlementEngine.settleEpochRevenue();
+```
+
+## Development
+
+### Available Scripts
+
+-   `yarn compile` – Compile contracts
+-   `yarn test` – Run Hardhat tests
+-   `yarn deploy` – Deploy contracts
+-   `forge test -vvv` – Run Foundry tests
+
+### Testing
+
+The project includes comprehensive test suites for all contracts:
+
+-   **Unit Tests**: Individual contract functionality
+-   **Integration Tests**: Cross-contract interactions
+-   **Role Tests**: Access control verification
+-   **Edge Cases**: Error conditions and boundary testing
+
+### Gas Optimization
+
+All contracts are optimized for gas efficiency:
+
+-   Packed storage slots
+-   Minimal external calls
+-   Efficient role-based access control
+-   Upgradeable proxy patterns
+
+## Security Considerations
+
+### Access Control
+
+-   Role-based permissions with OpenZeppelin AccessControl
+-   Multi-signature requirements for critical operations
+-   Time-locked administrative functions
+
+### Upgrade Safety
+
+-   Transparent proxy patterns for upgradeable contracts
+-   Storage gap preservation for future upgrades
+-   Initialization protection against reentrancy
+
+### Oracle Security
+
+-   Chainlink oracle integration for reliable price feeds
+-   Manual price update capabilities for emergencies
+-   Price validation and sanity checks
+
+## Integration Guide
+
+### For Developers
+
+See [`docs/Developer_Quick_Reference.md`](docs/Developer_Quick_Reference.md) for detailed integration guides, security notes, and code samples.
+
+### For External Systems
+
+The `HostAdapter` contract provides a clean interface for external systems to integrate with the protocol without requiring direct interaction with core contracts.
+
+## Contributing
+
+Issues and contributions are welcome! Please feel free to submit issues and enhancement requests.
 
 ## License
 
