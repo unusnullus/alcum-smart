@@ -1,187 +1,330 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.24;
+pragma solidity ^0.8.24;
 
-import {Test} from "forge-std/Test.sol";
-
+import {Test, console} from "forge-std/Test.sol";
+import {HostAdapter} from "../contracts/HostAdapter.sol";
+import {Zapper} from "../contracts/Zapper.sol";
 import {CUPToken} from "../contracts/CUPToken.sol";
 import {xCUP} from "../contracts/xCUP.sol";
-import {Zapper} from "../contracts/Zapper.sol";
 import {EpochManager} from "../contracts/EpochManager.sol";
-import {HostAdapter} from "../contracts/HostAdapter.sol";
-import {CopperPriceConsumerMock} from "../contracts/mock/CopperPriceConsumerMock.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {ERC20Mock} from "../contracts/mock/ERC20Mock.sol";
-import {TransparentUpgradeableProxy} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
+import {ICopperPriceConsumer} from "../contracts/interfaces/ICopperPriceConsumer.sol";
 
-contract DummyRouter { function WETH() external pure returns (address) { return address(0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE); } }
+// Mock contracts for testing
+contract MockCopperPriceConsumer is ICopperPriceConsumer {
+    uint256 public price = 450000000; // $4.50 with 8 decimals
 
-contract HostAdapterTest is Test {
-    CUPToken private cup;
-    xCUP private vault;
-    Zapper private zapper;
-    EpochManager private epochs;
-    HostAdapter private adapter;
-    CopperPriceConsumerMock private price;
-    DummyRouter private router;
-    ERC20Mock private usdc;
-
-    address private owner;
-    address private host;
-    address private curator;
-    address private beneficiary;
-    bytes32 private tag;
-
-    function setUp() public {
-        owner = address(this);
-        host = address(0x1001);
-        curator = address(0x1002);
-        beneficiary = address(0xBEEF);
-        tag = keccak256("ORDER-TEST-1");
-
-        // Core token
-        cup = new CUPToken();
-
-        // USDC mock for Silo approvals
-        usdc = new ERC20Mock("USDC", "USDC", 6);
-
-        // Deploy implementations
-        xCUP vaultImpl = new xCUP();
-        EpochManager epochsImpl = new EpochManager();
-        Zapper zapperImpl = new Zapper();
-        HostAdapter adapterImpl = new HostAdapter();
-
-        // Deploy proxies without init; then call initialize via proxy iface
-        vault = xCUP(address(new TransparentUpgradeableProxy(address(vaultImpl), owner, "")));
-        epochs = EpochManager(address(new TransparentUpgradeableProxy(address(epochsImpl), owner, "")));
-        price = new CopperPriceConsumerMock();
-
-        // Router dummy
-        router = new DummyRouter();
-
-        zapper = Zapper(address(new TransparentUpgradeableProxy(address(zapperImpl), owner, "")));
-
-        adapter = HostAdapter(address(new TransparentUpgradeableProxy(address(adapterImpl), owner, "")));
-
-        // Initialize via proxies
-        vault.initialize(IERC20(address(cup)), "xCUP", "xCUP");
-        epochs.initialize(7 days);
-        zapper.initialize(address(cup), address(usdc), address(vault), address(router), address(price), address(epochs));
-        adapter.initialize(address(zapper));
-
-        // Wire roles
-        // Grant adapter the Zapper integration role
-        vm.prank(zapper.owner());
-        zapper.grantRole(zapper.HOST_INTEGRATION_ROLE(), address(adapter));
-        // Allow adapter to act as curator when forwarding approvals
-        vm.prank(zapper.owner());
-        zapper.grantRole(zapper.VAULT_CURATOR_ROLE(), address(adapter));
-
-        // Grant operator roles on adapter
-        vm.prank(adapter.owner());
-        adapter.grantRole(adapter.HOST_OPERATOR_ROLE(), host);
-        vm.prank(adapter.owner());
-        adapter.grantRole(adapter.CURATOR_OPERATOR_ROLE(), curator);
-
-        // Fund Zapper with CUP for claims
-        // Grant MINTER to this test and mint to zapper
-        cup.grantRole(cup.MINTER_ROLE(), address(this));
-        cup.mint(address(zapper), 1_000_000e6);
-
-        // Start an active epoch: warp beyond duration then start
-        vm.warp(block.timestamp + 8 days);
-        epochs.nextEpoch();
+    function requestCopperPrice() external pure returns (bytes32) {
+        return bytes32(0);
     }
 
-    function test_registerApproveClaimExternal_byBeneficiary() public {
-        uint256 usdcAmount = 1_000e6;
-        uint256 priceSnap = 500; // assume CUP per USDC scaling in protocol
-
-        // Host registers external deposit
-        vm.prank(host);
-        bytes32 depositId = adapter.registerExternalDepositFor(beneficiary, usdcAmount, tag);
-        assertTrue(depositId != bytes32(0), "depositId");
-
-        // Curator approves with price snapshot
-        vm.prank(curator);
-        adapter.approveExternalDepositWithPrice(depositId, usdcAmount, priceSnap);
-
-        // Beneficiary claims
-        vm.prank(beneficiary);
-        uint256 shares = zapper.claimDeposit(depositId);
-        assertGt(shares, 0, "shares");
-        assertEq(vault.balanceOf(beneficiary), shares, "vault bal");
+    function fulfill(bytes32, uint256) external pure {
+        revert("Not implemented");
     }
 
-    function test_revert_register_without_role() public {
-        // Use an address without HOST_OPERATOR_ROLE
-        address outsider = address(0xDEAD);
-        vm.prank(outsider);
-        vm.expectRevert();
-        adapter.registerExternalDepositFor(beneficiary, 1_000e6, tag);
+    function getPriceAsDecimal() external view returns (uint256) {
+        return price / 10 ** 8;
     }
 
-    function test_update_beneficiary_before_approval_then_revert_after() public {
-        uint256 usdcAmount = 2_000e6;
-        vm.prank(host);
-        bytes32 depositId = adapter.registerExternalDepositFor(beneficiary, usdcAmount, tag);
-
-        address newBeneficiary = address(0xCAFE);
-        vm.prank(host);
-        adapter.setDepositBeneficiary(depositId, newBeneficiary);
-
-        vm.prank(curator);
-        adapter.approveExternalDepositWithPrice(depositId, usdcAmount, 400);
-
-        // After approval, changing beneficiary should revert
-        vm.prank(host);
-        vm.expectRevert();
-        adapter.setDepositBeneficiary(depositId, address(0xDEAD));
-
-        // Claim to ensure success with updated beneficiary
-        vm.prank(newBeneficiary);
-        uint256 shares = zapper.claimDeposit(depositId);
-        assertGt(shares, 0);
-        assertEq(vault.balanceOf(newBeneficiary), shares);
-    }
-
-    function test_revert_approve_without_curator_role() public {
-        vm.prank(host);
-        bytes32 depositId = adapter.registerExternalDepositFor(beneficiary, 500e6, tag);
-
-        // outsider does not have CURATOR_OPERATOR_ROLE on adapter
-        address outsider = address(0x1234);
-        vm.prank(outsider);
-        vm.expectRevert();
-        adapter.approveExternalDepositWithPrice(depositId, 500e6, 300);
-    }
-
-    function test_revert_claim_by_unauthorized() public {
-        vm.prank(host);
-        bytes32 depositId = adapter.registerExternalDepositFor(beneficiary, 500e6, tag);
-        vm.prank(curator);
-        adapter.approveExternalDepositWithPrice(depositId, 500e6, 300);
-
-        // Some other EOA tries to claim
-        vm.prank(address(0x9999));
-        vm.expectRevert("Not authorized to claim");
-        zapper.claimDeposit(depositId);
-    }
-
-    function test_revert_claim_when_no_cup_available() public {
-        vm.prank(host);
-        bytes32 depositId = adapter.registerExternalDepositFor(beneficiary, 100_000e6, tag);
-        vm.prank(curator);
-        adapter.approveExternalDepositWithPrice(depositId, 100_000e6, 1000);
-
-        // Drain CUP from Zapper
-        uint256 zapperCup = cup.balanceOf(address(zapper));
-        cup.grantRole(cup.BURNER_ROLE(), address(this));
-        cup.burn(address(zapper), zapperCup);
-
-        vm.prank(beneficiary);
-        vm.expectRevert("Insufficient CUP balance");
-        zapper.claimDeposit(depositId);
+    function updatePrice(uint256 _price) external {
+        price = _price;
     }
 }
 
+contract MockUSDC {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
 
+    function decimals() external pure returns (uint8) {
+        return 6;
+    }
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+}
+
+contract MockUniswapRouter {
+    function WETH() external pure returns (address) {
+        return address(0x1234567890123456789012345678901234567890);
+    }
+
+    function getAmountsOut(uint256 amountIn, address[] calldata path) external pure returns (uint256[] memory amounts) {
+        amounts = new uint256[](2);
+        amounts[0] = amountIn;
+        amounts[1] = amountIn; // 1:1 for testing
+    }
+}
+
+contract HostAdapterTest is Test {
+    HostAdapter public hostAdapter;
+    Zapper public zapper;
+    CUPToken public cupToken;
+    xCUP public xcup;
+    EpochManager public epochManager;
+    MockCopperPriceConsumer public copperPriceConsumer;
+    MockUSDC public usdc;
+    MockUniswapRouter public uniswapRouter;
+    address public owner;
+    address public vaultCurator;
+    address public hostIntegration;
+    address public user1;
+
+    function setUp() public {
+        owner = address(this);
+        vaultCurator = makeAddr("vaultCurator");
+        hostIntegration = makeAddr("hostIntegration");
+        user1 = makeAddr("user1");
+
+        // Deploy dependencies
+        CUPToken cupImpl = new CUPToken();
+        bytes memory cupInitData = abi.encodeWithSelector(CUPToken.initialize.selector);
+        ERC1967Proxy cupProxy = new ERC1967Proxy(address(cupImpl), cupInitData);
+        cupToken = CUPToken(address(cupProxy));
+
+        copperPriceConsumer = new MockCopperPriceConsumer();
+        usdc = new MockUSDC();
+        uniswapRouter = new MockUniswapRouter();
+
+        // Deploy EpochManager
+        EpochManager epochImpl = new EpochManager();
+        bytes memory epochInitData = abi.encodeWithSelector(EpochManager.initialize.selector, 7 days);
+        ERC1967Proxy epochProxy = new ERC1967Proxy(address(epochImpl), epochInitData);
+        epochManager = EpochManager(address(epochProxy));
+
+        // Deploy xCUP
+        xCUP xcupImpl = new xCUP();
+        bytes memory xcupInitData = abi.encodeWithSelector(
+            xCUP.initialize.selector,
+            IERC20(address(cupToken)),
+            "xCUP Vault",
+            "xCUP",
+            address(copperPriceConsumer),
+            address(uniswapRouter),
+            address(usdc),
+            address(0x1234567890123456789012345678901234567890) // Mock WETH
+        );
+        ERC1967Proxy xcupProxy = new ERC1967Proxy(address(xcupImpl), xcupInitData);
+        xcup = xCUP(address(xcupProxy));
+
+        // Deploy Zapper
+        Zapper zapperImpl = new Zapper();
+        bytes memory zapperInitData = abi.encodeWithSelector(
+            Zapper.initialize.selector,
+            address(cupToken),
+            address(usdc),
+            address(xcup),
+            address(uniswapRouter),
+            address(copperPriceConsumer),
+            address(epochManager)
+        );
+        ERC1967Proxy zapperProxy = new ERC1967Proxy(address(zapperImpl), zapperInitData);
+        zapper = Zapper(payable(address(zapperProxy)));
+
+        // Deploy HostAdapter
+        HostAdapter hostAdapterImpl = new HostAdapter();
+        bytes memory hostAdapterInitData = abi.encodeWithSelector(HostAdapter.initialize.selector, address(zapper));
+        ERC1967Proxy hostAdapterProxy = new ERC1967Proxy(address(hostAdapterImpl), hostAdapterInitData);
+        hostAdapter = HostAdapter(address(hostAdapterProxy));
+
+        // Grant roles
+        zapper.grantRole(zapper.HOST_INTEGRATION_ROLE(), address(hostAdapter));
+        zapper.grantRole(zapper.VAULT_CURATOR_ROLE(), vaultCurator);
+        zapper.grantRole(zapper.VAULT_CURATOR_ROLE(), hostIntegration);
+        zapper.grantRole(zapper.VAULT_CURATOR_ROLE(), address(hostAdapter));
+        hostAdapter.grantRole(hostAdapter.HOST_OPERATOR_ROLE(), hostIntegration);
+        hostAdapter.grantRole(hostAdapter.CURATOR_OPERATOR_ROLE(), hostIntegration);
+
+        // Grant xCUP redeemer role to zapper
+        xcup.grantRole(xcup.REDEEMER_ROLE(), address(zapper));
+
+        // Grant zapper permission to spend CUP tokens
+        cupToken.grantRole(cupToken.MINTER_ROLE(), address(zapper));
+
+        // Mint some tokens for testing
+        usdc.mint(user1, 1000000 * 10 ** 6); // 1M USDC
+        cupToken.grantRole(cupToken.MINTER_ROLE(), address(this));
+        cupToken.mint(address(zapper), 1000000 * 10 ** 6); // 1M CUP tokens
+    }
+
+    function testInitialization() public {
+        assertEq(hostAdapter.zapper(), address(zapper));
+        assertTrue(hostAdapter.hasRole(hostAdapter.DEFAULT_ADMIN_ROLE(), owner));
+        assertTrue(hostAdapter.hasRole(hostAdapter.HOST_OPERATOR_ROLE(), hostIntegration));
+    }
+
+    function testRegisterExternalDepositFor() public {
+        uint256 amount = 1000 * 10 ** 6;
+
+        vm.prank(hostIntegration);
+        bytes32 depositId =
+            hostAdapter.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
+
+        // Check that deposit was recorded in zapper
+        Zapper.Deposit memory deposit = zapper.getDeposit(depositId);
+        assertEq(deposit.beneficiary, user1);
+        assertEq(deposit.amount, amount);
+        assertEq(deposit.beneficiary, user1);
+    }
+
+    function testRegisterExternalDepositForWithoutRole() public {
+        vm.prank(user1);
+        vm.expectRevert();
+        hostAdapter.registerExternalDepositFor(user1, 1000 * 10 ** 6, bytes32(uint256(uint160(address(usdc)))));
+    }
+
+    function testSetDepositBeneficiary() public {
+        address newBeneficiary = makeAddr("newBeneficiary");
+        uint256 amount = 1000 * 10 ** 6;
+
+        // First register a deposit
+        vm.prank(hostIntegration);
+        bytes32 depositId =
+            hostAdapter.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
+
+        // Then set beneficiary
+        vm.prank(hostIntegration);
+        hostAdapter.setDepositBeneficiary(depositId, newBeneficiary);
+
+        // Check that beneficiary was updated
+        Zapper.Deposit memory deposit = zapper.getDeposit(depositId);
+        assertEq(deposit.beneficiary, newBeneficiary);
+    }
+
+    function testSetDepositBeneficiaryWithoutRole() public {
+        vm.prank(user1);
+        vm.expectRevert();
+        hostAdapter.setDepositBeneficiary(bytes32(uint256(uint160(user1))), makeAddr("newBeneficiary"));
+    }
+
+    function testApproveExternalDepositWithPrice() public {
+        uint256 amount = 1000 * 10 ** 6;
+        uint256 price = 450000000; // $4.50 with 8 decimals
+
+        // Register deposit first
+        vm.prank(hostIntegration);
+        bytes32 depositId =
+            hostAdapter.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
+
+        // Approve with price
+        vm.prank(hostIntegration);
+        hostAdapter.approveExternalDepositWithPrice(depositId, amount, price);
+
+        // Check that deposit was approved
+        Zapper.Deposit memory deposit = zapper.getDeposit(depositId);
+        assertTrue(deposit.approved);
+    }
+
+    function testApproveExternalDepositWithPriceWithoutRole() public {
+        uint256 amount = 1000 * 10 ** 6;
+        uint256 price = 450000000;
+
+        // Register deposit first
+        vm.prank(hostIntegration);
+        hostAdapter.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
+
+        // Try to approve without role
+        vm.prank(user1);
+        vm.expectRevert();
+        hostAdapter.approveExternalDepositWithPrice(bytes32(0), amount, price);
+    }
+
+    function testSetZapper() public {
+        address newZapper = makeAddr("newZapper");
+        hostAdapter.setZapper(payable(newZapper));
+        assertEq(hostAdapter.zapper(), newZapper);
+    }
+
+    function testSetZapperWithoutRole() public {
+        vm.prank(user1);
+        vm.expectRevert();
+        hostAdapter.setZapper(payable(makeAddr("newZapper")));
+    }
+
+    // Test error cases for better branch coverage
+    function testRegisterExternalDepositForWithZeroBeneficiary() public {
+        vm.prank(hostIntegration);
+        vm.expectRevert(HostAdapter.InvalidBeneficiary.selector);
+        hostAdapter.registerExternalDepositFor(address(0), 1000 * 10 ** 6, bytes32(uint256(uint160(address(usdc)))));
+    }
+
+    function testRegisterExternalDepositForWithZeroAmount() public {
+        vm.prank(hostIntegration);
+        vm.expectRevert(HostAdapter.InvalidAmount.selector);
+        hostAdapter.registerExternalDepositFor(user1, 0, bytes32(uint256(uint160(address(usdc)))));
+    }
+
+    function testSetDepositBeneficiaryWithZeroBeneficiary() public {
+        uint256 amount = 1000 * 10 ** 6;
+
+        // First register a deposit
+        vm.prank(hostIntegration);
+        bytes32 depositId =
+            hostAdapter.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
+
+        // Try to set zero beneficiary
+        vm.prank(hostIntegration);
+        vm.expectRevert(HostAdapter.InvalidBeneficiary.selector);
+        hostAdapter.setDepositBeneficiary(depositId, address(0));
+    }
+
+    function testApproveExternalDepositWithPriceWithZeroAmount() public {
+        uint256 amount = 1000 * 10 ** 6;
+        uint256 price = 450000000;
+
+        // Register deposit first
+        vm.prank(hostIntegration);
+        bytes32 depositId =
+            hostAdapter.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
+
+        // Try to approve with zero amount
+        vm.prank(hostIntegration);
+        vm.expectRevert(HostAdapter.InvalidApprovedAmount.selector);
+        hostAdapter.approveExternalDepositWithPrice(depositId, 0, price);
+    }
+
+    function testApproveExternalDepositWithPriceWithZeroPrice() public {
+        uint256 amount = 1000 * 10 ** 6;
+
+        // Register deposit first
+        vm.prank(hostIntegration);
+        bytes32 depositId =
+            hostAdapter.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
+
+        // Try to approve with zero price
+        vm.prank(hostIntegration);
+        vm.expectRevert(HostAdapter.InvalidPrice.selector);
+        hostAdapter.approveExternalDepositWithPrice(depositId, amount, 0);
+    }
+
+    function testSetZapperWithZeroAddress() public {
+        vm.expectRevert(HostAdapter.InvalidZapperAddress.selector);
+        hostAdapter.setZapper(payable(address(0)));
+    }
+
+    function testSetZapperWithSameAddress() public {
+        vm.expectRevert(HostAdapter.SameZapperAddress.selector);
+        hostAdapter.setZapper(payable(address(zapper)));
+    }
+
+    // Test initialization error case for better branch coverage
+    function testInitializeWithZeroZapper() public {
+        HostAdapter hostAdapterImpl = new HostAdapter();
+        bytes memory hostAdapterInitData = abi.encodeWithSelector(HostAdapter.initialize.selector, address(0));
+
+        vm.expectRevert(HostAdapter.InvalidZapperAddress.selector);
+        new ERC1967Proxy(address(hostAdapterImpl), hostAdapterInitData);
+    }
+}

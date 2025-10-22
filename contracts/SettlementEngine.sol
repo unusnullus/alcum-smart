@@ -276,10 +276,7 @@ contract SettlementEngine is
      * @param systemFee Amount of fees collected for the treasury (USDC, 6 decimals)
      */
     event RevenueDistributed(
-        uint256 indexed epochId,
-        uint256 revenueDistributed,
-        uint256 distributedCupTokens,
-        uint256 systemFee
+        uint256 indexed epochId, uint256 revenueDistributed, uint256 distributedCupTokens, uint256 systemFee
     );
 
     /**
@@ -407,7 +404,7 @@ contract SettlementEngine is
      *
      * @param newNav New NAV components including copper inventory, cash, and liabilities
      */
-    function updateNAV(NAVComponents calldata newNav) external onlyOwner {
+    function updateNAV(NAVComponents calldata newNav) external onlyRole(REVENUE_MANAGER_ROLE) {
         _nav = newNav;
 
         // Calculate total asset value
@@ -682,9 +679,12 @@ contract SettlementEngine is
      *
      * @param epochId The epoch ID to distribute revenue for (must be settled)
      */
-    function distributeRevenueToVault(
-        uint256 epochId
-    ) external onlyRole(REVENUE_MANAGER_ROLE) whenNotPaused nonReentrant {
+    function distributeRevenueToVault(uint256 epochId)
+        external
+        onlyRole(REVENUE_MANAGER_ROLE)
+        whenNotPaused
+        nonReentrant
+    {
         if (epochId > _epochManager.currentEpochId()) revert FutureEpochId();
         EpochRevenue storage revenue = epochRevenues[epochId];
 

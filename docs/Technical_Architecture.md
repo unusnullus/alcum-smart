@@ -63,17 +63,24 @@ The system manages the complete lifecycle from user deposits through various tok
 -   `claimDeposit()`: User function to claim approved deposits and receive xCUP shares
 -   `claimAllDeposits()`: User function to claim all their approved deposits
 -   `registerExternalDepositFor()`: Host integration function for external deposits
--   `redeem()`: Convert xCUP shares back to USDC
+-   `withdrawDeposit()`: User function to withdraw pending deposits before approval
+-   `withdrawAllDeposits()`: User function to withdraw all pending deposits
+-   `redeem()`: Convert xCUP shares back to USDC (direct redemption)
+-   `requestRedeem()`: Request asynchronous redemption of xCUP shares
+-   `approveRedeem()`: Curator function to approve redemption requests
+-   `claimRedeem()`: User function to claim approved redemptions
 -   `getCopperPrice()`: Retrieves current copper price from oracle
 
 **Security Features**:
 
 -   Role-based access control with VAULT_CURATOR_ROLE and HOST_INTEGRATION_ROLE
 -   Pausable functionality for emergencies
--   ReentrancyGuard protection
+-   ReentrancyGuard protection on all external calls
 -   Epoch-based time windows for deposits
 -   Input validation and balance checks
 -   Slippage protection (configurable, default 1%)
+-   Nonce-based deposit ID generation (prevents front-running)
+-   Commission system for direct redemptions
 
 **State Management**:
 
@@ -136,6 +143,10 @@ struct Deposit {
 -   `getXcupPriceInToken()`: Calculates xCUP price in various tokens
 -   `getTokenToXcupExchangeRate()`: Calculates exchange rates for deposits
 -   `getCopperPrice()`: Retrieves current copper price
+-   `setCopperPriceConsumer()`: Updates price consumer address (owner only)
+-   `setUniswapRouter()`: Updates Uniswap router address (owner only)
+-   `setUsdcToken()`: Updates USDC token address (owner only)
+-   `setWethToken()`: Updates WETH token address (owner only)
 
 **Price Integration**:
 
@@ -161,13 +172,15 @@ struct Deposit {
 -   `fulfill()`: Oracle callback to receive price data
 -   `updatePrice()`: Manual price update (PRICE_UPDATER_ROLE)
 -   `getPriceAsDecimal()`: Returns human-readable price
--   `isPriceFresh()`: Checks if price data is not stale
+-   `setOracle()`: Updates oracle address (DEFAULT_ADMIN_ROLE)
+-   `setJobId()`: Updates job ID (DEFAULT_ADMIN_ROLE)
+-   `setFee()`: Updates oracle fee (DEFAULT_ADMIN_ROLE)
 
 **Configuration**:
 
 -   Oracle address, job ID, and fee management
 -   Price precision: 8 decimals
--   Default max age: 24 hours
+-   Role-based access control for configuration updates
 
 ### 5. Settlement Engine (`SettlementEngine.sol`)
 
@@ -231,11 +244,12 @@ struct EpochRevenue {
 
 **Key Functions**:
 
--   `nextEpoch()`: Advances to the next epoch (owner only)
+-   `nextEpoch()`: Advances to the next epoch (EPOCH_MANAGER_ROLE)
 -   `currentEpochId()`: Returns current epoch identifier
 -   `timeLeftInEpoch()`: Calculates remaining time in current epoch
--   `isEpochActive()`: Checks if current epoch is still active
--   `setEpochDuration()`: Updates duration for future epochs
+-   `epochStart()`: Returns timestamp when current epoch started
+-   `epochDuration()`: Returns duration of epochs in seconds
+-   `setEpochDuration()`: Updates duration for future epochs (EPOCH_MANAGER_ROLE)
 
 ### 7. Host Adapter (`HostAdapter.sol`)
 
@@ -331,8 +345,12 @@ bytes32 public constant BURNER_ROLE = keccak256("BURNER_ROLE");
 |----------|-------|---------|------|
 | pause/unpause | ✅ | ❌ | ❌ |
 | approveDeposit | ❌ | ✅ | ❌ |
+| approveRedeem | ❌ | ✅ | ❌ |
 | zapAndDeposit | ❌ | ❌ | ✅ |
 | claimDeposit | ❌ | ❌ | ✅ |
+| requestRedeem | ❌ | ❌ | ✅ |
+| claimRedeem | ❌ | ❌ | ✅ |
+| withdrawDeposit | ❌ | ❌ | ✅ |
 
 ### Input Validation
 

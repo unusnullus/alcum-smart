@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
-import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 
 import {ChainlinkClient} from "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
 import {Chainlink} from "@chainlink/contracts/src/v0.8/Chainlink.sol";
@@ -17,13 +15,7 @@ import {ICopperPriceConsumer} from "./interfaces/ICopperPriceConsumer.sol";
  *      for the Alcum protocol. It supports both automated oracle updates and manual price
  *      updates by authorized roles.
  */
-contract CopperPriceConsumer is
-    Initializable,
-    ChainlinkClient,
-    ICopperPriceConsumer,
-    OwnableUpgradeable,
-    AccessControlUpgradeable
-{
+contract CopperPriceConsumer is ChainlinkClient, ICopperPriceConsumer, AccessControl {
     using Chainlink for Chainlink.Request;
 
     /// @notice Decimal precision for price storage (8 decimals)
@@ -97,45 +89,23 @@ contract CopperPriceConsumer is
      */
     event PriceRequested(bytes32 indexed requestId, address indexed oracle);
 
-    /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() {
-        _disableInitializers();
-    }
-
-    /**
-     * @notice Initializes the CopperPriceConsumer contract
-     * @dev This function replaces the constructor for upgradeable contracts.
-     *      Sets up Chainlink integration and initial price configuration.
-     *
-     * Requirements:
-     * - Can only be called once due to initializer modifier
-     * - All addresses must be non-zero
-     * - Caller becomes the owner and admin of the contract
-     *
-     * @param _oracle The Chainlink oracle address for price requests
-     * @param _jobId The Chainlink job ID for copper price data
-     * @param _fee The fee in LINK tokens required for each request
-     * @param _link The LINK token contract address
-     *
-     * @custom:oz-initializer
-     */
-    function initialize(address _oracle, bytes32 _jobId, uint256 _fee, address _link) public initializer {
+    constructor(address _oracle, bytes32 _jobId, uint256 _fee, address _link) {
         if (_oracle == address(0)) revert InvalidOracleAddress();
         if (_link == address(0)) revert InvalidLinkAddress();
         if (_fee == 0) revert InvalidFee();
 
-        __Ownable_init(_msgSender());
-        __AccessControl_init();
-
         // Grant the deployer the default admin role and price updater role
-        _grantRole(DEFAULT_ADMIN_ROLE, _msgSender());
-        _grantRole(PRICE_UPDATER_ROLE, _msgSender());
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(PRICE_UPDATER_ROLE, msg.sender);
 
+        // Set up Chainlink configuration
         _setChainlinkToken(_link);
-
         oracle = _oracle;
         jobId = _jobId;
         fee = _fee;
+
+        // Initialize with a default price (can be updated later)
+        price = 0;
     }
 
     /**
@@ -183,15 +153,15 @@ contract CopperPriceConsumer is
 
     /**
      * @notice Updates the Chainlink job ID for price requests
-     * @dev Only callable by the contract owner. Used when oracle configuration changes.
+     * @dev Only callable by addresses with DEFAULT_ADMIN_ROLE. Used when oracle configuration changes.
      *
      * Requirements:
-     * - Caller must be the contract owner
+     * - Caller must have DEFAULT_ADMIN_ROLE
      * - New job ID must be different from current one
      *
      * @param _jobId The new Chainlink job ID
      */
-    function setJobId(bytes32 _jobId) public onlyOwner {
+    function setJobId(bytes32 _jobId) public onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_jobId == jobId) revert SameJobId();
 
         jobId = _jobId;
@@ -201,15 +171,15 @@ contract CopperPriceConsumer is
 
     /**
      * @notice Updates the fee required for price requests
-     * @dev Only callable by the contract owner. Used when oracle fee structure changes.
+     * @dev Only callable by addresses with DEFAULT_ADMIN_ROLE. Used when oracle fee structure changes.
      *
      * Requirements:
-     * - Caller must be the contract owner
+     * - Caller must have DEFAULT_ADMIN_ROLE
      * - Fee must be greater than 0
      *
      * @param _fee The new fee amount in LINK tokens
      */
-    function setFee(uint256 _fee) public onlyOwner {
+    function setFee(uint256 _fee) public onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_fee == 0) revert InvalidFee();
         if (_fee == fee) revert SameFee();
 
@@ -219,15 +189,15 @@ contract CopperPriceConsumer is
 
     /**
      * @notice Updates the oracle address for price requests
-     * @dev Only callable by the contract owner. Used when switching oracles.
+     * @dev Only callable by addresses with DEFAULT_ADMIN_ROLE. Used when switching oracles.
      *
      * Requirements:
-     * - Caller must be the contract owner
+     * - Caller must have DEFAULT_ADMIN_ROLE
      * - Oracle address must be non-zero and different from current
      *
      * @param _oracle The new oracle address
      */
-    function setOracle(address _oracle) public onlyOwner {
+    function setOracle(address _oracle) public onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_oracle == address(0)) revert InvalidOracleAddress();
         if (_oracle == oracle) revert SameOracle();
 
@@ -264,9 +234,6 @@ contract CopperPriceConsumer is
         uint256 oldPrice = price;
         price = _price;
 
-        emit PriceUpdated(oldPrice, _price, _msgSender(), block.timestamp);
+        emit PriceUpdated(oldPrice, _price, msg.sender, block.timestamp);
     }
-
-    // Reserve storage gap for future upgrades (to avoid storage collisions)
-    uint256[50] private __gap;
 }

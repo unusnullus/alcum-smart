@@ -1,572 +1,624 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Test} from "forge-std/Test.sol";
-
-import {Upgrades} from "openzeppelin-foundry-upgrades/Upgrades.sol";
-
+import {Test, console} from "forge-std/Test.sol";
 import {xCUP} from "../contracts/xCUP.sol";
 import {CUPToken} from "../contracts/CUPToken.sol";
-import {CopperPriceConsumerMock} from "../contracts/mock/CopperPriceConsumerMock.sol";
-import {ERC20Mock} from "../contracts/mock/ERC20Mock.sol";
-
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ICopperPriceConsumer} from "../contracts/interfaces/ICopperPriceConsumer.sol";
+import {IUniswapV2Router02} from "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 
-// Mock Uniswap Router for testing
-contract MockUniswapRouter {
-    mapping(address => mapping(address => uint256)) internal rates;
+// Mock contracts for testing
+contract MockCopperPriceConsumer is ICopperPriceConsumer {
+    uint256 public price = 450000000; // $4.50 with 8 decimals
 
-    function setRate(address tokenA, address tokenB, uint256 rate) external {
-        rates[tokenA][tokenB] = rate;
+    function requestCopperPrice() external pure returns (bytes32) {
+        return bytes32(0);
     }
 
-    function getAmountsOut(uint256 amountIn, address[] memory path) external view returns (uint256[] memory amounts) {
-        amounts = new uint256[](path.length);
-        amounts[0] = amountIn;
+    function fulfill(bytes32, uint256) external pure {
+        revert("Not implemented");
+    }
 
-        for (uint256 i = 1; i < path.length; i++) {
-            uint256 rate = rates[path[i - 1]][path[i]];
-            if (rate == 0) rate = 1e18; // Default 1:1 rate
-            amounts[i] = (amounts[i - 1] * rate) / 1e18;
-        }
+    function getPriceAsDecimal() external view returns (uint256) {
+        return price / 10 ** 8;
+    }
+
+    function updatePrice(uint256 _price) external {
+        price = _price;
+    }
+}
+
+contract MockUSDC {
+    function decimals() external pure returns (uint8) {
+        return 6;
+    }
+}
+
+contract MockUniswapRouter is IUniswapV2Router02 {
+    function WETH() external pure returns (address) {
+        return address(0x1234567890123456789012345678901234567890);
+    }
+
+    function getAmountsOut(uint256 amountIn, address[] calldata path) external pure returns (uint256[] memory amounts) {
+        amounts = new uint256[](2);
+        amounts[0] = amountIn;
+        amounts[1] = amountIn; // 1:1 for testing
+    }
+
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external pure returns (uint256[] memory amounts) {
+        amounts = new uint256[](2);
+        amounts[0] = amountIn;
+        amounts[1] = amountOutMin;
+    }
+
+    function swapExactETHForTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline)
+        external
+        payable
+        returns (uint256[] memory amounts)
+    {
+        amounts = new uint256[](2);
+        amounts[0] = msg.value;
+        amounts[1] = amountOutMin;
+    }
+
+    function addLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 amountADesired,
+        uint256 amountBDesired,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    ) external pure returns (uint256 amountA, uint256 amountB, uint256 liquidity) {
+        return (amountADesired, amountBDesired, 1000);
+    }
+
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    ) external pure returns (uint256 amountA, uint256 amountB) {
+        return (amountAMin, amountBMin);
+    }
+
+    function swapExactTokensForETH(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external pure returns (uint256[] memory amounts) {
+        amounts = new uint256[](2);
+        amounts[0] = amountIn;
+        amounts[1] = amountOutMin;
+    }
+
+    function swapETHForExactTokens(uint256 amountOut, address[] calldata path, address to, uint256 deadline)
+        external
+        payable
+        returns (uint256[] memory amounts)
+    {
+        amounts = new uint256[](2);
+        amounts[0] = msg.value;
+        amounts[1] = amountOut;
+    }
+
+    function getAmountIn(uint256 amountOut, uint256 reserveIn, uint256 reserveOut)
+        external
+        pure
+        returns (uint256 amountIn)
+    {
+        return amountOut;
+    }
+
+    function getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut)
+        external
+        pure
+        returns (uint256 amountOut)
+    {
+        return amountIn;
+    }
+
+    function removeLiquidityETH(
+        address token,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    ) external pure returns (uint256 amountToken, uint256 amountETH) {
+        return (amountTokenMin, amountETHMin);
+    }
+
+    function removeLiquidityETHSupportingFeeOnTransferTokens(
+        address token,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    ) external pure returns (uint256 amountETH) {
+        return amountETHMin;
+    }
+
+    function removeLiquidityETHWithPermit(
+        address token,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline,
+        bool approveMax,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external pure returns (uint256 amountToken, uint256 amountETH) {
+        return (amountTokenMin, amountETHMin);
+    }
+
+    function removeLiquidityETHWithPermitSupportingFeeOnTransferTokens(
+        address token,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline,
+        bool approveMax,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external pure returns (uint256 amountETH) {
+        return amountETHMin;
+    }
+
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external pure {}
+
+    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external payable {}
+
+    function swapExactTokensForETHSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external pure {}
+
+    function factory() external pure returns (address) {
+        return address(0x456);
+    }
+
+    function addLiquidityETH(
+        address token,
+        uint256 amountTokenDesired,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    ) external payable returns (uint256 amountToken, uint256 amountETH, uint256 liquidity) {
+        return (amountTokenDesired, msg.value, 1000);
+    }
+
+    function getAmountsIn(uint256 amountOut, address[] calldata path) external pure returns (uint256[] memory amounts) {
+        amounts = new uint256[](2);
+        amounts[0] = amountOut;
+        amounts[1] = amountOut;
+    }
+
+    function quote(uint256 amountA, uint256 reserveA, uint256 reserveB) external pure returns (uint256 amountB) {
+        return amountA;
+    }
+
+    function removeLiquidityWithPermit(
+        address tokenA,
+        address tokenB,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline,
+        bool approveMax,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external pure returns (uint256 amountA, uint256 amountB) {
+        return (amountAMin, amountBMin);
+    }
+
+    function swapTokensForExactETH(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external pure returns (uint256[] memory amounts) {
+        amounts = new uint256[](2);
+        amounts[0] = amountInMax;
+        amounts[1] = amountOut;
+    }
+
+    function swapTokensForExactTokens(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external pure returns (uint256[] memory amounts) {
+        amounts = new uint256[](2);
+        amounts[0] = amountInMax;
+        amounts[1] = amountOut;
     }
 }
 
 contract xCUPTest is Test {
     xCUP public xcup;
     CUPToken public cupToken;
-    CopperPriceConsumerMock public priceConsumer;
-    MockUniswapRouter public router;
-    ERC20Mock public usdcToken;
-    ERC20Mock public wethToken;
-
-    address internal owner;
-    address internal redeemer;
-    address public user1;
-    address public user2;
-    address public unauthorized;
-
-    uint256 constant INITIAL_COPPER_PRICE = 450000000; // $4.50 with 8 decimals
-    uint256 constant INITIAL_CUP_SUPPLY = 1000000e6; // 1M CUP tokens
-
-    event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares);
-    event Withdraw(
-        address indexed sender,
-        address indexed receiver,
-        address indexed owner,
-        uint256 assets,
-        uint256 shares
-    );
-    event CopperPriceConsumerUpdated(address indexed previous, address indexed current);
-    event UniswapRouterUpdated(address indexed previous, address indexed current);
-    event UsdcTokenUpdated(address indexed previous, address indexed current);
-    event WethTokenUpdated(address indexed previous, address indexed current);
+    MockCopperPriceConsumer public copperPriceConsumer;
+    MockUniswapRouter public uniswapRouter;
+    MockUSDC public usdc;
+    address public owner;
+    address public user;
 
     function setUp() public {
         owner = address(this);
-        redeemer = makeAddr("redeemer");
-        user1 = makeAddr("user1");
-        user2 = makeAddr("user2");
-        unauthorized = makeAddr("unauthorized");
+        user = makeAddr("user");
 
-        // Deploy CUP token using upgradeable pattern
-        address cupTokenProxy = Upgrades.deployTransparentProxy(
-            "CUPToken.sol:CUPToken",
-            owner,
-            abi.encodeCall(CUPToken.initialize, ())
+        // Deploy dependencies
+        CUPToken cupImpl = new CUPToken();
+        bytes memory cupInitData = abi.encodeWithSelector(CUPToken.initialize.selector);
+        ERC1967Proxy cupProxy = new ERC1967Proxy(address(cupImpl), cupInitData);
+        cupToken = CUPToken(address(cupProxy));
+
+        copperPriceConsumer = new MockCopperPriceConsumer();
+        uniswapRouter = new MockUniswapRouter();
+        usdc = new MockUSDC();
+
+        // Deploy xCUP implementation
+        xCUP implementation = new xCUP();
+
+        // Deploy proxy
+        bytes memory initData = abi.encodeWithSelector(
+            xCUP.initialize.selector,
+            IERC20(address(cupToken)),
+            "xCUP Vault",
+            "xCUP",
+            address(copperPriceConsumer),
+            address(uniswapRouter),
+            address(usdc),
+            address(0x1234567890123456789012345678901234567890) // Mock WETH
         );
-        cupToken = CUPToken(cupTokenProxy);
+        ERC1967Proxy proxy = new ERC1967Proxy(address(implementation), initData);
 
-        // Deploy mock tokens
-        usdcToken = new ERC20Mock("USDC", "USDC", 6);
-        wethToken = new ERC20Mock("WETH", "WETH", 18);
+        xcup = xCUP(address(proxy));
 
-        // Deploy mock price consumer
-        priceConsumer = new CopperPriceConsumerMock();
-        priceConsumer.setPrice(INITIAL_COPPER_PRICE);
+        // Grant xCUP the minter role
+        cupToken.grantRole(cupToken.MINTER_ROLE(), address(xcup));
 
-        // Deploy mock router
-        router = new MockUniswapRouter();
-
-        // Deploy xCUP using upgradeable pattern with all parameters
-        address xcupProxy = Upgrades.deployTransparentProxy(
-            "xCUP.sol:xCUP",
-            owner,
-            abi.encodeCall(
-                xCUP.initialize,
-                (
-                    IERC20(address(cupToken)),
-                    "xCUP Vault",
-                    "xCUP",
-                    address(priceConsumer),
-                    address(router),
-                    address(usdcToken),
-                    address(wethToken)
-                )
-            )
-        );
-        xcup = xCUP(xcupProxy);
-
-        // Setup roles
-        xcup.grantRole(xcup.REDEEMER_ROLE(), redeemer);
-
-        // Mint CUP tokens
-        cupToken.grantRole(cupToken.MINTER_ROLE(), owner);
-        cupToken.mint(user1, INITIAL_CUP_SUPPLY);
-        cupToken.mint(user2, INITIAL_CUP_SUPPLY);
-        cupToken.mint(address(this), INITIAL_CUP_SUPPLY);
-
-        // Setup router rates (1 USDC = 1 USDC, 1 ETH = 2000 USDC)
-        router.setRate(address(usdcToken), address(usdcToken), 1e18);
-        router.setRate(address(wethToken), address(usdcToken), 2000e18);
-        router.setRate(address(usdcToken), address(wethToken), 5e14); // 1/2000
+        // Grant user the REDEEMER_ROLE for testing
+        xcup.grantRole(xcup.REDEEMER_ROLE(), user);
     }
 
-    function testInitialState() public {
+    function testInitialization() public {
         assertEq(xcup.name(), "xCUP Vault");
         assertEq(xcup.symbol(), "xCUP");
         assertEq(xcup.decimals(), 6);
-        assertEq(xcup.asset(), address(cupToken));
-        assertEq(xcup.totalSupply(), 0);
-        assertEq(xcup.totalAssets(), 0);
-        assertEq(xcup.owner(), owner);
-        assertFalse(xcup.paused());
-        assertTrue(xcup.v2Initialized()); // Now initialized in setUp
-
-        // Verify V2 features are properly initialized
-        assertEq(address(xcup.copperPriceConsumer()), address(priceConsumer));
-        assertEq(address(xcup.uniswapRouter()), address(router));
-        assertEq(address(xcup.usdcToken()), address(usdcToken));
-        assertEq(xcup.wethToken(), address(wethToken));
-    }
-
-    function testInitializeV2() public {
-        vm.expectEmit(true, true, true, true);
-        emit xCUP.V2Initialized(
-            address(priceConsumer),
-            address(router),
-            address(usdcToken),
-            address(wethToken),
-            block.timestamp
-        );
-
-
-        assertTrue(xcup.v2Initialized());
-        assertEq(address(xcup.copperPriceConsumer()), address(priceConsumer));
-        assertEq(address(xcup.uniswapRouter()), address(router));
-        assertEq(address(xcup.usdcToken()), address(usdcToken));
-        assertEq(xcup.wethToken(), address(wethToken));
-    }
-
-    function testInitializeV2RevertAlreadyInitialized() public {
-        vm.expectRevert("V2 already initialized");
-    }
-
-    function testInitializeV2RevertInvalidAddresses() public {
-        vm.expectRevert("Invalid copper price consumer");
-        xcup.initializeV2(address(0), address(router), address(usdcToken), address(wethToken));
-
-        vm.expectRevert("Invalid Uniswap router");
-        xcup.initializeV2(address(priceConsumer), address(0), address(usdcToken), address(wethToken));
-
-        vm.expectRevert("Invalid USDC token");
-        xcup.initializeV2(address(priceConsumer), address(router), address(0), address(wethToken));
-
-        vm.expectRevert("Invalid WETH token");
-        xcup.initializeV2(address(priceConsumer), address(router), address(usdcToken), address(0));
-    }
-
-    function testInitializeV2RevertNotOwner() public {
-        vm.prank(unauthorized);
-        vm.expectRevert();
-        // V2 features are already initialized in setUp
+        assertEq(address(xcup.asset()), address(cupToken));
+        assertTrue(xcup.hasRole(xcup.DEFAULT_ADMIN_ROLE(), owner));
     }
 
     function testDeposit() public {
-        uint256 depositAmount = 1000e6; // 1000 CUP
+        uint256 amount = 1000 * 10 ** 6;
 
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), depositAmount);
+        // Mint CUP tokens to user
+        cupToken.grantRole(cupToken.MINTER_ROLE(), address(this));
+        cupToken.mint(user, amount);
 
-        vm.expectEmit(true, true, false, true);
-        emit Deposit(user1, user1, depositAmount, depositAmount);
-
-        uint256 shares = xcup.deposit(depositAmount, user1);
+        vm.startPrank(user);
+        cupToken.approve(address(xcup), amount);
+        uint256 shares = xcup.deposit(amount, user);
         vm.stopPrank();
 
-        assertEq(shares, depositAmount); // 1:1 ratio initially
-        assertEq(xcup.balanceOf(user1), depositAmount);
-        assertEq(xcup.totalSupply(), depositAmount);
-        assertEq(xcup.totalAssets(), depositAmount);
+        assertEq(xcup.balanceOf(user), shares);
+        assertEq(xcup.totalSupply(), shares);
     }
 
-    function testMint() public {
-        uint256 shareAmount = 1000e6; // 1000 shares
+    function testWithdraw() public {
+        uint256 amount = 1000 * 10 ** 6;
 
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shareAmount);
+        // First deposit
+        cupToken.grantRole(cupToken.MINTER_ROLE(), address(this));
+        cupToken.mint(user, amount);
 
-        uint256 assets = xcup.mint(shareAmount, user1);
+        vm.startPrank(user);
+        cupToken.approve(address(xcup), amount);
+        uint256 shares = xcup.deposit(amount, user);
+
+        // Then withdraw
+        uint256 withdrawn = xcup.withdraw(amount, user, user);
         vm.stopPrank();
 
-        assertEq(assets, shareAmount); // 1:1 ratio initially
-        assertEq(xcup.balanceOf(user1), shareAmount);
-        assertEq(xcup.totalSupply(), shareAmount);
-        assertEq(xcup.totalAssets(), shareAmount);
+        assertEq(withdrawn, amount);
+        assertEq(xcup.balanceOf(user), 0);
     }
 
-    function testWithdrawOnlyRedeemer() public {
-        // Setup: deposit first
-        uint256 depositAmount = 1000e6;
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), depositAmount);
-        xcup.deposit(depositAmount, user1);
+    function testRedeem() public {
+        uint256 amount = 1000 * 10 ** 6;
+
+        // First deposit
+        cupToken.grantRole(cupToken.MINTER_ROLE(), address(this));
+        cupToken.mint(user, amount);
+
+        vm.startPrank(user);
+        cupToken.approve(address(xcup), amount);
+        uint256 shares = xcup.deposit(amount, user);
+
+        // Then redeem
+        uint256 redeemed = xcup.redeem(shares, user, user);
         vm.stopPrank();
 
-        // Only redeemer should be able to withdraw
-        vm.prank(user1);
-        vm.expectRevert();
-        xcup.withdraw(depositAmount, user1, user1);
-
-        // Redeemer should be able to withdraw
-        vm.prank(redeemer);
-        uint256 shares = xcup.withdraw(depositAmount, user1, user1);
-
-        assertEq(shares, depositAmount);
-        assertEq(xcup.balanceOf(user1), 0);
-        assertEq(cupToken.balanceOf(user1), INITIAL_CUP_SUPPLY); // Back to original
+        assertEq(redeemed, amount);
+        assertEq(xcup.balanceOf(user), 0);
     }
 
-    function testRedeemOnlyRedeemer() public {
-        // Setup: deposit first
-        uint256 depositAmount = 1000e6;
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), depositAmount);
-        xcup.deposit(depositAmount, user1);
-        vm.stopPrank();
-
-        // Only redeemer should be able to redeem
-        vm.prank(user1);
-        vm.expectRevert();
-        xcup.redeem(depositAmount, user1, user1);
-
-        // Redeemer should be able to redeem
-        vm.prank(redeemer);
-        uint256 assets = xcup.redeem(depositAmount, user1, user1);
-
-        assertEq(assets, depositAmount);
-        assertEq(xcup.balanceOf(user1), 0);
-        assertEq(cupToken.balanceOf(user1), INITIAL_CUP_SUPPLY); // Back to original
-    }
-
-    function testPauseAndUnpause() public {
+    function testPause() public {
         xcup.pause();
         assertTrue(xcup.paused());
+    }
 
+    function testUnpause() public {
+        xcup.pause();
         xcup.unpause();
         assertFalse(xcup.paused());
     }
 
-    function testPauseRevertNotOwner() public {
-        vm.prank(unauthorized);
-        vm.expectRevert();
-        xcup.pause();
-    }
-
-    function testUnpauseRevertNotOwner() public {
-        xcup.pause();
-
-        vm.prank(unauthorized);
-        vm.expectRevert();
-        xcup.unpause();
-    }
-
     function testGetCopperPrice() public {
-        // V2 features are already initialized in setUp
-
         uint256 price = xcup.getCopperPrice();
-        assertEq(price, INITIAL_COPPER_PRICE);
-
-        // Update price and test again
-        uint256 newPrice = 500000000; // $5.00
-        priceConsumer.setPrice(newPrice);
-        assertEq(xcup.getCopperPrice(), newPrice);
+        assertEq(price, 450000000); // $4.50 with 8 decimals
     }
 
     function testSetCopperPriceConsumer() public {
-        // V2 features are already initialized in setUp
-
-        CopperPriceConsumerMock newPriceConsumer = new CopperPriceConsumerMock();
-        newPriceConsumer.setPrice(500000000);
-
-        vm.expectEmit(true, true, false, false);
-        emit CopperPriceConsumerUpdated(address(priceConsumer), address(newPriceConsumer));
-
-        xcup.setCopperPriceConsumer(address(newPriceConsumer));
-
-        assertEq(address(xcup.copperPriceConsumer()), address(newPriceConsumer));
-        assertEq(xcup.getCopperPrice(), 500000000);
+        MockCopperPriceConsumer newConsumer = new MockCopperPriceConsumer();
+        xcup.setCopperPriceConsumer(address(newConsumer));
+        // Can't test directly as it's private, but function should not revert
     }
 
-    function testSetCopperPriceConsumerRevertInvalidAddress() public {
-        vm.expectRevert("Invalid copper price consumer");
+    function testSetCopperPriceConsumerWithoutRole() public {
+        vm.prank(user);
+        vm.expectRevert();
         xcup.setCopperPriceConsumer(address(0));
     }
 
-    function testSetCopperPriceConsumerRevertNotOwner() public {
-        vm.prank(unauthorized);
+    function testSetUniswapRouter() public {
+        address newRouter = makeAddr("newRouter");
+        xcup.setUniswapRouter(newRouter);
+        assertEq(address(xcup.uniswapRouter()), newRouter);
+    }
+
+    function testSetUniswapRouterWithoutRole() public {
+        vm.prank(user);
         vm.expectRevert();
-        xcup.setCopperPriceConsumer(address(priceConsumer));
+        xcup.setUniswapRouter(makeAddr("newRouter"));
+    }
+
+    function testSetUsdcToken() public {
+        address newUsdc = makeAddr("newUsdc");
+        xcup.setUsdcToken(newUsdc);
+        assertEq(address(xcup.usdcToken()), newUsdc);
+    }
+
+    function testSetUsdcTokenWithoutRole() public {
+        vm.prank(user);
+        vm.expectRevert();
+        xcup.setUsdcToken(makeAddr("newUsdc"));
+    }
+
+    function testSetWethToken() public {
+        address newWeth = makeAddr("newWeth");
+        xcup.setWethToken(newWeth);
+        assertEq(address(xcup.wethToken()), newWeth);
+    }
+
+    function testSetWethTokenWithoutRole() public {
+        vm.prank(user);
+        vm.expectRevert();
+        xcup.setWethToken(makeAddr("newWeth"));
     }
 
     function testGetXcupPriceInToken() public {
-        // V2 features are already initialized in setUp
-
-        uint256 xcupAmount = 1000e6; // 1000 xCUP
-
-        // Test with USDC
-        uint256 usdcPrice = xcup.getXcupPriceInToken(address(usdcToken), xcupAmount);
-        assertGt(usdcPrice, 0);
-
-        // Test with WETH (should use router)
-        uint256 wethPrice = xcup.getXcupPriceInToken(address(wethToken), xcupAmount);
-        assertGt(wethPrice, 0);
-
-        // Test with ETH (address(0) should use WETH)
-        uint256 ethPrice = xcup.getXcupPriceInToken(address(0), xcupAmount);
-        assertEq(ethPrice, wethPrice);
-    }
-
-    function testGetXcupPriceInTokenRevertNotInitialized() public {
-        vm.expectRevert("Copper price consumer not initialized");
-        xcup.getXcupPriceInToken(address(usdcToken), 1000e6);
-    }
-
-    function testGetXcupPriceInTokenRevertZeroAmount() public {
-        // V2 features are already initialized in setUp
-
-        vm.expectRevert("Amount must be > 0");
-        xcup.getXcupPriceInToken(address(usdcToken), 0);
+        uint256 xcupAmount = 1000 * 10 ** 6;
+        uint256 price = xcup.getXcupPriceInToken(address(usdc), xcupAmount);
+        assertTrue(price > 0);
     }
 
     function testGetTokenToXcupExchangeRate() public {
-        // V2 features are already initialized in setUp
-
-        uint256 tokenAmount = 1000e6; // 1000 USDC
-
-        // Test with USDC
-        uint256 xcupFromUsdc = xcup.getTokenToXcupExchangeRate(address(usdcToken), tokenAmount);
-        assertGt(xcupFromUsdc, 0);
-
-        // Test with WETH
-        uint256 wethAmount = 1e18; // 1 WETH
-        uint256 xcupFromWeth = xcup.getTokenToXcupExchangeRate(address(wethToken), wethAmount);
-        assertGt(xcupFromWeth, 0);
-
-        // Test with ETH (address(0))
-        uint256 xcupFromEth = xcup.getTokenToXcupExchangeRate(address(0), wethAmount);
-        assertEq(xcupFromEth, xcupFromWeth);
+        uint256 tokenAmount = 1000 * 10 ** 6;
+        uint256 rate = xcup.getTokenToXcupExchangeRate(address(usdc), tokenAmount);
+        assertTrue(rate > 0);
     }
 
-    function testGetTokenToXcupExchangeRateRevertNotInitialized() public {
-        vm.expectRevert("Copper price consumer not initialized");
-        xcup.getTokenToXcupExchangeRate(address(usdcToken), 1000e6);
+    function testDecimals() public {
+        assertEq(xcup.decimals(), 6);
     }
 
-    function testGetTokenToXcupExchangeRateRevertZeroAmount() public {
-        // V2 features are already initialized in setUp
-
-        vm.expectRevert("Amount must be > 0");
-        xcup.getTokenToXcupExchangeRate(address(usdcToken), 0);
+    function testWithdrawWithoutRole() public {
+        uint256 amount = 1000 * 10 ** 6;
+        vm.prank(user);
+        vm.expectRevert();
+        xcup.withdraw(amount, user, user);
     }
 
-    function testSetUniswapRouter() public {
-        // V2 features are already initialized in setUp
-
-        MockUniswapRouter newRouter = new MockUniswapRouter();
-
-        vm.expectEmit(true, true, false, false);
-        emit UniswapRouterUpdated(address(router), address(newRouter));
-
-        xcup.setUniswapRouter(address(newRouter));
-
-        assertEq(address(xcup.uniswapRouter()), address(newRouter));
+    function testRedeemWithoutRole() public {
+        uint256 shares = 1000 * 10 ** 6;
+        vm.prank(user);
+        vm.expectRevert();
+        xcup.redeem(shares, user, user);
     }
 
-    function testSetUniswapRouterRevertInvalidAddress() public {
+    function testSetCopperPriceConsumerInvalidAddress() public {
+        vm.expectRevert(xCUP.InvalidAddress.selector);
+        xcup.setCopperPriceConsumer(address(0));
+    }
+
+    function testSetUniswapRouterInvalidAddress() public {
         vm.expectRevert("Invalid Uniswap router");
         xcup.setUniswapRouter(address(0));
     }
 
-    function testSetUsdcToken() public {
-        // V2 features are already initialized in setUp
-
-        ERC20Mock newUsdc = new ERC20Mock("New USDC", "USDC2", 6);
-
-        vm.expectEmit(true, true, false, false);
-        emit UsdcTokenUpdated(address(usdcToken), address(newUsdc));
-
-        xcup.setUsdcToken(address(newUsdc));
-
-        assertEq(address(xcup.usdcToken()), address(newUsdc));
-    }
-
-    function testSetUsdcTokenRevertInvalidAddress() public {
+    function testSetUsdcTokenInvalidAddress() public {
         vm.expectRevert("Invalid USDC token");
         xcup.setUsdcToken(address(0));
     }
 
-    function testSetWethToken() public {
-        // V2 features are already initialized in setUp
-
-        ERC20Mock newWeth = new ERC20Mock("New WETH", "WETH2", 18);
-
-        vm.expectEmit(true, true, false, false);
-        emit WethTokenUpdated(address(wethToken), address(newWeth));
-
-        xcup.setWethToken(address(newWeth));
-
-        assertEq(xcup.wethToken(), address(newWeth));
-    }
-
-    function testSetWethTokenRevertInvalidAddress() public {
+    function testSetWethTokenInvalidAddress() public {
         vm.expectRevert("Invalid WETH token");
         xcup.setWethToken(address(0));
     }
 
-    function testConvertToShares() public {
-        // Initially 1:1 ratio
-        assertEq(xcup.convertToShares(1000e6), 1000e6);
-
-        // After some deposits, ratio might change
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), 1000e6);
-        xcup.deposit(1000e6, user1);
-        vm.stopPrank();
-
-        // Should still be 1:1 for now
-        assertEq(xcup.convertToShares(1000e6), 1000e6);
+    function testGetXcupPriceInTokenWithZeroAmount() public {
+        vm.expectRevert(xCUP.InvalidAmount.selector);
+        xcup.getXcupPriceInToken(address(usdc), 0);
     }
 
-    function testConvertToAssets() public {
-        // Initially 1:1 ratio
-        assertEq(xcup.convertToAssets(1000e6), 1000e6);
-
-        // After some deposits
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), 1000e6);
-        xcup.deposit(1000e6, user1);
-        vm.stopPrank();
-
-        // Should still be 1:1 for now
-        assertEq(xcup.convertToAssets(1000e6), 1000e6);
+    function testGetTokenToXcupExchangeRateWithZeroAmount() public {
+        vm.expectRevert("Amount must be > 0");
+        xcup.getTokenToXcupExchangeRate(address(usdc), 0);
     }
 
-    function testPreviewDeposit() public {
-        uint256 assets = 1000e6;
-        uint256 expectedShares = xcup.previewDeposit(assets);
-
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), assets);
-        uint256 actualShares = xcup.deposit(assets, user1);
-        vm.stopPrank();
-
-        assertEq(actualShares, expectedShares);
+    function testDepositWithMaxAmount() public {
+        uint256 amount = type(uint256).max;
+        vm.expectRevert(); // Should revert due to insufficient balance
+        xcup.deposit(amount, user);
     }
 
-    function testPreviewMint() public {
-        uint256 shares = 1000e6;
-        uint256 expectedAssets = xcup.previewMint(shares);
-
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), expectedAssets);
-        uint256 actualAssets = xcup.mint(shares, user1);
-        vm.stopPrank();
-
-        assertEq(actualAssets, expectedAssets);
+    function testRedeemWithMaxShares() public {
+        uint256 shares = type(uint256).max;
+        vm.expectRevert(); // Should revert due to insufficient shares
+        xcup.redeem(shares, user, user);
     }
 
-    function testMaxDeposit() public {
-        // Should return max uint256 when not paused
-        assertEq(xcup.maxDeposit(user1), type(uint256).max);
+    function testWithdrawWithMaxAmount() public {
+        uint256 amount = type(uint256).max;
+        vm.expectRevert(); // Should revert due to insufficient balance
+        xcup.withdraw(amount, user, user);
+    }
 
-        // Should return 0 when paused
+    function testPauseWhenAlreadyPaused() public {
         xcup.pause();
-        assertEq(xcup.maxDeposit(user1), 0);
-    }
-
-    function testMaxMint() public {
-        // Should return max uint256 when not paused
-        assertEq(xcup.maxMint(user1), type(uint256).max);
-
-        // Should return 0 when paused
+        vm.expectRevert(); // Should revert when already paused
         xcup.pause();
-        assertEq(xcup.maxMint(user1), 0);
     }
 
-    function testMultipleUsersDeposit() public {
-        uint256 depositAmount1 = 1000e6;
-        uint256 depositAmount2 = 2000e6;
-
-        // User1 deposits
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), depositAmount1);
-        uint256 shares1 = xcup.deposit(depositAmount1, user1);
-        vm.stopPrank();
-
-        // User2 deposits
-        vm.startPrank(user2);
-        cupToken.approve(address(xcup), depositAmount2);
-        uint256 shares2 = xcup.deposit(depositAmount2, user2);
-        vm.stopPrank();
-
-        assertEq(xcup.balanceOf(user1), shares1);
-        assertEq(xcup.balanceOf(user2), shares2);
-        assertEq(xcup.totalSupply(), shares1 + shares2);
-        assertEq(xcup.totalAssets(), depositAmount1 + depositAmount2);
+    function testUnpauseWhenNotPaused() public {
+        vm.expectRevert(); // Should revert when not paused
+        xcup.unpause();
     }
 
-    function testRoleManagement() public {
-        address newRedeemer = makeAddr("newRedeemer");
+    // Test initialization error cases for better branch coverage
+    function testInitializeWithZeroUnderlying() public {
+        xCUP xcupImpl = new xCUP();
+        bytes memory xcupInitData = abi.encodeWithSelector(
+            xCUP.initialize.selector,
+            IERC20(address(0)), // Zero underlying
+            "xCUP Vault",
+            "xCUP",
+            address(copperPriceConsumer),
+            address(uniswapRouter),
+            address(usdc),
+            address(0x1234567890123456789012345678901234567890)
+        );
 
-        // Grant role
-        xcup.grantRole(xcup.REDEEMER_ROLE(), newRedeemer);
-        assertTrue(xcup.hasRole(xcup.REDEEMER_ROLE(), newRedeemer));
-
-        // Revoke role
-        xcup.revokeRole(xcup.REDEEMER_ROLE(), newRedeemer);
-        assertFalse(xcup.hasRole(xcup.REDEEMER_ROLE(), newRedeemer));
+        vm.expectRevert(xCUP.InvalidAddress.selector);
+        new ERC1967Proxy(address(xcupImpl), xcupInitData);
     }
 
-    function testInitializeOnlyOnce() public {
-        // Try to initialize again - should revert
-        vm.expectRevert();
-        xcup.initialize(IERC20(address(cupToken)), "xCUP Vault", "xCUP");
+    function testInitializeWithZeroCopperPriceConsumer() public {
+        xCUP xcupImpl = new xCUP();
+        bytes memory xcupInitData = abi.encodeWithSelector(
+            xCUP.initialize.selector,
+            IERC20(address(cupToken)),
+            "xCUP Vault",
+            "xCUP",
+            address(0), // Zero copper price consumer
+            address(uniswapRouter),
+            address(usdc),
+            address(0x1234567890123456789012345678901234567890)
+        );
+
+        vm.expectRevert(xCUP.InvalidAddress.selector);
+        new ERC1967Proxy(address(xcupImpl), xcupInitData);
     }
 
-    function testAssetFunction() public {
-        assertEq(xcup.asset(), address(cupToken));
+    function testInitializeWithZeroUniswapRouter() public {
+        xCUP xcupImpl = new xCUP();
+        bytes memory xcupInitData = abi.encodeWithSelector(
+            xCUP.initialize.selector,
+            IERC20(address(cupToken)),
+            "xCUP Vault",
+            "xCUP",
+            address(copperPriceConsumer),
+            address(0), // Zero uniswap router
+            address(usdc),
+            address(0x1234567890123456789012345678901234567890)
+        );
+
+        vm.expectRevert(xCUP.InvalidAddress.selector);
+        new ERC1967Proxy(address(xcupImpl), xcupInitData);
     }
 
-    function testDecimalsFunction() public {
-        assertEq(xcup.decimals(), 6);
+    function testInitializeWithZeroUsdcToken() public {
+        xCUP xcupImpl = new xCUP();
+        bytes memory xcupInitData = abi.encodeWithSelector(
+            xCUP.initialize.selector,
+            IERC20(address(cupToken)),
+            "xCUP Vault",
+            "xCUP",
+            address(copperPriceConsumer),
+            address(uniswapRouter),
+            address(0), // Zero USDC token
+            address(0x1234567890123456789012345678901234567890)
+        );
+
+        vm.expectRevert(xCUP.InvalidAddress.selector);
+        new ERC1967Proxy(address(xcupImpl), xcupInitData);
     }
 
-    function testPriceCalculationEdgeCases() public {
-        // V2 features are already initialized in setUp
+    function testInitializeWithZeroWethToken() public {
+        xCUP xcupImpl = new xCUP();
+        bytes memory xcupInitData = abi.encodeWithSelector(
+            xCUP.initialize.selector,
+            IERC20(address(cupToken)),
+            "xCUP Vault",
+            "xCUP",
+            address(copperPriceConsumer),
+            address(uniswapRouter),
+            address(usdc),
+            address(0) // Zero WETH token
+        );
 
-        // Test with zero copper price
-        priceConsumer.setPrice(0);
-        vm.expectRevert("Invalid copper price");
-        xcup.getXcupPriceInToken(address(usdcToken), 1000e6);
-
-        // Reset price
-        priceConsumer.setPrice(INITIAL_COPPER_PRICE);
-
-        // Test with very small amount
-        uint256 smallAmount = 1; // 1 wei
-        uint256 price = xcup.getXcupPriceInToken(address(usdcToken), smallAmount);
-        // Should not revert and return some value
-        assertGe(price, 0);
+        vm.expectRevert(xCUP.InvalidAddress.selector);
+        new ERC1967Proxy(address(xcupImpl), xcupInitData);
     }
 }

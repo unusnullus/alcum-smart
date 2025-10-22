@@ -15,11 +15,7 @@ interface IxCUP {
 
     /// @dev Events
     event TokenExchangeRateCalculated(
-        address indexed token,
-        uint256 xcupAmount,
-        uint256 tokenAmount,
-        uint256 rate,
-        uint256 timestamp
+        address indexed token, uint256 xcupAmount, uint256 tokenAmount, uint256 rate, uint256 timestamp
     );
 
     /**
@@ -30,12 +26,8 @@ interface IxCUP {
     /**
      * @dev Initialize V2 functionality (owner only)
      */
-    function initializeV2(
-        address copperPriceConsumer_,
-        address uniswapRouter_,
-        address usdcToken_,
-        address wethToken_
-    ) external;
+    function initializeV2(address copperPriceConsumer_, address uniswapRouter_, address usdcToken_, address wethToken_)
+        external;
 
     /**
      * @dev Set new copper price consumer address (owner only)
@@ -50,27 +42,26 @@ interface IxCUP {
     /**
      * @dev Get exchange rate of token to XCUP
      */
-    function getTokenToXcupExchangeRate(
-        address token,
-        uint256 tokenAmount
-    ) external returns (PriceData memory priceData);
+    function getTokenToXcupExchangeRate(address token, uint256 tokenAmount)
+        external
+        returns (PriceData memory priceData);
 
     // VIEW VERSIONS (no state changes)
     /**
      * @dev Get XCUP price in specified token (view-only)
      */
-    function getXcupPriceInTokenView(
-        address token,
-        uint256 xcupAmount
-    ) external view returns (PriceData memory priceData);
+    function getXcupPriceInTokenView(address token, uint256 xcupAmount)
+        external
+        view
+        returns (PriceData memory priceData);
 
     /**
      * @dev Get exchange rate of token to XCUP (view-only)
      */
-    function getTokenToXcupExchangeRateView(
-        address token,
-        uint256 tokenAmount
-    ) external view returns (PriceData memory priceData);
+    function getTokenToXcupExchangeRateView(address token, uint256 tokenAmount)
+        external
+        view
+        returns (PriceData memory priceData);
 
     /**
      * @dev Set new Uniswap router address (owner only)
