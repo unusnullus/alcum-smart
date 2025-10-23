@@ -134,7 +134,7 @@ library RedeemLib {
         if (copperPrice == 0) revert InvalidPrice();
 
         //  Convert CUP → USDC (no commission)
-        uint256 totalUsdcAmount = (withdrawnCup * copperPrice) / (10 ** 11);
+        uint256 totalUsdcAmount = (withdrawnCup * copperPrice) / (10 ** 8);
 
         //  Pull USDC from Silo
         usdc.safeTransferFrom(silo, address(this), totalUsdcAmount);
