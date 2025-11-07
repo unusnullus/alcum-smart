@@ -36,7 +36,11 @@ contract HostAdapter is Initializable, OwnableUpgradeable, AccessControlUpgradea
      * @param amount The USDC amount of the deposit
      */
     event ExternalDepositRegistered(
-        address indexed operator, address indexed beneficiary, bytes32 indexed depositId, bytes32 tag, uint256 amount
+        address indexed operator,
+        address indexed beneficiary,
+        bytes32 indexed depositId,
+        bytes32 tag,
+        uint256 amount
     );
 
     /**
@@ -47,7 +51,10 @@ contract HostAdapter is Initializable, OwnableUpgradeable, AccessControlUpgradea
      * @param newBeneficiary The new beneficiary address
      */
     event DepositBeneficiaryUpdated(
-        address indexed operator, bytes32 indexed depositId, address indexed oldBeneficiary, address newBeneficiary
+        address indexed operator,
+        bytes32 indexed depositId,
+        address indexed oldBeneficiary,
+        address newBeneficiary
     );
 
     /**
@@ -58,7 +65,10 @@ contract HostAdapter is Initializable, OwnableUpgradeable, AccessControlUpgradea
      * @param priceSnapshot The price used for approval
      */
     event ExternalDepositApproved(
-        address indexed curator, bytes32 indexed depositId, uint256 approvedAmount, uint256 priceSnapshot
+        address indexed curator,
+        bytes32 indexed depositId,
+        uint256 approvedAmount,
+        uint256 priceSnapshot
     );
 
     /**
@@ -148,11 +158,11 @@ contract HostAdapter is Initializable, OwnableUpgradeable, AccessControlUpgradea
      *
      * Emits an {ExternalDepositRegistered} event.
      */
-    function registerExternalDepositFor(address beneficiary, uint256 usdcAmount, bytes32 tag)
-        external
-        onlyRole(HOST_OPERATOR_ROLE)
-        returns (bytes32 depositId)
-    {
+    function registerExternalDepositFor(
+        address beneficiary,
+        uint256 usdcAmount,
+        bytes32 tag
+    ) external onlyRole(HOST_OPERATOR_ROLE) returns (bytes32 depositId) {
         if (beneficiary == address(0)) revert InvalidBeneficiary();
         if (usdcAmount == 0) revert InvalidAmount();
 
@@ -205,10 +215,11 @@ contract HostAdapter is Initializable, OwnableUpgradeable, AccessControlUpgradea
      *
      * Emits an {ExternalDepositApproved} event.
      */
-    function approveExternalDepositWithPrice(bytes32 depositId, uint256 approvedUsdc, uint256 price)
-        external
-        onlyRole(CURATOR_OPERATOR_ROLE)
-    {
+    function approveExternalDepositWithPrice(
+        bytes32 depositId,
+        uint256 approvedUsdc,
+        uint256 price
+    ) external onlyRole(CURATOR_OPERATOR_ROLE) {
         if (approvedUsdc == 0) revert InvalidApprovedAmount();
         if (price == 0) revert InvalidPrice();
 

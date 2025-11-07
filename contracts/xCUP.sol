@@ -174,14 +174,11 @@ contract xCUP is
      *
      * @return shares The amount of shares burned for the withdrawal
      */
-    function withdraw(uint256 assets, address receiver, address owner)
-        public
-        override
-        onlyRole(REDEEMER_ROLE)
-        nonReentrant
-        whenNotPaused
-        returns (uint256 shares)
-    {
+    function withdraw(
+        uint256 assets,
+        address receiver,
+        address owner
+    ) public override onlyRole(REDEEMER_ROLE) nonReentrant whenNotPaused returns (uint256 shares) {
         return super.withdraw(assets, receiver, owner);
     }
 
@@ -202,14 +199,11 @@ contract xCUP is
      *
      * @return assets The amount of underlying assets received
      */
-    function redeem(uint256 shares, address receiver, address owner)
-        public
-        override
-        onlyRole(REDEEMER_ROLE)
-        nonReentrant
-        whenNotPaused
-        returns (uint256 assets)
-    {
+    function redeem(
+        uint256 shares,
+        address receiver,
+        address owner
+    ) public override onlyRole(REDEEMER_ROLE) nonReentrant whenNotPaused returns (uint256 assets) {
         return super.redeem(shares, receiver, owner);
     }
 
@@ -255,8 +249,10 @@ contract xCUP is
      */
     modifier priceContractsInitialized() {
         if (
-            address(copperPriceConsumer) == address(0) || address(uniswapRouter) == address(0)
-                || address(usdcToken) == address(0) || wethToken == address(0)
+            address(copperPriceConsumer) == address(0) ||
+            address(uniswapRouter) == address(0) ||
+            address(usdcToken) == address(0) ||
+            wethToken == address(0)
         ) {
             revert PriceContractsNotInitialized();
         }
@@ -310,12 +306,10 @@ contract xCUP is
      *
      * @return price The equivalent value in the specified token
      */
-    function getXcupPriceInToken(address token, uint256 xcupAmount)
-        external
-        view
-        priceContractsInitialized
-        returns (uint256 price)
-    {
+    function getXcupPriceInToken(
+        address token,
+        uint256 xcupAmount
+    ) external view priceContractsInitialized returns (uint256 price) {
         if (xcupAmount == 0) revert InvalidAmount();
 
         address actualToken = token == address(0) ? wethToken : token;
@@ -348,12 +342,10 @@ contract xCUP is
      * @param tokenAmount Amount of tokens for exchange
      * @return xcupAmount Amount of XCUP tokens that can be obtained
      */
-    function getTokenToXcupExchangeRate(address token, uint256 tokenAmount)
-        external
-        view
-        priceContractsInitialized
-        returns (uint256 xcupAmount)
-    {
+    function getTokenToXcupExchangeRate(
+        address token,
+        uint256 tokenAmount
+    ) external view priceContractsInitialized returns (uint256 xcupAmount) {
         require(tokenAmount > 0, "Amount must be > 0");
 
         address actualToken = token == address(0) ? wethToken : token;
