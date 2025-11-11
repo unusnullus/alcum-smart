@@ -6,6 +6,7 @@ import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/acce
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
 import {Zapper} from "./Zapper.sol";
+import {DepositLib} from "./libraries/DepositLib.sol";
 
 /**
  * @title HostAdapter
@@ -190,7 +191,7 @@ contract HostAdapter is Initializable, OwnableUpgradeable, AccessControlUpgradea
         if (beneficiary == address(0)) revert InvalidBeneficiary();
 
         // Get current deposit info to emit the old beneficiary
-        Zapper.Deposit memory deposit = _zapper.getDeposit(depositId);
+        DepositLib.Deposit memory deposit = _zapper.getDeposit(depositId);
         address oldBeneficiary = deposit.beneficiary;
 
         _zapper.setDepositBeneficiary(depositId, beneficiary);

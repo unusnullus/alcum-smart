@@ -65,10 +65,6 @@ The system manages the complete lifecycle from user deposits through various tok
 -   `registerExternalDepositFor()`: Host integration function for external deposits
 -   `withdrawDeposit()`: User function to withdraw pending deposits before approval
 -   `withdrawAllDeposits()`: User function to withdraw all pending deposits
--   `redeem()`: Convert xCUP shares back to USDC (direct redemption)
--   `requestRedeem()`: Request asynchronous redemption of xCUP shares
--   `approveRedeem()`: Curator function to approve redemption requests
--   `claimRedeem()`: User function to claim approved redemptions
 -   `getCopperPrice()`: Retrieves current copper price from oracle
 
 **Security Features**:
@@ -80,7 +76,6 @@ The system manages the complete lifecycle from user deposits through various tok
 -   Input validation and balance checks
 -   Slippage protection (configurable, default 1%)
 -   Nonce-based deposit ID generation (prevents front-running)
--   Commission system for direct redemptions
 
 **State Management**:
 
@@ -251,7 +246,66 @@ struct EpochRevenue {
 -   `epochDuration()`: Returns duration of epochs in seconds
 -   `setEpochDuration()`: Updates duration for future epochs (EPOCH_MANAGER_ROLE)
 
-### 7. Host Adapter (`HostAdapter.sol`)
+### 7. Redeem Engine (`RedeemEngine.sol`)
+
+**Purpose**: Separate contract for handling all redemption operations with dedicated Silo management.
+
+**Features**:
+
+-   Request-based redemption flow (request → approve → claim) without commission
+-   Direct redemption with configurable commission
+-   Dedicated Silo contract for USDC management during redemptions
+-   Isolated from main Zapper operations for better security and fund separation
+-   Full access control and reentrancy protection
+
+**Key Functions**:
+
+-   `requestRedeem()`: Creates a new redeem request (user)
+-   `approveRedeem()`: Approves a pending redeem request (VAULT_CURATOR_ROLE)
+-   `claimRedeem()`: Claims an approved redeem request (user)
+-   `redeem()`: Direct redemption with commission (user)
+-   `setRedeemCommission()`: Sets commission rate for direct redemptions (DEFAULT_ADMIN_ROLE)
+-   `withdrawFromRedeemSilo()`: Withdraws USDC from redeem silo (VAULT_CURATOR_ROLE)
+-   `getRedeem()`: Returns redeem request information
+-   `getRedeemCommission()`: Returns current commission rate
+-   `redeemSilo()`: Returns address of dedicated redeem Silo
+
+**Redemption Flows**:
+
+1. **Request-Based Flow** (No Commission):
+
+    - User approves `redeemEngine` to spend xCUP shares
+    - User calls `requestRedeem(shares)` - **shares are immediately transferred to contract**
+    - Curator calls `approveRedeem(redeemId, usdcAmount)`
+    - User calls `claimRedeem(redeemId)` - uses shares already in contract to receive USDC
+
+2. **Direct Flow** (With Commission):
+    - User calls `redeem(sharesToRedeem)`
+    - Commission is deducted and stays in redeem silo
+    - User receives USDC minus commission immediately
+
+**State Management**:
+
+```solidity
+struct RedeemRequest {
+    address user;           // requester
+    uint256 shares;         // xCUP shares to redeem
+    uint256 usdcAmount;     // approved payout
+    bool approved;          // approved by admin
+    bool claimed;           // claimed by user
+}
+```
+
+**Security Features**:
+
+-   Role-based access control (VAULT_CURATOR_ROLE for approvals)
+-   ReentrancyGuard on all state-changing functions
+-   Pausable functionality for emergency stops
+-   Dedicated Silo for fund isolation
+-   Commission validation (max 100%)
+-   Input validation and balance checks
+
+### 8. Host Adapter (`HostAdapter.sol`)
 
 **Purpose**: Isolated adapter for host-to-host integrations with role separation.
 
@@ -343,14 +397,20 @@ bytes32 public constant BURNER_ROLE = keccak256("BURNER_ROLE");
 **Permission Matrix**:
 | Function | Owner | Curator | User |
 |----------|-------|---------|------|
+| **Zapper Functions** |
 | pause/unpause | ✅ | ❌ | ❌ |
 | approveDeposit | ❌ | ✅ | ❌ |
-| approveRedeem | ❌ | ✅ | ❌ |
 | zapAndDeposit | ❌ | ❌ | ✅ |
 | claimDeposit | ❌ | ❌ | ✅ |
+| withdrawDeposit | ❌ | ❌ | ✅ |
+| **RedeemEngine Functions** |
+| pause/unpause (RedeemEngine) | ✅ | ❌ | ❌ |
+| approveRedeem | ❌ | ✅ | ❌ |
 | requestRedeem | ❌ | ❌ | ✅ |
 | claimRedeem | ❌ | ❌ | ✅ |
-| withdrawDeposit | ❌ | ❌ | ✅ |
+| redeem (direct) | ❌ | ❌ | ✅ |
+| setRedeemCommission | ✅ | ❌ | ❌ |
+| withdrawFromRedeemSilo | ❌ | ✅ | ❌ |
 
 ### Input Validation
 

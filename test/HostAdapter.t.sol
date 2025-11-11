@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Test, console} from "forge-std/Test.sol";
 import {HostAdapter} from "../contracts/HostAdapter.sol";
 import {Zapper} from "../contracts/Zapper.sol";
+import {DepositLib} from "../contracts/libraries/DepositLib.sol";
 import {CUPToken} from "../contracts/CUPToken.sol";
 import {xCUP} from "../contracts/xCUP.sol";
 import {EpochManager} from "../contracts/EpochManager.sol";
@@ -169,11 +170,14 @@ contract HostAdapterTest is Test {
         uint256 amount = 1000 * 10 ** 6;
 
         vm.prank(hostIntegration);
-        bytes32 depositId =
-            hostAdapter.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
+        bytes32 depositId = hostAdapter.registerExternalDepositFor(
+            user1,
+            amount,
+            bytes32(uint256(uint160(address(usdc))))
+        );
 
         // Check that deposit was recorded in zapper
-        Zapper.Deposit memory deposit = zapper.getDeposit(depositId);
+        DepositLib.Deposit memory deposit = zapper.getDeposit(depositId);
         assertEq(deposit.beneficiary, user1);
         assertEq(deposit.amount, amount);
         assertEq(deposit.beneficiary, user1);
@@ -191,15 +195,18 @@ contract HostAdapterTest is Test {
 
         // First register a deposit
         vm.prank(hostIntegration);
-        bytes32 depositId =
-            hostAdapter.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
+        bytes32 depositId = hostAdapter.registerExternalDepositFor(
+            user1,
+            amount,
+            bytes32(uint256(uint160(address(usdc))))
+        );
 
         // Then set beneficiary
         vm.prank(hostIntegration);
         hostAdapter.setDepositBeneficiary(depositId, newBeneficiary);
 
         // Check that beneficiary was updated
-        Zapper.Deposit memory deposit = zapper.getDeposit(depositId);
+        DepositLib.Deposit memory deposit = zapper.getDeposit(depositId);
         assertEq(deposit.beneficiary, newBeneficiary);
     }
 
@@ -215,15 +222,18 @@ contract HostAdapterTest is Test {
 
         // Register deposit first
         vm.prank(hostIntegration);
-        bytes32 depositId =
-            hostAdapter.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
+        bytes32 depositId = hostAdapter.registerExternalDepositFor(
+            user1,
+            amount,
+            bytes32(uint256(uint160(address(usdc))))
+        );
 
         // Approve with price
         vm.prank(hostIntegration);
         hostAdapter.approveExternalDepositWithPrice(depositId, amount, price);
 
         // Check that deposit was approved
-        Zapper.Deposit memory deposit = zapper.getDeposit(depositId);
+        DepositLib.Deposit memory deposit = zapper.getDeposit(depositId);
         assertTrue(deposit.approved);
     }
 
@@ -271,8 +281,11 @@ contract HostAdapterTest is Test {
 
         // First register a deposit
         vm.prank(hostIntegration);
-        bytes32 depositId =
-            hostAdapter.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
+        bytes32 depositId = hostAdapter.registerExternalDepositFor(
+            user1,
+            amount,
+            bytes32(uint256(uint160(address(usdc))))
+        );
 
         // Try to set zero beneficiary
         vm.prank(hostIntegration);
@@ -286,8 +299,11 @@ contract HostAdapterTest is Test {
 
         // Register deposit first
         vm.prank(hostIntegration);
-        bytes32 depositId =
-            hostAdapter.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
+        bytes32 depositId = hostAdapter.registerExternalDepositFor(
+            user1,
+            amount,
+            bytes32(uint256(uint160(address(usdc))))
+        );
 
         // Try to approve with zero amount
         vm.prank(hostIntegration);
@@ -300,8 +316,11 @@ contract HostAdapterTest is Test {
 
         // Register deposit first
         vm.prank(hostIntegration);
-        bytes32 depositId =
-            hostAdapter.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
+        bytes32 depositId = hostAdapter.registerExternalDepositFor(
+            user1,
+            amount,
+            bytes32(uint256(uint160(address(usdc))))
+        );
 
         // Try to approve with zero price
         vm.prank(hostIntegration);

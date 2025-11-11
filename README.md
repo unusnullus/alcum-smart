@@ -22,6 +22,7 @@ Alcum is a DeFi protocol that enables copper-backed value management through a c
 | **`CUPToken`**            | Copper-backed ERC-20 token              | Mintable/burnable, 6 decimals, role-based access          |
 | **`xCUP`**                | ERC-4626 vault for CUP tokens           | Share-based deposits, controlled redemptions              |
 | **`Zapper`**              | Token conversion and deposit management | Multi-token support, async approvals, Uniswap integration |
+| **`RedeemEngine`**        | Redemption operations management        | Request-based and direct redemptions, dedicated silo      |
 | **`EpochManager`**        | Time-based epoch management             | Configurable durations, epoch progression                 |
 | **`SettlementEngine`**    | Revenue tracking and distribution       | NAV calculations, profit distribution                     |
 | **`CopperPriceConsumer`** | Chainlink oracle integration            | Real-time copper prices, manual updates                   |
@@ -30,19 +31,19 @@ Alcum is a DeFi protocol that enables copper-backed value management through a c
 
 ### Role-Based Access Control
 
-| Role                        | Contracts           | Permissions                          |
-| --------------------------- | ------------------- | ------------------------------------ |
-| **`DEFAULT_ADMIN_ROLE`**    | All contracts       | Full administrative control          |
-| **`VAULT_CURATOR_ROLE`**    | Zapper              | Approve/decline user deposits        |
-| **`HOST_INTEGRATION_ROLE`** | Zapper              | Register external deposits           |
-| **`HOST_OPERATOR_ROLE`**    | HostAdapter         | Register/update external deposits    |
-| **`CURATOR_OPERATOR_ROLE`** | HostAdapter         | Approve external deposits with price |
-| **`MINTER_ROLE`**           | CUPToken            | Mint new CUP tokens                  |
-| **`BURNER_ROLE`**           | CUPToken            | Burn CUP tokens                      |
-| **`REDEEMER_ROLE`**         | xCUP                | Redeem user shares                   |
-| **`REVENUE_MANAGER_ROLE`**  | SettlementEngine    | Manage revenue settlement            |
-| **`EPOCH_MANAGER_ROLE`**    | EpochManager        | Advance epochs, update duration      |
-| **`PRICE_UPDATER_ROLE`**    | CopperPriceConsumer | Manual price updates                 |
+| Role                        | Contracts            | Permissions                                   |
+| --------------------------- | -------------------- | --------------------------------------------- |
+| **`DEFAULT_ADMIN_ROLE`**    | All contracts        | Full administrative control                   |
+| **`VAULT_CURATOR_ROLE`**    | Zapper, RedeemEngine | Approve/decline deposits, approve redemptions |
+| **`HOST_INTEGRATION_ROLE`** | Zapper               | Register external deposits                    |
+| **`HOST_OPERATOR_ROLE`**    | HostAdapter          | Register/update external deposits             |
+| **`CURATOR_OPERATOR_ROLE`** | HostAdapter          | Approve external deposits with price          |
+| **`MINTER_ROLE`**           | CUPToken             | Mint new CUP tokens                           |
+| **`BURNER_ROLE`**           | CUPToken             | Burn CUP tokens                               |
+| **`REDEEMER_ROLE`**         | xCUP                 | Redeem user shares                            |
+| **`REVENUE_MANAGER_ROLE`**  | SettlementEngine     | Manage revenue settlement                     |
+| **`EPOCH_MANAGER_ROLE`**    | EpochManager         | Advance epochs, update duration               |
+| **`PRICE_UPDATER_ROLE`**    | CopperPriceConsumer  | Manual price updates                          |
 
 ## How It Works
 
@@ -263,6 +264,10 @@ All contracts are optimized for gas efficiency:
 ### For Developers
 
 See [`docs/Developer_Quick_Reference.md`](docs/Developer_Quick_Reference.md) for detailed integration guides, security notes, and code samples.
+
+### For Redemption Operations
+
+See [`docs/RedeemEngine_Guide.md`](docs/RedeemEngine_Guide.md) for comprehensive guide on using the RedeemEngine contract for redemption operations.
 
 ### For External Systems
 

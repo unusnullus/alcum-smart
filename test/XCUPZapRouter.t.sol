@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
-import {Upgrades} from "openzeppelin-foundry-upgrades/Upgrades.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ERC20Mock} from "../contracts/mock/ERC20Mock.sol";
@@ -15,7 +15,7 @@ import {IXCUPRatePool} from "../contracts/interfaces/IXCUPRatePool.sol";
 contract MockUniswapRouter is IUniswapRouterV2 {
     mapping(address => mapping(address => uint256)) public rates;
     bool public shouldRevert;
-    address public constant WETH_ADDRESS = 0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14;
+    address public WETH_ADDRESS; // Made non-constant so we can set it in tests
 
     function setRate(address tokenA, address tokenB, uint256 rate) external {
         rates[tokenA][tokenB] = rate;
@@ -122,8 +122,33 @@ contract MockUniswapRouter is IUniswapRouterV2 {
         }
     }
 
+    function setWETHAddress(address _weth) external {
+        WETH_ADDRESS = _weth;
+    }
+
     function WETH() external pure returns (address) {
-        return WETH_ADDRESS;
+        // This will be mocked in tests using vm.mockCall
+        return address(0);
+    }
+}
+
+// Mock WETH with withdraw functionality
+contract MockWETH is ERC20Mock {
+    constructor() ERC20Mock("WETH", "WETH", 18) {}
+
+    function deposit() external payable {
+        _mint(msg.sender, msg.value);
+    }
+
+    function withdraw(uint256 amount) external {
+        require(balanceOf(msg.sender) >= amount, "Insufficient balance");
+        _burn(msg.sender, amount);
+        (bool success, ) = payable(msg.sender).call{value: amount}("");
+        require(success, "ETH transfer failed");
+    }
+
+    receive() external payable {
+        _mint(msg.sender, msg.value);
     }
 }
 
@@ -170,6 +195,27 @@ contract MockXCUPPool is IXCUPRatePool {
         reserves[address(xcup)] += xcupAmountIn;
         reserves[address(usdc)] -= usdcOut;
     }
+
+    function swapExactUSDCToXCUP(uint256 usdcAmountIn, uint256 minXCUPOut) external {
+        require(usdcAmountIn > 0, "Zero amount");
+
+        (uint256 rX, uint256 rU) = this.getReserves();
+        require(rX > 0 && rU > 0, "Empty reserves");
+
+        // Simple constant product formula for testing
+        uint256 amountInWithFee = (usdcAmountIn * (10000 - swapFee)) / 10000;
+        uint256 xcupOut = (amountInWithFee * rX) / (rU + amountInWithFee);
+
+        require(xcupOut >= minXCUPOut && xcupOut > 0, "Slippage");
+
+        // Transfer tokens
+        usdc.transferFrom(msg.sender, address(this), usdcAmountIn);
+        xcup.transfer(msg.sender, xcupOut);
+
+        // Update reserves
+        reserves[address(usdc)] += usdcAmountIn;
+        reserves[address(xcup)] -= xcupOut;
+    }
 }
 
 contract XCUPZapRouterTest is Test {
@@ -199,10 +245,17 @@ contract XCUPZapRouterTest is Test {
         xcup = new ERC20Mock("xCUP", "XCUP", 6);
         usdc = new ERC20Mock("USDC", "USDC", 6);
         tokenOut = new ERC20Mock("TokenOut", "TOUT", 18);
-        weth = new ERC20Mock("WETH", "WETH", 18);
+        weth = new MockWETH();
 
         // Deploy mock router
         uniswapRouter = new MockUniswapRouter();
+
+        // Mock WETH() to return our mock WETH address
+        vm.mockCall(
+            address(uniswapRouter),
+            abi.encodeWithSelector(IUniswapRouterV2.WETH.selector),
+            abi.encode(address(weth))
+        );
 
         // Deploy mock pool
         xcupPool = new MockXCUPPool(address(xcup), address(usdc));
@@ -213,24 +266,31 @@ contract XCUPZapRouterTest is Test {
         xcupPool.setReserves(1000 * ONE_XCUP, 1000 * ONE_USDC);
 
         // Deploy zap router
-        address zapRouterProxy = Upgrades.deployTransparentProxy(
-            "XCUPZapRouter.sol:XCUPZapRouter",
-            owner,
-            abi.encodeCall(
-                XCUPZapRouter.initialize,
-                (address(uniswapRouter), address(xcupPool), address(xcup), address(usdc))
-            )
+        XCUPZapRouter impl = new XCUPZapRouter();
+        bytes memory initData = abi.encodeWithSelector(
+            XCUPZapRouter.initialize.selector,
+            address(uniswapRouter),
+            address(xcupPool),
+            address(xcup),
+            address(usdc)
         );
-        zapRouter = XCUPZapRouter(zapRouterProxy);
+        ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);
+        zapRouter = XCUPZapRouter(payable(address(proxy)));
 
         // Set up Uniswap rates
         // USDC -> TokenOut: 1 USDC = 1 TokenOut (1e6 -> 1e18, so rate = 1e18)
         uniswapRouter.setRate(address(usdc), address(tokenOut), 1e18);
         // USDC -> WETH: 1 USDC = 0.0005 WETH (1e6 -> 0.0005e18, so rate = 5e14)
-        uniswapRouter.setRate(address(usdc), address(uniswapRouter.WETH()), 5e14);
+        uniswapRouter.setRate(address(usdc), address(weth), 5e14);
 
         // Mint tokens for user
         xcup.mint(user, 1000 * ONE_XCUP);
+
+        // Mint tokens to router for swaps (router needs output tokens)
+        tokenOut.mint(address(uniswapRouter), 10000 * ONE_TOKEN);
+        weth.mint(address(uniswapRouter), 10000 * ONE_TOKEN);
+        usdc.mint(address(uniswapRouter), 10000 * ONE_USDC);
+
         vm.stopPrank();
 
         // User approves zap router
@@ -248,13 +308,9 @@ contract XCUPZapRouterTest is Test {
 
     function test_ZapXCUPToToken_Success() public {
         uint256 xcupAmount = 100 * ONE_XCUP;
-        uint256 expectedUSDC = (xcupAmount * 9950) / 10000; // After 0.5% fee
-        expectedUSDC = (expectedUSDC * 1000 * ONE_USDC) / (1000 * ONE_XCUP + expectedUSDC);
-        uint256 expectedTokenOut = (expectedUSDC * 1e18) / 1e6; // USDC to TokenOut rate
 
-        address[] memory path = new address[](2);
-        path[0] = address(usdc);
-        path[1] = address(tokenOut);
+        // Mint tokens to router for swap output
+        tokenOut.mint(address(uniswapRouter), 1000 * ONE_TOKEN);
 
         uint256 userBalanceBefore = tokenOut.balanceOf(user);
         uint256 deadline = block.timestamp + 300;
@@ -264,7 +320,6 @@ contract XCUPZapRouterTest is Test {
             xcupAmount,
             address(tokenOut),
             0, // minAmountOut
-            path,
             deadline
         );
 
@@ -276,67 +331,59 @@ contract XCUPZapRouterTest is Test {
     function test_ZapXCUPToToken_WithMinAmountOut() public {
         uint256 xcupAmount = 100 * ONE_XCUP;
 
-        address[] memory path = new address[](2);
-        path[0] = address(usdc);
-        path[1] = address(tokenOut);
+        // Mint tokens to router for swap output
+        tokenOut.mint(address(uniswapRouter), 1000 * ONE_TOKEN);
 
         // Get expected output
-        (uint256 usdcAmount, uint256 tokenAmount) = zapRouter.getAmountsOut(xcupAmount, path);
+        (uint256 usdcAmount, uint256 tokenAmount) = zapRouter.getAmountsOut(xcupAmount, address(tokenOut));
         uint256 minAmountOut = (tokenAmount * 90) / 100; // 90% of expected
 
         uint256 deadline = block.timestamp + 300;
 
         vm.prank(user);
-        uint256 amountOut = zapRouter.zapXCUPToToken(xcupAmount, address(tokenOut), minAmountOut, path, deadline);
+        uint256 amountOut = zapRouter.zapXCUPToToken(xcupAmount, address(tokenOut), minAmountOut, deadline);
 
         assertGe(amountOut, minAmountOut);
     }
 
     function test_ZapXCUPToToken_RevertInvalidPath() public {
+        // Path validation removed - test with invalid token instead
         uint256 xcupAmount = 100 * ONE_XCUP;
-
-        address[] memory path = new address[](2);
-        path[0] = address(tokenOut); // Wrong: should start with USDC
-        path[1] = address(usdc);
-
         uint256 deadline = block.timestamp + 300;
 
         vm.prank(user);
-        vm.expectRevert(XCUPZapRouter.InvalidPath.selector);
-        zapRouter.zapXCUPToToken(xcupAmount, address(tokenOut), 0, path, deadline);
+        vm.expectRevert(); // Should revert for invalid token
+        zapRouter.zapXCUPToToken(xcupAmount, address(0xDEAD), 0, deadline);
     }
 
-    function test_ZapXCUPToToken_RevertPathNotEndsWithTokenOut() public {
+    function test_ZapXCUPToToken_RevertInvalidToken() public {
         uint256 xcupAmount = 100 * ONE_XCUP;
-
-        address[] memory path = new address[](2);
-        path[0] = address(usdc);
-        path[1] = address(usdc); // Wrong: should end with tokenOut
-
         uint256 deadline = block.timestamp + 300;
 
         vm.prank(user);
-        vm.expectRevert(XCUPZapRouter.InvalidPath.selector);
-        zapRouter.zapXCUPToToken(xcupAmount, address(tokenOut), 0, path, deadline);
+        vm.expectRevert(); // Should revert for invalid token
+        zapRouter.zapXCUPToToken(xcupAmount, address(0xDEAD), 0, deadline);
     }
 
     function test_ZapXCUPToETH_Success() public {
         uint256 xcupAmount = 100 * ONE_XCUP;
         uint256 deadline = block.timestamp + 300;
 
-        uint256 userBalanceBefore = weth.balanceOf(user);
+        uint256 userBalanceBefore = user.balance;
 
-        // Mint WETH to router for swap
-        weth.mint(address(uniswapRouter), 1000 * ONE_TOKEN);
+        // WETH is already minted to router in setUp
+        // Fund WETH contract with ETH for withdraw
+        vm.deal(address(weth), 1000 ether);
 
         vm.prank(user);
-        uint256 amountOut = zapRouter.zapXCUPToETH(
+        uint256 amountOut = zapRouter.zapXCUPToToken(
             xcupAmount,
+            address(0), // ETH
             0, // minAmountOut
             deadline
         );
 
-        uint256 userBalanceAfter = weth.balanceOf(user);
+        uint256 userBalanceAfter = user.balance;
         assertEq(userBalanceAfter - userBalanceBefore, amountOut);
         assertGt(amountOut, 0);
     }
@@ -433,49 +480,315 @@ contract XCUPZapRouterTest is Test {
     function test_ZapXCUPToToken_MultiHopPath() public {
         ERC20Mock intermediateToken = new ERC20Mock("Intermediate", "INT", 18);
         intermediateToken.mint(address(uniswapRouter), 1000 * ONE_TOKEN);
+        tokenOut.mint(address(uniswapRouter), 1000 * ONE_TOKEN);
 
         // Set rates: USDC -> Intermediate -> TokenOut
         uniswapRouter.setRate(address(usdc), address(intermediateToken), 1e18);
         uniswapRouter.setRate(address(intermediateToken), address(tokenOut), 1e18);
 
         uint256 xcupAmount = 100 * ONE_XCUP;
-
-        address[] memory path = new address[](3);
-        path[0] = address(usdc);
-        path[1] = address(intermediateToken);
-        path[2] = address(tokenOut);
-
         uint256 deadline = block.timestamp + 300;
 
         vm.prank(user);
-        uint256 amountOut = zapRouter.zapXCUPToToken(xcupAmount, address(tokenOut), 0, path, deadline);
+        uint256 amountOut = zapRouter.zapXCUPToToken(xcupAmount, address(tokenOut), 0, deadline);
 
         assertGt(amountOut, 0);
         assertEq(tokenOut.balanceOf(user), amountOut);
     }
 
     function test_ZapXCUPToToken_RevertZeroAmount() public {
-        address[] memory path = new address[](2);
-        path[0] = address(usdc);
-        path[1] = address(tokenOut);
-
         uint256 deadline = block.timestamp + 300;
 
         vm.prank(user);
         vm.expectRevert(XCUPZapRouter.InvalidAmount.selector);
-        zapRouter.zapXCUPToToken(0, address(tokenOut), 0, path, deadline);
+        zapRouter.zapXCUPToToken(0, address(tokenOut), 0, deadline);
     }
 
-    function test_ZapXCUPToToken_RevertShortPath() public {
+    function test_ZapXCUPToUSDC_Direct() public {
         uint256 xcupAmount = 100 * ONE_XCUP;
+        uint256 deadline = block.timestamp + 300;
 
-        address[] memory path = new address[](1);
-        path[0] = address(usdc);
+        uint256 userUSDCBefore = usdc.balanceOf(user);
 
+        vm.prank(user);
+        uint256 amountOut = zapRouter.zapXCUPToToken(
+            xcupAmount,
+            address(usdc), // Direct USDC swap
+            0, // minAmountOut
+            deadline
+        );
+
+        uint256 userUSDCAfter = usdc.balanceOf(user);
+        assertEq(userUSDCAfter - userUSDCBefore, amountOut);
+        assertGt(amountOut, 0);
+    }
+
+    function test_ZapXCUPToToken_InsufficientOutput() public {
+        uint256 xcupAmount = 100 * ONE_XCUP;
+        uint256 deadline = block.timestamp + 300;
+
+        // Set very high minAmountOut that can't be reached
+        // This will fail at Uniswap swap level, not at our contract level
+        uint256 minAmountOut = 1000000 * ONE_TOKEN;
+
+        vm.prank(user);
+        // Will revert from Uniswap router, not our contract
+        vm.expectRevert();
+        zapRouter.zapXCUPToToken(xcupAmount, address(tokenOut), minAmountOut, deadline);
+    }
+
+    function test_ZapTokenToXCUP_USDC() public {
+        uint256 usdcAmount = 100 * ONE_USDC;
+        uint256 deadline = block.timestamp + 300;
+
+        // Mint USDC to user
+        usdc.mint(user, usdcAmount);
+        vm.prank(user);
+        usdc.approve(address(zapRouter), usdcAmount);
+
+        uint256 userXCUPBefore = xcup.balanceOf(user);
+
+        vm.prank(user);
+        uint256 amountOut = zapRouter.zapTokenToXCUP(
+            address(usdc), // Direct USDC swap
+            usdcAmount,
+            0, // minAmountOut
+            deadline
+        );
+
+        uint256 userXCUPAfter = xcup.balanceOf(user);
+        assertEq(userXCUPAfter - userXCUPBefore, amountOut);
+        assertGt(amountOut, 0);
+    }
+
+    function test_ZapTokenToXCUP_Token() public {
+        uint256 tokenAmount = 10 * ONE_TOKEN;
+        uint256 deadline = block.timestamp + 300;
+
+        // Mint tokens to user
+        tokenOut.mint(user, tokenAmount);
+
+        // Calculate expected USDC output from swap
+        address[] memory path = new address[](2);
+        path[0] = address(tokenOut);
+        path[1] = address(usdc);
+        uint256[] memory amountsOut = uniswapRouter.getAmountsOut(tokenAmount, path);
+        uint256 expectedUSDC = amountsOut[amountsOut.length - 1];
+
+        // Mint USDC to router - router needs to have USDC to transfer to zapRouter after swap
+        usdc.mint(address(uniswapRouter), expectedUSDC * 2); // Extra buffer
+
+        // Pool needs xCUP to give out
+        xcup.mint(address(xcupPool), 10000000 * ONE_XCUP);
+        usdc.mint(address(xcupPool), 10000000 * ONE_USDC);
+        xcupPool.setReserves(10000000 * ONE_XCUP, 10000000 * ONE_USDC);
+
+        vm.prank(user);
+        tokenOut.approve(address(zapRouter), tokenAmount);
+
+        uint256 userXCUPBefore = xcup.balanceOf(user);
+
+        vm.prank(user);
+        uint256 amountOut = zapRouter.zapTokenToXCUP(
+            address(tokenOut),
+            tokenAmount,
+            0, // minAmountOut
+            deadline
+        );
+
+        uint256 userXCUPAfter = xcup.balanceOf(user);
+        assertEq(userXCUPAfter - userXCUPBefore, amountOut);
+        assertGt(amountOut, 0);
+    }
+
+    function test_ZapTokenToXCUP_ETH() public {
+        uint256 ethAmount = 0.001 ether;
+        uint256 deadline = block.timestamp + 300;
+
+        // Calculate expected USDC output from WETH swap
+        address[] memory path = new address[](2);
+        path[0] = address(weth);
+        path[1] = address(usdc);
+        uint256[] memory amountsOut = uniswapRouter.getAmountsOut(ethAmount, path);
+        uint256 expectedUSDC = amountsOut[amountsOut.length - 1];
+
+        // Mint USDC to router - router needs to have USDC to transfer to zapRouter after swap
+        usdc.mint(address(uniswapRouter), expectedUSDC * 2); // Extra buffer
+
+        // Pool needs xCUP to give out
+        xcup.mint(address(xcupPool), 10000000 * ONE_XCUP);
+        usdc.mint(address(xcupPool), 10000000 * ONE_USDC);
+        xcupPool.setReserves(10000000 * ONE_XCUP, 10000000 * ONE_USDC);
+
+        // Fund WETH with ETH
+        vm.deal(address(weth), 100 ether);
+        vm.deal(user, ethAmount);
+
+        uint256 userXCUPBefore = xcup.balanceOf(user);
+
+        vm.prank(user);
+        uint256 amountOut = zapRouter.zapTokenToXCUP{value: ethAmount}(
+            address(0), // ETH
+            ethAmount,
+            0, // minAmountOut
+            deadline
+        );
+
+        uint256 userXCUPAfter = xcup.balanceOf(user);
+        assertEq(userXCUPAfter - userXCUPBefore, amountOut);
+        assertGt(amountOut, 0);
+    }
+
+    function test_ZapTokenToXCUP_ZeroAmount() public {
         uint256 deadline = block.timestamp + 300;
 
         vm.prank(user);
-        vm.expectRevert(XCUPZapRouter.InvalidPath.selector);
-        zapRouter.zapXCUPToToken(xcupAmount, address(tokenOut), 0, path, deadline);
+        vm.expectRevert(XCUPZapRouter.InvalidAmount.selector);
+        zapRouter.zapTokenToXCUP(address(tokenOut), 0, 0, deadline);
+    }
+
+    function test_ZapTokenToXCUP_ETH_InvalidAmount() public {
+        uint256 deadline = block.timestamp + 300;
+
+        vm.deal(user, 1 ether);
+
+        vm.prank(user);
+        vm.expectRevert(XCUPZapRouter.InvalidAmount.selector);
+        zapRouter.zapTokenToXCUP{value: 0.5 ether}(address(0), 1 ether, 0, deadline);
+    }
+
+    function test_GetAmountsIn() public {
+        uint256 xcupAmountOut = 100 * ONE_XCUP;
+
+        (uint256 tokenAmount, uint256 usdcAmount) = zapRouter.getAmountsIn(xcupAmountOut, address(tokenOut));
+
+        assertGt(tokenAmount, 0);
+        assertGt(usdcAmount, 0);
+    }
+
+    function test_GetAmountsIn_ETH() public {
+        uint256 xcupAmountOut = 100 * ONE_XCUP;
+
+        (uint256 tokenAmount, uint256 usdcAmount) = zapRouter.getAmountsIn(xcupAmountOut, address(0));
+
+        assertGt(tokenAmount, 0);
+        assertGt(usdcAmount, 0);
+    }
+
+    function test_GetAmountsIn_USDC() public {
+        uint256 xcupAmountOut = 100 * ONE_XCUP;
+
+        (uint256 tokenAmount, uint256 usdcAmount) = zapRouter.getAmountsIn(xcupAmountOut, address(usdc));
+
+        assertGt(tokenAmount, 0);
+        assertGt(usdcAmount, 0);
+    }
+
+    function test_GetAmountsOut_USDC() public {
+        uint256 xcupAmount = 100 * ONE_XCUP;
+
+        (uint256 usdcAmount, uint256 tokenAmount) = zapRouter.getAmountsOut(xcupAmount, address(usdc));
+
+        assertGt(usdcAmount, 0);
+        assertEq(tokenAmount, usdcAmount); // For USDC output, tokenAmount = usdcAmount
+    }
+
+    function test_GetAmountsOut_ETH() public {
+        uint256 xcupAmount = 100 * ONE_XCUP;
+
+        (uint256 usdcAmount, uint256 tokenAmount) = zapRouter.getAmountsOut(xcupAmount, address(0));
+
+        assertGt(usdcAmount, 0);
+        assertGt(tokenAmount, 0);
+    }
+
+    function test_GetAmountsOut_ZeroReserves() public {
+        // Create new pool with zero reserves
+        MockXCUPPool emptyPool = new MockXCUPPool(address(xcup), address(usdc));
+
+        XCUPZapRouter newImpl = new XCUPZapRouter();
+        bytes memory initData = abi.encodeWithSelector(
+            XCUPZapRouter.initialize.selector,
+            address(uniswapRouter),
+            address(emptyPool),
+            address(xcup),
+            address(usdc)
+        );
+        ERC1967Proxy newProxy = new ERC1967Proxy(address(newImpl), initData);
+        XCUPZapRouter newRouter = XCUPZapRouter(payable(address(newProxy)));
+
+        (uint256 usdcAmount, uint256 tokenAmount) = newRouter.getAmountsOut(100 * ONE_XCUP, address(tokenOut));
+
+        assertEq(usdcAmount, 0);
+        assertEq(tokenAmount, 0);
+    }
+
+    function test_SetConfig_InvalidAddress() public {
+        vm.prank(owner);
+        vm.expectRevert(XCUPZapRouter.InvalidAddress.selector);
+        zapRouter.setConfig(address(0), address(xcupPool), address(xcup), address(usdc));
+    }
+
+    function test_Initialize_InvalidAddress() public {
+        XCUPZapRouter impl = new XCUPZapRouter();
+        bytes memory initData = abi.encodeWithSelector(
+            XCUPZapRouter.initialize.selector,
+            address(0), // Invalid
+            address(xcupPool),
+            address(xcup),
+            address(usdc)
+        );
+        vm.expectRevert();
+        new ERC1967Proxy(address(impl), initData);
+    }
+
+    function test_EmergencyWithdrawETH() public {
+        vm.deal(address(zapRouter), 1 ether);
+        uint256 ownerBefore = owner.balance;
+
+        vm.prank(owner);
+        zapRouter.emergencyWithdrawETH();
+
+        assertEq(owner.balance - ownerBefore, 1 ether);
+    }
+
+    function test_EmergencyWithdraw_ZeroBalance() public {
+        vm.prank(owner);
+        // Should not revert, just do nothing
+        zapRouter.emergencyWithdraw(usdc);
+    }
+
+    function test_EmergencyWithdrawETH_ZeroBalance() public {
+        vm.prank(owner);
+        // Should not revert, just do nothing
+        zapRouter.emergencyWithdrawETH();
+    }
+
+    function test_ZapTokenToXCUP_InsufficientOutput() public {
+        uint256 usdcAmount = 100 * ONE_USDC;
+        uint256 deadline = block.timestamp + 300;
+
+        usdc.mint(user, usdcAmount);
+        vm.prank(user);
+        usdc.approve(address(zapRouter), usdcAmount);
+
+        // Set very high minAmountOut
+        uint256 minAmountOut = 1000000 * ONE_XCUP;
+
+        vm.prank(user);
+        vm.expectRevert(XCUPZapRouter.InsufficientOutput.selector);
+        zapRouter.zapTokenToXCUP(address(usdc), usdcAmount, minAmountOut, deadline);
+    }
+
+    function test_ZapXCUPToUSDC_InsufficientOutput() public {
+        uint256 xcupAmount = 100 * ONE_XCUP;
+        uint256 deadline = block.timestamp + 300;
+
+        // Set very high minAmountOut
+        uint256 minAmountOut = 1000000 * ONE_USDC;
+
+        vm.prank(user);
+        vm.expectRevert(XCUPZapRouter.InsufficientOutput.selector);
+        zapRouter.zapXCUPToToken(xcupAmount, address(usdc), minAmountOut, deadline);
     }
 }

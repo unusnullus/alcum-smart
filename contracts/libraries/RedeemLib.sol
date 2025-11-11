@@ -30,6 +30,9 @@ library RedeemLib {
     event RedeemRequested(address indexed user, bytes32 indexed redeemId, uint256 shares);
     event RedeemApproved(bytes32 indexed redeemId, uint256 shares, uint256 usdcAmount);
     event RedeemClaimed(address indexed user, bytes32 indexed redeemId, uint256 usdcAmount);
+    event RedeemCancelled(bytes32 indexed redeemId, address indexed user, uint256 shares);
+    event RedeemDeclined(bytes32 indexed redeemId, address indexed user, uint256 shares);
+    event ProportionalApproval(uint256 totalApproved, uint256 totalShares, uint256 proportion);
 
     // ───────────────────────────── ERRORS ─────────────────────────────
 
@@ -41,16 +44,31 @@ library RedeemLib {
     error InvalidAmount();
     error InvalidPrice();
     error InsufficientBalance();
+    error RedeemNotFound();
+    error RedeemAlreadyApproved();
+    error NoPendingRedeems();
+    error NoValidPendingRedeems();
+    error TargetAmountExceedsTotal();
+    error InvalidApprovedAmount();
 
     // ───────────────────────────── REDEEM WORKFLOW ─────────────────────────────
 
     /**
      * @notice Creates a new redeem request.
+     * @param self Mapping of redeem IDs to redeem requests
+     * @param pendingRedeemIds Array of pending redeem IDs
+     * @param userRedeems Mapping of user addresses to their redeem IDs
+     * @param user The user address requesting the redeem
+     * @param shares The number of xCUP shares to redeem
+     * @return redeemId The unique identifier for the redeem request
      */
-    function requestRedeem(mapping(bytes32 => RedeemRequest) storage self, address user, uint256 shares)
-        external
-        returns (bytes32 redeemId)
-    {
+    function requestRedeem(
+        mapping(bytes32 => RedeemRequest) storage self,
+        bytes32[] storage pendingRedeemIds,
+        mapping(address => bytes32[]) storage userRedeems,
+        address user,
+        uint256 shares
+    ) external returns (bytes32 redeemId) {
         if (user == address(0)) revert InvalidRedeemRequest();
         if (shares == 0) revert InvalidAmount();
 
@@ -61,15 +79,21 @@ library RedeemLib {
 
         self[redeemId] = RedeemRequest({user: user, shares: shares, usdcAmount: 0, approved: false, claimed: false});
 
+        // Add to pending list and user's list
+        pendingRedeemIds.push(redeemId);
+        userRedeems[user].push(redeemId);
+
         emit RedeemRequested(user, redeemId, shares);
     }
 
     /**
      * @notice Approves a pending redeem request.
      */
-    function approveRedeem(mapping(bytes32 => RedeemRequest) storage self, bytes32 redeemId, uint256 usdcAmount)
-        external
-    {
+    function approveRedeem(
+        mapping(bytes32 => RedeemRequest) storage self,
+        bytes32 redeemId,
+        uint256 usdcAmount
+    ) external {
         RedeemRequest storage req = self[redeemId];
         if (req.user == address(0)) revert InvalidRedeemRequest();
         if (req.approved) revert AlreadyApproved();
@@ -152,11 +176,211 @@ library RedeemLib {
     /**
      * @notice Returns full redeem info.
      */
-    function getRedeem(mapping(bytes32 => RedeemRequest) storage self, bytes32 redeemId)
-        external
-        view
-        returns (RedeemRequest memory)
-    {
+    function getRedeem(
+        mapping(bytes32 => RedeemRequest) storage self,
+        bytes32 redeemId
+    ) external view returns (RedeemRequest memory) {
         return self[redeemId];
+    }
+
+    /**
+     * @notice Removes a redeem ID from the pending list
+     * @param pendingRedeemIds Array of pending redeem IDs
+     * @param redeemId The redeem ID to remove
+     */
+    function removePendingRedeem(bytes32[] storage pendingRedeemIds, bytes32 redeemId) internal {
+        uint256 length = pendingRedeemIds.length;
+        for (uint256 i = 0; i < length; i++) {
+            if (pendingRedeemIds[i] == redeemId) {
+                // Move last element to current position
+                pendingRedeemIds[i] = pendingRedeemIds[length - 1];
+                pendingRedeemIds.pop();
+                return;
+            }
+        }
+    }
+
+    /**
+     * @notice Removes a redeem ID from a user's list
+     * @param userRedeems Mapping of user addresses to their redeem IDs
+     * @param user The user address
+     * @param redeemId The redeem ID to remove
+     */
+    function removeUserRedeem(
+        mapping(address => bytes32[]) storage userRedeems,
+        address user,
+        bytes32 redeemId
+    ) internal {
+        bytes32[] storage redeems = userRedeems[user];
+        uint256 length = redeems.length;
+        for (uint256 i = 0; i < length; i++) {
+            if (redeems[i] == redeemId) {
+                // Move last element to current position
+                redeems[i] = redeems[length - 1];
+                redeems.pop();
+                return;
+            }
+        }
+    }
+
+    /**
+     * @notice Cancels a redeem request (user-initiated)
+     * @param self Mapping of redeem IDs to redeem requests
+     * @param pendingRedeemIds Array of pending redeem IDs
+     * @param userRedeems Mapping of user addresses to their redeem IDs
+     * @param redeemId The unique identifier of the redeem request to cancel
+     * @return user The user address whose redeem was cancelled
+     * @return shares The number of shares that were cancelled
+     */
+    function cancelRedeem(
+        mapping(bytes32 => RedeemRequest) storage self,
+        bytes32[] storage pendingRedeemIds,
+        mapping(address => bytes32[]) storage userRedeems,
+        bytes32 redeemId
+    ) external returns (address user, uint256 shares) {
+        RedeemRequest storage req = self[redeemId];
+
+        if (req.user == address(0)) {
+            revert RedeemNotFound();
+        }
+        if (req.approved) {
+            revert RedeemAlreadyApproved();
+        }
+        if (req.claimed) {
+            revert AlreadyClaimed();
+        }
+
+        user = req.user;
+        shares = req.shares;
+
+        delete self[redeemId];
+        removePendingRedeem(pendingRedeemIds, redeemId);
+        removeUserRedeem(userRedeems, user, redeemId);
+
+        emit RedeemCancelled(redeemId, user, shares);
+    }
+
+    /**
+     * @notice Declines a redeem request (curator-initiated)
+     * @param self Mapping of redeem IDs to redeem requests
+     * @param pendingRedeemIds Array of pending redeem IDs
+     * @param userRedeems Mapping of user addresses to their redeem IDs
+     * @param redeemId The unique identifier of the redeem request to decline
+     * @return user The user address whose redeem was declined
+     * @return shares The number of shares that were declined
+     */
+    function declineRedeem(
+        mapping(bytes32 => RedeemRequest) storage self,
+        bytes32[] storage pendingRedeemIds,
+        mapping(address => bytes32[]) storage userRedeems,
+        bytes32 redeemId
+    ) external returns (address user, uint256 shares) {
+        RedeemRequest storage req = self[redeemId];
+
+        if (req.user == address(0)) {
+            revert RedeemNotFound();
+        }
+        if (req.approved) {
+            revert RedeemAlreadyApproved();
+        }
+        if (req.claimed) {
+            revert AlreadyClaimed();
+        }
+
+        user = req.user;
+        shares = req.shares;
+
+        delete self[redeemId];
+        removePendingRedeem(pendingRedeemIds, redeemId);
+        removeUserRedeem(userRedeems, user, redeemId);
+
+        emit RedeemDeclined(redeemId, user, shares);
+    }
+
+    /**
+     * @notice Calculates proportional approval amounts for redeem requests
+     * @dev This function only calculates the proportion and approved shares, but doesn't set approved flag.
+     *      The caller should set approved flag and usdcAmount based on the calculated approvedShares.
+     * @param self Mapping of redeem IDs to redeem requests
+     * @param pendingRedeemIds Array of pending redeem IDs
+     * @param targetTotalShares The total shares to approve across all redeems
+     * @return proportion The proportion (scaled by 1e18) to apply to each redeem
+     * @return totalPendingShares The total pending shares before approval
+     */
+    function calculateProportionalApproval(
+        mapping(bytes32 => RedeemRequest) storage self,
+        bytes32[] storage pendingRedeemIds,
+        uint256 targetTotalShares
+    ) external returns (uint256 proportion, uint256 totalPendingShares) {
+        if (targetTotalShares == 0) {
+            revert InvalidApprovedAmount();
+        }
+        if (pendingRedeemIds.length == 0) {
+            revert NoPendingRedeems();
+        }
+
+        // Calculate total pending shares
+        uint256 validRedeems;
+
+        for (uint256 i = 0; i < pendingRedeemIds.length; i++) {
+            RedeemRequest storage req = self[pendingRedeemIds[i]];
+            if (req.user != address(0) && !req.approved) {
+                totalPendingShares += req.shares;
+                validRedeems++;
+            }
+        }
+
+        if (totalPendingShares == 0) {
+            revert NoValidPendingRedeems();
+        }
+        if (targetTotalShares > totalPendingShares) {
+            revert TargetAmountExceedsTotal();
+        }
+
+        // Calculate proportion (scaled by 1e18 for precision)
+        proportion = (targetTotalShares * 1e18) / totalPendingShares;
+
+        emit ProportionalApproval(targetTotalShares, totalPendingShares, proportion);
+    }
+
+    /**
+     * @notice Gets all pending redeem requests for batch processing
+     * @param self Mapping of redeem IDs to redeem requests
+     * @param pendingRedeemIds Array of pending redeem IDs
+     * @return redeemIds Array of redeem IDs that are pending
+     * @return totalShares The total shares of all pending redeems
+     */
+    function getPendingRedeemsForApproval(
+        mapping(bytes32 => RedeemRequest) storage self,
+        bytes32[] storage pendingRedeemIds
+    ) external view returns (bytes32[] memory redeemIds, uint256 totalShares) {
+        if (pendingRedeemIds.length == 0) {
+            revert NoPendingRedeems();
+        }
+
+        // First pass: count valid redeems
+        uint256 validCount = 0;
+        for (uint256 i = 0; i < pendingRedeemIds.length; i++) {
+            RedeemRequest storage req = self[pendingRedeemIds[i]];
+            if (req.user != address(0) && !req.approved) {
+                validCount++;
+                totalShares += req.shares;
+            }
+        }
+
+        if (validCount == 0) {
+            revert NoValidPendingRedeems();
+        }
+
+        // Second pass: collect redeem IDs
+        redeemIds = new bytes32[](validCount);
+        uint256 currentIndex = 0;
+        for (uint256 i = 0; i < pendingRedeemIds.length; i++) {
+            RedeemRequest storage req = self[pendingRedeemIds[i]];
+            if (req.user != address(0) && !req.approved) {
+                redeemIds[currentIndex] = pendingRedeemIds[i];
+                currentIndex++;
+            }
+        }
     }
 }

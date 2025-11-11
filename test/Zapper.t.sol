@@ -10,7 +10,8 @@ import {HostAdapter} from "../contracts/HostAdapter.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ICopperPriceConsumer} from "../contracts/interfaces/ICopperPriceConsumer.sol";
-import {RedeemLib} from "../contracts/libraries/RedeemLib.sol";
+import {DepositLib} from "../contracts/libraries/DepositLib.sol";
+import {PermitLib} from "../contracts/libraries/PermitLib.sol";
 
 // Mock contracts for testing
 contract MockCopperPriceConsumer is ICopperPriceConsumer {
@@ -73,8 +74,14 @@ contract MockUSDC is IERC20 {
 }
 
 contract MockUniswapRouter {
+    IERC20 public usdcToken; // Will be set after deployment
+
     function WETH() external pure returns (address) {
         return address(0x1234567890123456789012345678901234567890);
+    }
+
+    function setUSDC(address usdc_) external {
+        usdcToken = IERC20(usdc_);
     }
 
     function getAmountsOut(uint256 amountIn, address[] calldata path) external pure returns (uint256[] memory amounts) {
@@ -83,15 +90,28 @@ contract MockUniswapRouter {
         amounts[1] = amountIn; // 1:1 for testing
     }
 
-    function swapExactETHForTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline)
-        external
-        payable
-        returns (uint256[] memory amounts)
-    {
-        // Mock implementation - just return the amounts
+    function swapExactETHForTokens(
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external payable returns (uint256[] memory amounts) {
+        // Mock implementation - transfer USDC to 'to' address (silo)
         amounts = new uint256[](2);
         amounts[0] = msg.value;
-        amounts[1] = msg.value; // 1:1 for testing
+        // Convert ETH (18 decimals) to USDC (6 decimals) - 1:1 for testing
+        // This means 1 ETH = 1 USDC in the mock, so we divide by 10^12
+        amounts[1] = msg.value / 10 ** 12;
+
+        // Transfer USDC to the 'to' address (silo) to simulate swap
+        if (address(usdcToken) != address(0) && amounts[1] > 0) {
+            // Ensure router has enough USDC
+            uint256 routerBalance = usdcToken.balanceOf(address(this));
+            if (routerBalance >= amounts[1]) {
+                // Transfer USDC to silo
+                usdcToken.transfer(to, amounts[1]);
+            }
+        }
     }
 
     function swapExactTokensForTokens(
@@ -101,10 +121,21 @@ contract MockUniswapRouter {
         address to,
         uint256 deadline
     ) external returns (uint256[] memory amounts) {
-        // Mock implementation - just return the amounts
+        // Mock implementation - transfer USDC to 'to' address (silo)
         amounts = new uint256[](2);
         amounts[0] = amountIn;
         amounts[1] = amountIn; // 1:1 for testing
+
+        // Transfer USDC to the 'to' address (silo) to simulate swap
+        if (address(usdcToken) != address(0)) {
+            // Mint USDC to this router first if needed
+            if (usdcToken.balanceOf(address(this)) < amounts[1]) {
+                // If router doesn't have enough, we need to mint it
+                // This is a mock, so we'll handle it in the test setup
+            }
+            // Transfer USDC to silo
+            usdcToken.transfer(to, amounts[1]);
+        }
     }
 }
 
@@ -177,8 +208,10 @@ contract ZapperTest is Test {
 
         // Deploy HostAdapter
         HostAdapter hostAdapterImpl = new HostAdapter();
-        bytes memory hostAdapterInitData =
-            abi.encodeWithSelector(HostAdapter.initialize.selector, payable(address(zapper)));
+        bytes memory hostAdapterInitData = abi.encodeWithSelector(
+            HostAdapter.initialize.selector,
+            payable(address(zapper))
+        );
         ERC1967Proxy hostAdapterProxy = new ERC1967Proxy(address(hostAdapterImpl), hostAdapterInitData);
         hostAdapter = HostAdapter(address(hostAdapterProxy));
 
@@ -193,11 +226,16 @@ contract ZapperTest is Test {
         // Grant zapper permission to mint/burn CUP tokens
         cupToken.grantRole(cupToken.MINTER_ROLE(), address(zapper));
 
+        // Configure mock router with USDC address
+        uniswapRouter.setUSDC(address(usdc));
+
         // Mint some tokens for testing
         usdc.mint(user1, 1000000 * 10 ** 6); // 1M USDC
         usdc.mint(user2, 1000000 * 10 ** 6); // 1M USDC
         usdc.mint(address(zapper), 1000000 * 10 ** 6); // 1M USDC for zapper
         usdc.mint(zapper.silo(), 1000000 * 10 ** 6); // 1M USDC for silo
+        // Mint USDC to router for ETH swaps
+        usdc.mint(address(uniswapRouter), 1000000 * 10 ** 6); // 1M USDC for router
 
         cupToken.grantRole(cupToken.MINTER_ROLE(), address(this));
         cupToken.mint(address(zapper), 1000000 * 10 ** 6); // 1M CUP tokens
@@ -225,7 +263,7 @@ contract ZapperTest is Test {
         vm.stopPrank();
 
         // Check that deposit was created
-        Zapper.Deposit memory deposit = zapper.getDeposit(depositId);
+        DepositLib.Deposit memory deposit = zapper.getDeposit(depositId);
         assertEq(deposit.user, user1);
         assertEq(deposit.amount, amount);
         assertTrue(deposit.amount > 0);
@@ -241,7 +279,7 @@ contract ZapperTest is Test {
         zapper.zapAndDepositWithPermit(
             IERC20(address(usdc)),
             amount,
-            Zapper.PermitParams(0, 0, 0, bytes32(0), bytes32(0)),
+            PermitLib.PermitParams(0, 0, 0, bytes32(0), bytes32(0)),
             bytes32(uint256(uint160(user1))),
             0
         );
@@ -254,7 +292,7 @@ contract ZapperTest is Test {
         bytes32 depositId = zapper.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
 
         // Check that deposit was recorded
-        Zapper.Deposit memory deposit = zapper.getDeposit(depositId);
+        DepositLib.Deposit memory deposit = zapper.getDeposit(depositId);
         assertEq(deposit.beneficiary, user1);
         assertEq(deposit.amount, amount);
         assertEq(deposit.beneficiary, user1);
@@ -293,7 +331,7 @@ contract ZapperTest is Test {
         zapper.withdrawDeposit(depositId);
 
         // Check that deposit amount was reduced
-        Zapper.Deposit memory deposit = zapper.getDeposit(depositId);
+        DepositLib.Deposit memory deposit = zapper.getDeposit(depositId);
         assertEq(deposit.amount, 0);
     }
 
@@ -328,7 +366,7 @@ contract ZapperTest is Test {
         zapper.approveDeposit(depositId, amount);
 
         // Check that deposit was approved
-        Zapper.Deposit memory deposit = zapper.getDeposit(depositId);
+        DepositLib.Deposit memory deposit = zapper.getDeposit(depositId);
         assertTrue(deposit.approved);
     }
 
@@ -372,7 +410,7 @@ contract ZapperTest is Test {
         zapper.approveAllDeposits();
 
         // Check that deposit was approved
-        Zapper.Deposit memory deposit = zapper.getDeposit(depositId);
+        DepositLib.Deposit memory deposit = zapper.getDeposit(depositId);
         assertTrue(deposit.approved);
     }
 
@@ -387,7 +425,7 @@ contract ZapperTest is Test {
         zapper.approveExternalDepositWithPrice(depositId, amount, 80000000000); // 800 USD per ton
 
         // Check that deposit was approved correctly
-        Zapper.Deposit memory deposit = zapper.getDeposit(depositId);
+        DepositLib.Deposit memory deposit = zapper.getDeposit(depositId);
         assertTrue(deposit.approved);
         assertEq(deposit.approvedAmount, amount);
         assertEq(deposit.priceSnapshot, 80000000000);
@@ -455,15 +493,6 @@ contract ZapperTest is Test {
 
         // Grant zapper permission to spend CUP tokens and give allowance for xCUP
         cupToken.grantRole(cupToken.MINTER_ROLE(), address(zapper));
-        vm.prank(user1);
-        xcup.approve(address(zapper), shares);
-
-        // Then redeem
-        vm.prank(user1);
-        zapper.redeem(shares);
-
-        // Check that user received USDC tokens
-        assertTrue(usdc.balanceOf(user1) > 0);
     }
 
     function testGetCopperPrice() public {
@@ -488,14 +517,14 @@ contract ZapperTest is Test {
         vm.prank(hostIntegration);
         bytes32 depositId = zapper.registerExternalDepositFor(user1, amount, bytes32(0));
 
-        Zapper.Deposit memory deposit = zapper.getDeposit(depositId);
+        DepositLib.Deposit memory deposit = zapper.getDeposit(depositId);
         assertEq(deposit.beneficiary, user1);
         assertEq(deposit.amount, amount);
         assertTrue(deposit.isExternal);
     }
 
     function testGetDepositNotFound() public {
-        Zapper.Deposit memory deposit = zapper.getDeposit(bytes32(0));
+        DepositLib.Deposit memory deposit = zapper.getDeposit(bytes32(0));
         assertEq(deposit.user, address(0));
         assertEq(deposit.amount, 0);
     }
@@ -506,7 +535,7 @@ contract ZapperTest is Test {
         vm.prank(hostIntegration);
         bytes32 depositId = zapper.registerExternalDepositFor(user1, amount, bytes32(0));
 
-        Zapper.Deposit[] memory deposits = zapper.getUserDeposits(user1);
+        DepositLib.Deposit[] memory deposits = zapper.getUserDeposits(user1);
         assertEq(deposits.length, 1);
         assertEq(deposits[0].depositId, depositId);
     }
@@ -517,7 +546,7 @@ contract ZapperTest is Test {
         vm.prank(hostIntegration);
         bytes32 depositId = zapper.registerExternalDepositFor(user1, amount, bytes32(0));
 
-        Zapper.Deposit[] memory deposits = zapper.getPendingDeposits();
+        DepositLib.Deposit[] memory deposits = zapper.getPendingDeposits();
         assertEq(deposits.length, 1);
         assertEq(deposits[0].depositId, depositId);
     }
@@ -574,7 +603,7 @@ contract ZapperTest is Test {
         uint256 ethAmount = 1 ether;
 
         // Send ETH directly to the contract
-        (bool success,) = address(zapper).call{value: ethAmount}("");
+        (bool success, ) = address(zapper).call{value: ethAmount}("");
         assertTrue(success);
 
         // Check that a deposit was created
@@ -586,7 +615,7 @@ contract ZapperTest is Test {
         uint256 ethAmount = 1 ether;
 
         // Send ETH with data to trigger fallback
-        (bool success,) = address(zapper).call{value: ethAmount}("0x1234");
+        (bool success, ) = address(zapper).call{value: ethAmount}("0x1234");
         assertTrue(success);
 
         // Check that a deposit was created
@@ -619,8 +648,8 @@ contract ZapperTest is Test {
         vm.stopPrank();
 
         // Check that deposits were approved proportionally
-        Zapper.Deposit memory deposit1 = zapper.getDeposit(depositId1);
-        Zapper.Deposit memory deposit2 = zapper.getDeposit(depositId2);
+        DepositLib.Deposit memory deposit1 = zapper.getDeposit(depositId1);
+        DepositLib.Deposit memory deposit2 = zapper.getDeposit(depositId2);
 
         assertTrue(deposit1.approved);
         assertTrue(deposit2.approved);
@@ -631,7 +660,7 @@ contract ZapperTest is Test {
     function testApproveDepositsProportionallyInvalidAmount() public {
         // Test with invalid target amount
         vm.startPrank(vaultCurator);
-        vm.expectRevert("Target amount must be greater than 0");
+        vm.expectRevert(DepositLib.InvalidApprovedAmount.selector);
         zapper.approveDepositsProportionally(0);
         vm.stopPrank();
     }
@@ -639,7 +668,7 @@ contract ZapperTest is Test {
     function testApproveDepositsProportionallyNoDeposits() public {
         // Test with no pending deposits
         vm.startPrank(vaultCurator);
-        vm.expectRevert("No pending deposits");
+        vm.expectRevert(DepositLib.NoPendingDeposits.selector);
         zapper.approveDepositsProportionally(1000);
         vm.stopPrank();
     }
@@ -656,7 +685,7 @@ contract ZapperTest is Test {
 
         // Try to approve more than total deposits
         vm.startPrank(vaultCurator);
-        vm.expectRevert("Target amount exceeds total pending");
+        vm.expectRevert(DepositLib.TargetAmountExceedsTotal.selector);
         zapper.approveDepositsProportionally(2000);
         vm.stopPrank();
     }
@@ -702,8 +731,13 @@ contract ZapperTest is Test {
         // Test permit with ETH (should work without permit)
         bytes32 depositId = keccak256(abi.encodePacked(user1, uint256(1), uint256(1 ether), block.timestamp));
 
-        Zapper.PermitParams memory permitParams =
-            Zapper.PermitParams({value: 0, deadline: 0, v: 0, r: bytes32(0), s: bytes32(0)});
+        PermitLib.PermitParams memory permitParams = PermitLib.PermitParams({
+            value: 0,
+            deadline: 0,
+            v: 0,
+            r: bytes32(0),
+            s: bytes32(0)
+        });
 
         // This should work for ETH
         zapper.zapAndDepositWithPermit{value: 1 ether}(IERC20(address(0)), 1 ether, permitParams, depositId, 100);
@@ -715,8 +749,13 @@ contract ZapperTest is Test {
     function testZapAndDepositWithPermitInvalidAmount() public {
         bytes32 depositId = keccak256(abi.encodePacked(user1, uint256(1), uint256(0), block.timestamp));
 
-        Zapper.PermitParams memory permitParams =
-            Zapper.PermitParams({value: 0, deadline: 0, v: 0, r: bytes32(0), s: bytes32(0)});
+        PermitLib.PermitParams memory permitParams = PermitLib.PermitParams({
+            value: 0,
+            deadline: 0,
+            v: 0,
+            r: bytes32(0),
+            s: bytes32(0)
+        });
 
         vm.expectRevert("Invalid amount");
         zapper.zapAndDepositWithPermit(usdc, 0, permitParams, depositId, 100);
@@ -725,8 +764,13 @@ contract ZapperTest is Test {
     function testZapAndDepositWithPermitInvalidETHAmount() public {
         bytes32 depositId = keccak256(abi.encodePacked(user1, uint256(1), uint256(1 ether), block.timestamp));
 
-        Zapper.PermitParams memory permitParams =
-            Zapper.PermitParams({value: 0, deadline: 0, v: 0, r: bytes32(0), s: bytes32(0)});
+        PermitLib.PermitParams memory permitParams = PermitLib.PermitParams({
+            value: 0,
+            deadline: 0,
+            v: 0,
+            r: bytes32(0),
+            s: bytes32(0)
+        });
 
         // Give user enough ETH
         vm.deal(user1, 2 ether);
@@ -821,6 +865,45 @@ contract ZapperTest is Test {
         vm.stopPrank();
     }
 
+    function testWithdrawAllDepositsMultipleDeposits() public {
+        // Create multiple pending deposits for the same user
+        uint256 amount1 = 1000 * 10 ** 6;
+        uint256 amount2 = 2000 * 10 ** 6;
+        uint256 amount3 = 3000 * 10 ** 6;
+
+        bytes32 depositId1 = keccak256(abi.encodePacked(user1, uint256(1), amount1, block.timestamp));
+        bytes32 depositId2 = keccak256(abi.encodePacked(user1, uint256(2), amount2, block.timestamp));
+        bytes32 depositId3 = keccak256(abi.encodePacked(user1, uint256(3), amount3, block.timestamp));
+
+        // Mint USDC to user
+        usdc.mint(user1, amount1 + amount2 + amount3);
+
+        // Create all three deposits
+        vm.startPrank(user1);
+        usdc.approve(address(zapper), amount1 + amount2 + amount3);
+        zapper.zapAndDeposit(IERC20(address(usdc)), amount1, depositId1, 0);
+        zapper.zapAndDeposit(IERC20(address(usdc)), amount2, depositId2, 0);
+        zapper.zapAndDeposit(IERC20(address(usdc)), amount3, depositId3, 0);
+        vm.stopPrank();
+
+        // Ensure silo has enough USDC
+        usdc.mint(zapper.silo(), amount1 + amount2 + amount3);
+
+        // Get user balance before withdrawal
+        uint256 balanceBefore = usdc.balanceOf(user1);
+
+        // Withdraw all deposits (should process all 3 in the loop)
+        vm.prank(user1);
+        uint256 totalRefunded = zapper.withdrawAllDeposits();
+
+        // Check that user received refund for all deposits
+        assertEq(totalRefunded, amount1 + amount2 + amount3);
+        assertEq(usdc.balanceOf(user1), balanceBefore + totalRefunded);
+
+        // Check that all deposits were removed
+        assertEq(zapper.getUserDepositIds(user1).length, 0);
+    }
+
     function testApproveDepositInvalidAmount() public {
         bytes32 depositId = keccak256(abi.encodePacked(user1, uint256(1), uint256(1000), block.timestamp));
         usdc.mint(user1, 1000);
@@ -831,7 +914,7 @@ contract ZapperTest is Test {
         vm.stopPrank();
 
         vm.startPrank(vaultCurator);
-        vm.expectRevert("Approved amount must be greater than 0");
+        vm.expectRevert(DepositLib.InvalidApprovedAmount.selector);
         zapper.approveDeposit(depositId, 0);
         vm.stopPrank();
     }
@@ -846,7 +929,7 @@ contract ZapperTest is Test {
         vm.stopPrank();
 
         vm.startPrank(vaultCurator);
-        vm.expectRevert("Approved amount exceeds deposit amount");
+        vm.expectRevert(DepositLib.ApprovedAmountExceedsDeposit.selector);
         zapper.approveDeposit(depositId, 2000);
         vm.stopPrank();
     }
@@ -855,7 +938,7 @@ contract ZapperTest is Test {
         bytes32 depositId = hostAdapter.registerExternalDepositFor(user1, 1000, bytes32(0));
 
         vm.startPrank(vaultCurator);
-        vm.expectRevert("Invalid price");
+        vm.expectRevert(DepositLib.InvalidApprovedAmount.selector);
         zapper.approveExternalDepositWithPrice(depositId, 1000, 0);
         vm.stopPrank();
     }
@@ -876,7 +959,7 @@ contract ZapperTest is Test {
 
         // Try to decline approved deposit
         vm.startPrank(vaultCurator);
-        vm.expectRevert("Deposit already approved");
+        vm.expectRevert(DepositLib.DepositAlreadyApproved.selector);
         zapper.declineDeposit(depositId);
         vm.stopPrank();
     }
@@ -939,7 +1022,9 @@ contract ZapperTest is Test {
 
         // Mock copper price to return 0
         vm.mockCall(
-            address(copperPriceConsumer), abi.encodeWithSelector(ICopperPriceConsumer.price.selector), abi.encode(0)
+            address(copperPriceConsumer),
+            abi.encodeWithSelector(ICopperPriceConsumer.price.selector),
+            abi.encode(0)
         );
 
         vm.startPrank(user1);
@@ -1102,7 +1187,7 @@ contract ZapperTest is Test {
         vm.stopPrank();
 
         // Check that deposit was approved
-        Zapper.Deposit memory deposit = newZapper.getDeposit(depositId);
+        DepositLib.Deposit memory deposit = newZapper.getDeposit(depositId);
         assertTrue(deposit.approved);
 
         // But claiming should fail because zapper can't mint CUP tokens
@@ -1144,8 +1229,8 @@ contract ZapperTest is Test {
         vm.stopPrank();
 
         // Check that deposits were approved
-        Zapper.Deposit memory deposit1 = zapper.getDeposit(depositId1);
-        Zapper.Deposit memory deposit2 = zapper.getDeposit(depositId2);
+        DepositLib.Deposit memory deposit1 = zapper.getDeposit(depositId1);
+        DepositLib.Deposit memory deposit2 = zapper.getDeposit(depositId2);
         assertTrue(deposit1.approved);
         assertTrue(deposit2.approved);
 
@@ -1153,50 +1238,6 @@ contract ZapperTest is Test {
         uint256 finalCupBalance = cupToken.balanceOf(address(zapper));
         // The balance might not decrease if approveAllDeposits doesn't actually use CUP tokens
         // The important thing is that the operation succeeded
-    }
-
-    function testRedeemInsufficientShares() public {
-        vm.expectRevert("Insufficient shares to redeem");
-        zapper.redeem(1000);
-    }
-
-    function testRedeemCopperPriceZero() public {
-        // First create some xCUP shares
-        uint256 amount = 1000;
-        usdc.mint(user1, amount);
-        cupToken.mint(address(zapper), amount);
-
-        vm.startPrank(user1);
-        usdc.approve(address(zapper), amount);
-        zapper.zapAndDeposit(usdc, amount, keccak256("test"), 100);
-        vm.stopPrank();
-
-        // Approve and claim to get xCUP shares
-        vm.startPrank(vaultCurator);
-        zapper.approveDeposit(keccak256("test"), amount);
-        vm.stopPrank();
-        vm.startPrank(user1);
-        zapper.claimDeposit(keccak256("test"));
-        vm.stopPrank();
-
-        // Mock copper price to return 0
-        vm.mockCall(
-            address(copperPriceConsumer), abi.encodeWithSelector(ICopperPriceConsumer.price.selector), abi.encode(0)
-        );
-
-        // Check that user has xCUP shares
-        uint256 userShares = xcup.balanceOf(user1);
-        assertTrue(userShares > 0, "User should have xCUP shares");
-
-        // Approve zapper to transfer xCUP shares
-        vm.startPrank(user1);
-        xcup.approve(address(zapper), userShares);
-        vm.stopPrank();
-
-        vm.startPrank(user1);
-        vm.expectRevert("Copper price is 0");
-        zapper.redeem(userShares);
-        vm.stopPrank();
     }
 
     function testWithdrawInsufficientBalance() public {
@@ -1226,20 +1267,20 @@ contract ZapperTest is Test {
 
     function testReceiveFunctionNoETH() public {
         // Test receive function with no ETH sent
-        (bool success,) = address(zapper).call("");
+        (bool success, ) = address(zapper).call("");
         assertFalse(success);
     }
 
     function testFallbackFunctionNoETH() public {
         // Test fallback function with no ETH sent
-        (bool success,) = address(zapper).call("0x1234");
+        (bool success, ) = address(zapper).call("0x1234");
         assertTrue(success); // Should succeed but do nothing
     }
 
     function testApproveDepositWithZeroAmount() public {
         bytes32 depositId = keccak256(abi.encodePacked(user1, uint256(1), uint256(1 ether), block.timestamp));
         vm.startPrank(vaultCurator);
-        vm.expectRevert("Deposit not found");
+        vm.expectRevert(DepositLib.DepositNotFound.selector);
         zapper.approveDeposit(depositId, 0);
         vm.stopPrank();
     }
@@ -1247,7 +1288,7 @@ contract ZapperTest is Test {
     function testApproveDepositWithMaxAmount() public {
         bytes32 depositId = keccak256(abi.encodePacked(user1, uint256(1), uint256(1 ether), block.timestamp));
         vm.startPrank(vaultCurator);
-        vm.expectRevert("Deposit not found");
+        vm.expectRevert(DepositLib.DepositNotFound.selector);
         zapper.approveDeposit(depositId, type(uint256).max);
         vm.stopPrank();
     }
@@ -1255,7 +1296,7 @@ contract ZapperTest is Test {
     function testDeclineDepositWithZeroAmount() public {
         bytes32 depositId = keccak256(abi.encodePacked(user1, uint256(1), uint256(1 ether), block.timestamp));
         vm.startPrank(vaultCurator);
-        vm.expectRevert("Deposit not found");
+        vm.expectRevert(DepositLib.DepositNotFound.selector);
         zapper.declineDeposit(depositId);
         vm.stopPrank();
     }
@@ -1265,20 +1306,6 @@ contract ZapperTest is Test {
         vm.startPrank(user1);
         vm.expectRevert("Invalid user");
         zapper.withdrawDeposit(depositId);
-        vm.stopPrank();
-    }
-
-    function testRedeemWithZeroShares() public {
-        vm.startPrank(user1);
-        vm.expectRevert("Shares to redeem must be greater than 0");
-        zapper.redeem(0);
-        vm.stopPrank();
-    }
-
-    function testRedeemWithMaxShares() public {
-        vm.startPrank(user1);
-        vm.expectRevert("Insufficient shares to redeem");
-        zapper.redeem(type(uint256).max);
         vm.stopPrank();
     }
 
@@ -1313,7 +1340,7 @@ contract ZapperTest is Test {
         vm.deal(user1, type(uint256).max);
         vm.startPrank(user1);
         vm.expectRevert(); // Should revert due to insufficient balance
-        (bool success,) = address(zapper).call{value: type(uint256).max}("");
+        (bool success, ) = address(zapper).call{value: type(uint256).max}("");
         vm.stopPrank();
         assertFalse(success);
     }
@@ -1322,1057 +1349,112 @@ contract ZapperTest is Test {
         vm.deal(user1, type(uint256).max);
         vm.startPrank(user1);
         vm.expectRevert(); // Should revert due to insufficient balance
-        (bool success,) = address(zapper).call{value: type(uint256).max}("");
+        (bool success, ) = address(zapper).call{value: type(uint256).max}("");
         vm.stopPrank();
         assertFalse(success);
     }
 
-    // ───────────────────────────── REDEEM TESTS ─────────────────────────────
-
-    function testRequestRedeem() public {
-        uint256 shares = 1000 * 10 ** 6; // 1000 xCUP shares
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Check that redeem request was created
-        assertTrue(redeemId != bytes32(0));
-    }
-
-    function testRequestRedeemZeroShares() public {
-        vm.startPrank(user1);
-        vm.expectRevert(); // Should revert due to zero shares
-        zapper.requestRedeem(0);
-        vm.stopPrank();
-    }
-
-    function testRequestRedeemInsufficientShares() public {
-        uint256 shares = 1000 * 10 ** 6;
-
-        // requestRedeem doesn't check balance, only claimRedeem does
-        // So this should succeed
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Verify redeem request was created
-        assertTrue(redeemId != bytes32(0));
-    }
-
-    function testRequestRedeemWhenPaused() public {
-        uint256 shares = 1000 * 10 ** 6;
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Pause the contract
-        zapper.pause();
-
-        // Try to request redeem when paused
-        vm.startPrank(user1);
-        vm.expectRevert(); // Should revert when paused
-        zapper.requestRedeem(shares);
-        vm.stopPrank();
-    }
-
-    function testApproveRedeem() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 usdcAmount = 800 * 10 ** 6; // 800 USDC
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Approve redeem
-        vm.startPrank(vaultCurator);
-        zapper.approveRedeem(redeemId, usdcAmount);
-        vm.stopPrank();
-
-        // Test passes if no revert occurs
-        assertTrue(true);
-    }
-
-    function testApproveRedeemWithoutRole() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 usdcAmount = 800 * 10 ** 6;
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Try to approve without role
-        vm.startPrank(user1);
-        vm.expectRevert(); // Should revert due to missing role
-        zapper.approveRedeem(redeemId, usdcAmount);
-        vm.stopPrank();
-    }
-
-    function testApproveRedeemInvalidId() public {
-        uint256 usdcAmount = 800 * 10 ** 6;
-        bytes32 invalidRedeemId = keccak256("invalid");
-
-        vm.startPrank(vaultCurator);
-        vm.expectRevert(); // Should revert due to invalid redeem ID
-        zapper.approveRedeem(invalidRedeemId, usdcAmount);
-        vm.stopPrank();
-    }
-
-    function testApproveRedeemWhenPaused() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 usdcAmount = 800 * 10 ** 6;
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Pause the contract
-        zapper.pause();
-
-        // Try to approve when paused
-        vm.startPrank(vaultCurator);
-        vm.expectRevert(); // Should revert when paused
-        zapper.approveRedeem(redeemId, usdcAmount);
-        vm.stopPrank();
-    }
-
-    function testClaimRedeem() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 usdcAmount = 800 * 10 ** 6;
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Approve redeem
-        vm.startPrank(vaultCurator);
-        zapper.approveRedeem(redeemId, usdcAmount);
-        vm.stopPrank();
-
-        // Approve zapper to transfer xCUP shares from user
-        vm.startPrank(user1);
-        xcup.approve(address(zapper), shares);
-        vm.stopPrank();
-
-        // Claim redeem
-        uint256 initialUsdcBalance = usdc.balanceOf(user1);
-        vm.startPrank(user1);
-        uint256 claimedAmount = zapper.claimRedeem(redeemId);
-        vm.stopPrank();
-
-        // Check that user received USDC
-        assertTrue(claimedAmount > 0);
-        assertTrue(usdc.balanceOf(user1) > initialUsdcBalance);
-    }
-
-    function testClaimRedeemNotApproved() public {
-        uint256 shares = 1000 * 10 ** 6;
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Try to claim without approval
-        vm.startPrank(user1);
-        vm.expectRevert(); // Should revert due to not approved
-        zapper.claimRedeem(redeemId);
-        vm.stopPrank();
-    }
-
-    function testClaimRedeemInvalidUser() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 usdcAmount = 800 * 10 ** 6;
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Approve redeem
-        vm.startPrank(vaultCurator);
-        zapper.approveRedeem(redeemId, usdcAmount);
-        vm.stopPrank();
-
-        // Try to claim with different user
-        vm.startPrank(user2);
-        vm.expectRevert(); // Should revert due to invalid user
-        zapper.claimRedeem(redeemId);
-        vm.stopPrank();
-    }
-
-    function testClaimRedeemInvalidId() public {
-        bytes32 invalidRedeemId = keccak256("invalid");
-
-        vm.startPrank(user1);
-        vm.expectRevert(); // Should revert due to invalid redeem ID
-        zapper.claimRedeem(invalidRedeemId);
-        vm.stopPrank();
-    }
-
-    function testClaimRedeemWhenPaused() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 usdcAmount = 800 * 10 ** 6;
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Approve redeem
-        vm.startPrank(vaultCurator);
-        zapper.approveRedeem(redeemId, usdcAmount);
-        vm.stopPrank();
-
-        // Pause the contract
-        zapper.pause();
-
-        // Try to claim when paused
-        vm.startPrank(user1);
-        vm.expectRevert(); // Should revert when paused
-        zapper.claimRedeem(redeemId);
-        vm.stopPrank();
-    }
-
-    function testClaimRedeemInsufficientShares() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 usdcAmount = 800 * 10 ** 6;
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Approve redeem
-        vm.startPrank(vaultCurator);
-        zapper.approveRedeem(redeemId, usdcAmount);
-        vm.stopPrank();
-
-        // Transfer all xCUP shares away from user1
-        vm.startPrank(user1);
-        xcup.transfer(user2, xcup.balanceOf(user1));
-        vm.stopPrank();
-
-        // Try to claim without sufficient shares
-        vm.startPrank(user1);
-        vm.expectRevert(); // Should revert due to insufficient shares
-        zapper.claimRedeem(redeemId);
-        vm.stopPrank();
-    }
-
-    function testClaimRedeemCopperPriceZero() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 usdcAmount = 800 * 10 ** 6;
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Approve redeem
-        vm.startPrank(vaultCurator);
-        zapper.approveRedeem(redeemId, usdcAmount);
-        vm.stopPrank();
-
-        // Approve zapper to transfer xCUP shares from user
-        vm.startPrank(user1);
-        xcup.approve(address(zapper), shares);
-        vm.stopPrank();
-
-        // Mock copper price to return 0
-        vm.mockCall(
-            address(copperPriceConsumer), abi.encodeWithSelector(ICopperPriceConsumer.price.selector), abi.encode(0)
-        );
-
-        // Try to claim with zero copper price
-        vm.startPrank(user1);
-        vm.expectRevert(); // Should revert due to zero copper price
-        zapper.claimRedeem(redeemId);
-        vm.stopPrank();
-    }
-
-    function testClaimRedeemInsufficientUSDCBalance() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 usdcAmount = 800 * 10 ** 6;
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Approve redeem
-        vm.startPrank(vaultCurator);
-        zapper.approveRedeem(redeemId, usdcAmount);
-        vm.stopPrank();
-
-        // Approve zapper to transfer xCUP shares from user
-        vm.startPrank(user1);
-        xcup.approve(address(zapper), shares);
-        vm.stopPrank();
-
-        // Remove all USDC from silo
-        address silo = zapper.silo();
-        vm.startPrank(silo);
-        usdc.transfer(user2, usdc.balanceOf(silo));
-        vm.stopPrank();
-
-        // Try to claim with insufficient USDC in silo
-        vm.startPrank(user1);
-        vm.expectRevert(); // Should revert due to insufficient USDC balance
-        zapper.claimRedeem(redeemId);
-        vm.stopPrank();
-    }
-
-    function testFullRedeemWorkflow() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 usdcAmount = 800 * 10 ** 6;
-
-        // Step 1: Create xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        uint256 depositedShares = xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Step 2: Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(depositedShares);
-        vm.stopPrank();
-
-        // Step 3: Approve redeem
-        vm.startPrank(vaultCurator);
-        zapper.approveRedeem(redeemId, usdcAmount);
-        vm.stopPrank();
-
-        // Step 4: Approve zapper to transfer xCUP shares
-        vm.startPrank(user1);
-        xcup.approve(address(zapper), depositedShares);
-        vm.stopPrank();
-
-        // Step 5: Claim redeem
-        uint256 initialUsdcBalance = usdc.balanceOf(user1);
-        uint256 initialCupBalance = cupToken.balanceOf(user1);
-
-        vm.startPrank(user1);
-        uint256 claimedAmount = zapper.claimRedeem(redeemId);
-        vm.stopPrank();
-
-        // Verify results
-        assertTrue(claimedAmount > 0);
-        assertTrue(usdc.balanceOf(user1) > initialUsdcBalance);
-        assertEq(cupToken.balanceOf(user1), initialCupBalance); // CUP should be converted to USDC
-        assertEq(xcup.balanceOf(user1), 0); // All xCUP shares should be redeemed
-    }
-
-    function testMultipleRedeemRequests() public {
-        uint256 shares1 = 500 * 10 ** 6;
-        uint256 shares2 = 300 * 10 ** 6;
-
-        // Create xCUP shares for user1
-        cupToken.mint(user1, shares1 + shares2);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares1 + shares2);
-        xcup.deposit(shares1 + shares2, user1);
-        vm.stopPrank();
-
-        // Create two redeem requests
-        vm.startPrank(user1);
-        bytes32 redeemId1 = zapper.requestRedeem(shares1);
-        bytes32 redeemId2 = zapper.requestRedeem(shares2);
-        vm.stopPrank();
-
-        // Verify different redeem IDs
-        assertTrue(redeemId1 != redeemId2);
-        assertTrue(redeemId1 != bytes32(0));
-        assertTrue(redeemId2 != bytes32(0));
-    }
-
-    function testApproveRedeemAlreadyApproved() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 usdcAmount = 800 * 10 ** 6;
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Approve redeem first time
-        vm.startPrank(vaultCurator);
-        zapper.approveRedeem(redeemId, usdcAmount);
-        vm.stopPrank();
-
-        // Try to approve again
-        vm.startPrank(vaultCurator);
-        vm.expectRevert(); // Should revert due to already approved
-        zapper.approveRedeem(redeemId, usdcAmount);
-        vm.stopPrank();
-    }
-
-    function testClaimRedeemAlreadyClaimed() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 usdcAmount = 800 * 10 ** 6;
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Approve redeem
-        vm.startPrank(vaultCurator);
-        zapper.approveRedeem(redeemId, usdcAmount);
-        vm.stopPrank();
-
-        // Approve zapper to transfer xCUP shares from user
-        vm.startPrank(user1);
-        xcup.approve(address(zapper), shares);
-        vm.stopPrank();
-
-        // Claim redeem first time
-        vm.startPrank(user1);
-        zapper.claimRedeem(redeemId);
-        vm.stopPrank();
-
-        // Try to claim again
-        vm.startPrank(user1);
-        vm.expectRevert(); // Should revert due to already claimed
-        zapper.claimRedeem(redeemId);
-        vm.stopPrank();
-    }
-
-    // ───────────────────────────── COMMISSION TESTS ─────────────────────────────
-
-    function testRedeemWithCommission() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 copperPrice = 450000000; // $4.50 with 8 decimals
-        uint256 expectedUsdcAmount = (shares * copperPrice) / (10 ** 8); // Calculate actual expected amount
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Approve zapper to transfer xCUP shares from user
-        vm.startPrank(user1);
-        xcup.approve(address(zapper), shares);
-        vm.stopPrank();
-
-        // Record initial balances
-        uint256 initialUserUsdcBalance = usdc.balanceOf(user1);
-
-        // Perform redeem (this should apply commission)
-        vm.startPrank(user1);
-        uint256 receivedUsdc = zapper.redeem(shares);
-        vm.stopPrank();
-
-        // Check that user received USDC (less commission)
-        assertTrue(receivedUsdc > 0);
-        assertTrue(usdc.balanceOf(user1) > initialUserUsdcBalance);
-
-        // Since commission is 0 by default, user should receive full amount
-        assertEq(receivedUsdc, expectedUsdcAmount);
-    }
-
-    function testRedeemCommissionCalculation() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 copperPrice = 450000000; // $4.50 with 8 decimals
-        uint256 expectedTotalUsdc = (shares * copperPrice) / (10 ** 8);
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Approve zapper to transfer xCUP shares from user
-        vm.startPrank(user1);
-        xcup.approve(address(zapper), shares);
-        vm.stopPrank();
-
-        // Perform redeem
-        vm.startPrank(user1);
-        uint256 receivedUsdc = zapper.redeem(shares);
-        vm.stopPrank();
-
-        // With 0% commission (default), user should receive full amount
-        assertEq(receivedUsdc, expectedTotalUsdc);
-    }
-
-    function testRedeemCommissionStaysInSilo() public {
-        uint256 shares = 1000 * 10 ** 6;
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Approve zapper to transfer xCUP shares from user
-        vm.startPrank(user1);
-        xcup.approve(address(zapper), shares);
-        vm.stopPrank();
-
-        // Record initial silo balance
-        uint256 initialSiloBalance = usdc.balanceOf(zapper.silo());
-
-        // Perform redeem
-        vm.startPrank(user1);
-        uint256 receivedUsdc = zapper.redeem(shares);
-        vm.stopPrank();
-
-        // Record final silo balance
-        uint256 finalSiloBalance = usdc.balanceOf(zapper.silo());
-
-        // With 0% commission, silo balance should decrease by the full amount
-        // (This test will need to be updated if commission is set to non-zero)
-        assertEq(finalSiloBalance, initialSiloBalance - receivedUsdc);
-    }
-
-    function testRedeemWithDifferentCommissionRates() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 totalUsdcAmount = (shares * 450000000) / (10 ** 8);
-
-        // Test with 0% commission (default)
-        assertEq(zapper.getRedeemCommission(), 0);
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Approve zapper to transfer xCUP shares from user
-        vm.startPrank(user1);
-        xcup.approve(address(zapper), shares);
-        vm.stopPrank();
-
-        // Test with 0% commission
-        vm.startPrank(user1);
-        uint256 receivedUsdc0 = zapper.redeem(shares);
-        vm.stopPrank();
-
-        // Verify that with 0% commission, user receives full amount
-        assertEq(receivedUsdc0, totalUsdcAmount);
-
-        // Now test with 2% commission (200 basis points)
-        vm.startPrank(owner);
-        zapper.setRedeemCommission(200);
-        vm.stopPrank();
-
-        assertEq(zapper.getRedeemCommission(), 200);
-
-        // Create new shares for testing with commission
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        xcup.approve(address(zapper), shares);
-        vm.stopPrank();
-
-        // Test with 2% commission
-        vm.startPrank(user1);
-        uint256 receivedUsdc2 = zapper.redeem(shares);
-        vm.stopPrank();
-
-        // With 2% commission, user should receive 98% of total amount
-        uint256 expectedAmount2 = (totalUsdcAmount * 9800) / 10000;
-        assertEq(receivedUsdc2, expectedAmount2);
-
-        // Test with 5% commission (500 basis points)
-        vm.startPrank(owner);
-        zapper.setRedeemCommission(500);
-        vm.stopPrank();
-
-        assertEq(zapper.getRedeemCommission(), 500);
-
-        // Create new shares for testing with 5% commission
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        xcup.approve(address(zapper), shares);
-        vm.stopPrank();
-
-        // Test with 5% commission
-        vm.startPrank(user1);
-        uint256 receivedUsdc5 = zapper.redeem(shares);
-        vm.stopPrank();
-
-        // With 5% commission, user should receive 95% of total amount
-        uint256 expectedAmount5 = (totalUsdcAmount * 9500) / 10000;
-        assertEq(receivedUsdc5, expectedAmount5);
-    }
-
-    function testRedeemCommissionEdgeCases() public {
-        uint256 shares = 1000 * 10 ** 6;
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Approve zapper to transfer xCUP shares from user
-        vm.startPrank(user1);
-        xcup.approve(address(zapper), shares);
-        vm.stopPrank();
-
-        // Test with very small amount (should still work with 0% commission)
-        vm.startPrank(user1);
-        uint256 receivedUsdc = zapper.redeem(1); // 1 wei
-        vm.stopPrank();
-
-        // Should receive proportional amount
-        assertTrue(receivedUsdc > 0);
-    }
-
-    function testRedeemCommissionPrecision() public {
-        // Test commission calculation precision with different amounts
-        uint256[] memory testAmounts = new uint256[](3);
-        testAmounts[0] = 1; // 1 wei
-        testAmounts[1] = 1000 * 10 ** 6; // 1000 USDC
-        testAmounts[2] = 1000000 * 10 ** 6; // 1M USDC
-
-        for (uint256 i = 0; i < testAmounts.length; i++) {
-            uint256 shares = testAmounts[i];
-
-            // Create xCUP shares for user1
-            cupToken.mint(user1, shares);
-            vm.startPrank(user1);
-            cupToken.approve(address(xcup), shares);
-            xcup.deposit(shares, user1);
-            vm.stopPrank();
-
-            // Approve zapper to transfer xCUP shares from user
-            vm.startPrank(user1);
-            xcup.approve(address(zapper), shares);
-            vm.stopPrank();
-
-            // Ensure silo has enough USDC for this redeem
-            uint256 expectedUsdc = (shares * 450000000) / (10 ** 8);
-            if (usdc.balanceOf(zapper.silo()) < expectedUsdc) {
-                usdc.mint(zapper.silo(), expectedUsdc);
-            }
-
-            // Perform redeem
-            vm.startPrank(user1);
-            uint256 receivedUsdc = zapper.redeem(shares);
-            vm.stopPrank();
-
-            // With 0% commission, should receive full amount
-            uint256 expectedAmount = (shares * 450000000) / (10 ** 8);
-            assertEq(receivedUsdc, expectedAmount);
-        }
-    }
-
-    function testSetRedeemCommission() public {
-        // Test setting commission to 2% (200 basis points)
-        vm.startPrank(owner);
-        zapper.setRedeemCommission(200);
-        vm.stopPrank();
-
-        assertEq(zapper.getRedeemCommission(), 200);
-    }
-
-    function testSetRedeemCommissionWithoutRole() public {
-        vm.startPrank(user1);
-        vm.expectRevert(); // Should revert due to missing role
-        zapper.setRedeemCommission(200);
-        vm.stopPrank();
-    }
-
-    function testSetRedeemCommissionInvalidRate() public {
-        vm.startPrank(owner);
-        vm.expectRevert("Commission cannot exceed 100%");
-        zapper.setRedeemCommission(10001); // 100.01%
-        vm.stopPrank();
-    }
-
-    function testSetRedeemCommissionMaxRate() public {
-        vm.startPrank(owner);
-        zapper.setRedeemCommission(10000); // 100%
-        vm.stopPrank();
-
-        assertEq(zapper.getRedeemCommission(), 10000);
-    }
-
-    function testGetRedeemCommission() public {
-        // Test default commission (should be 0)
-        assertEq(zapper.getRedeemCommission(), 0);
-
-        // Set commission and verify
-        vm.startPrank(owner);
-        zapper.setRedeemCommission(250); // 2.5%
-        vm.stopPrank();
-
-        assertEq(zapper.getRedeemCommission(), 250);
-    }
-
-    function testRedeemCommissionStaysInSiloWithCommission() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 totalUsdcAmount = (shares * 450000000) / (10 ** 8);
-
-        // Set 3% commission
-        vm.startPrank(owner);
-        zapper.setRedeemCommission(300); // 3%
-        vm.stopPrank();
-
-        // First create some xCUP shares for user1
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Approve zapper to transfer xCUP shares from user
-        vm.startPrank(user1);
-        xcup.approve(address(zapper), shares);
-        vm.stopPrank();
-
-        // Record initial silo balance
-        uint256 initialSiloBalance = usdc.balanceOf(zapper.silo());
-
-        // Perform redeem
-        vm.startPrank(user1);
-        uint256 receivedUsdc = zapper.redeem(shares);
-        vm.stopPrank();
-
-        // Record final silo balance
-        uint256 finalSiloBalance = usdc.balanceOf(zapper.silo());
-
-        // With 3% commission:
-        // - User should receive 97% of total amount
-        // - Commission (3%) should stay in silo
-        uint256 expectedUserAmount = (totalUsdcAmount * 9700) / 10000;
-        uint256 expectedCommission = totalUsdcAmount - expectedUserAmount;
-
-        assertEq(receivedUsdc, expectedUserAmount);
-        assertEq(finalSiloBalance, initialSiloBalance - receivedUsdc);
-        // Commission stays in silo, so silo balance decreases by user amount only
-    }
-
-    function testRedeemCommissionPrecisionWithDifferentRates() public {
-        uint256 shares = 1000 * 10 ** 6;
-        uint256 totalUsdcAmount = (shares * 450000000) / (10 ** 8);
-
-        // Test different commission rates
-        uint256[] memory commissionRates = new uint256[](4);
-        commissionRates[0] = 1; // 0.01%
-        commissionRates[1] = 50; // 0.5%
-        commissionRates[2] = 100; // 1%
-        commissionRates[3] = 1000; // 10%
-
-        for (uint256 i = 0; i < commissionRates.length; i++) {
-            uint256 commissionBps = commissionRates[i];
-
-            // Set commission
-            vm.startPrank(owner);
-            zapper.setRedeemCommission(commissionBps);
-            vm.stopPrank();
-
-            // Create xCUP shares for user1
-            cupToken.mint(user1, shares);
-            vm.startPrank(user1);
-            cupToken.approve(address(xcup), shares);
-            xcup.deposit(shares, user1);
-            xcup.approve(address(zapper), shares);
-            vm.stopPrank();
-
-            // Ensure silo has enough USDC for this redeem
-            uint256 expectedUsdc = (shares * 450000000) / (10 ** 8);
-            if (usdc.balanceOf(zapper.silo()) < expectedUsdc) {
-                usdc.mint(zapper.silo(), expectedUsdc);
-            }
-
-            // Perform redeem
-            vm.startPrank(user1);
-            uint256 receivedUsdc = zapper.redeem(shares);
-            vm.stopPrank();
-
-            // Calculate expected amount
-            uint256 expectedAmount = (totalUsdcAmount * (10000 - commissionBps)) / 10000;
-            assertEq(receivedUsdc, expectedAmount);
-        }
-    }
-
-    // Additional tests for RedeemLib branch coverage
-    function testRequestRedeemWithDuplicateId() public {
-        // This test covers the req.user != address(0) branch in RedeemLib.requestRedeem
-        // When block.timestamp is the same, keccak256 can produce the same ID
-
-        uint256 shares = 1000 * 10 ** 6;
-
-        // Set up user with shares
-        cupToken.mint(user1, shares * 2);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares * 2);
-        xcup.deposit(shares * 2, user1);
-        vm.stopPrank();
-
-        // First request
-        vm.startPrank(user1);
-        bytes32 redeemId1 = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Second request with same parameters in same block (should revert due to duplicate ID)
-        vm.startPrank(user1);
-        vm.expectRevert(RedeemLib.InvalidRedeemRequest.selector);
-        zapper.requestRedeem(shares);
-        vm.stopPrank();
-    }
-
-    function testApproveRedeemWithZeroUser() public {
-        // This test covers the req.user == address(0) branch in RedeemLib.approveRedeem
-        // We need to try to approve a non-existent redeem request
-
-        bytes32 nonExistentRedeemId = keccak256("non-existent");
-
-        vm.expectRevert(); // Should revert due to invalid redeem request
-        zapper.approveRedeem(nonExistentRedeemId, 1000 * 10 ** 6);
-    }
-
-    function testGetRedeem() public {
-        // Test the getRedeem function to retrieve redeem request information
-        uint256 shares = 1000 * 10 ** 6;
-
-        // Set up user with shares
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Get redeem information
-        RedeemLib.RedeemRequest memory redeemInfo = zapper.getRedeem(redeemId);
-
-        // Verify the redeem request information
-        assertEq(redeemInfo.user, user1, "User should match");
-        assertEq(redeemInfo.shares, shares, "Shares should match");
-        assertEq(redeemInfo.usdcAmount, 0, "USDC amount should be 0 initially");
-        assertFalse(redeemInfo.approved, "Should not be approved initially");
-        assertFalse(redeemInfo.claimed, "Should not be claimed initially");
-
-        // Approve the redeem
+    // ───────────────────────────── SECURITY TESTS ─────────────────────────────
+
+    /**
+     * @notice Test that sending ETH with ERC20 token in zapAndDeposit reverts
+     * @dev This prevents ETH loss when users accidentally send both ETH and ERC20 tokens
+     */
+    function testZapAndDepositETHWithERC20Token() public {
         uint256 usdcAmount = 1000 * 10 ** 6;
-        vm.startPrank(vaultCurator);
-        zapper.approveRedeem(redeemId, usdcAmount);
+        uint256 ethAmount = 1 ether;
+        bytes32 depositId = keccak256(abi.encodePacked("test-deposit"));
+
+        // Mint USDC to user and give ETH
+        usdc.mint(user1, usdcAmount);
+        vm.deal(user1, ethAmount);
+
+        vm.startPrank(user1);
+        usdc.approve(address(zapper), usdcAmount);
+
+        // Try to send both ETH and USDC - should revert
+        vm.expectRevert("Cannot send ETH with ERC20 token");
+        zapper.zapAndDeposit{value: ethAmount}(IERC20(address(usdc)), usdcAmount, depositId, 100);
         vm.stopPrank();
-
-        // Get updated redeem information
-        redeemInfo = zapper.getRedeem(redeemId);
-
-        // Verify the updated information
-        assertEq(redeemInfo.user, user1, "User should still match");
-        assertEq(redeemInfo.shares, shares, "Shares should still match");
-        assertEq(redeemInfo.usdcAmount, usdcAmount, "USDC amount should be updated");
-        assertTrue(redeemInfo.approved, "Should be approved now");
-        assertFalse(redeemInfo.claimed, "Should still not be claimed");
     }
 
-    function testGetRedeemNonExistent() public {
-        // Test getting a non-existent redeem request
-        bytes32 nonExistentRedeemId = keccak256("non-existent");
+    /**
+     * @notice Test that sending ETH with ERC20 token in zapAndDepositWithPermit reverts
+     * @dev This prevents ETH loss when users accidentally send both ETH and ERC20 tokens
+     */
+    function testZapAndDepositWithPermitETHWithERC20Token() public {
+        uint256 usdcAmount = 1000 * 10 ** 6;
+        uint256 ethAmount = 1 ether;
+        bytes32 depositId = keccak256(abi.encodePacked("test-deposit"));
 
-        RedeemLib.RedeemRequest memory redeemInfo = zapper.getRedeem(nonExistentRedeemId);
+        // Mint USDC to user and give ETH
+        usdc.mint(user1, usdcAmount);
+        vm.deal(user1, ethAmount);
 
-        // Verify that all fields are empty/default for non-existent request
-        assertEq(redeemInfo.user, address(0), "User should be address(0)");
-        assertEq(redeemInfo.shares, 0, "Shares should be 0");
-        assertEq(redeemInfo.usdcAmount, 0, "USDC amount should be 0");
-        assertFalse(redeemInfo.approved, "Should not be approved");
-        assertFalse(redeemInfo.claimed, "Should not be claimed");
-    }
-
-    function testApproveRedeemWithAlreadyClaimed() public {
-        // This test covers the req.claimed branch in RedeemLib.approveRedeem
-        // We need to test the case where a redeem request is already claimed
-        uint256 shares = 1000 * 10 ** 6;
-
-        // Set up user with shares
-        cupToken.mint(user1, shares);
         vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
+        usdc.approve(address(zapper), usdcAmount);
 
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
+        // Create permit params (won't be used but needed for function signature)
+        PermitLib.PermitParams memory permitParams = PermitLib.PermitParams({
+            value: usdcAmount,
+            deadline: block.timestamp + 1 hours,
+            v: 0,
+            r: bytes32(0),
+            s: bytes32(0)
+        });
 
-        // Approve redeem
-        vm.prank(vaultCurator);
-        zapper.approveRedeem(redeemId, 1000 * 10 ** 6);
-
-        // Ensure silo has enough USDC for the claim
-        uint256 expectedUsdc = 1000 * 10 ** 6;
-        if (usdc.balanceOf(zapper.silo()) < expectedUsdc) {
-            usdc.mint(zapper.silo(), expectedUsdc);
-        }
-
-        // Give allowance for xCUP tokens to Zapper
-        vm.startPrank(user1);
-        xcup.approve(address(zapper), shares);
-        vm.stopPrank();
-
-        // Claim redeem
-        vm.startPrank(user1);
-        zapper.claimRedeem(redeemId);
-        vm.stopPrank();
-
-        // Try to approve again (should revert due to already approved)
-        vm.expectRevert(RedeemLib.AlreadyApproved.selector);
-        vm.prank(vaultCurator);
-        zapper.approveRedeem(redeemId, 1000 * 10 ** 6);
-    }
-
-    function testClaimRedeemWithZeroUser() public {
-        // This test covers the req.user == address(0) branch in RedeemLib.claimRedeem
-        bytes32 nonExistentRedeemId = keccak256("non-existent");
-
-        vm.expectRevert(); // Should revert due to invalid redeem request
-        zapper.claimRedeem(nonExistentRedeemId);
-    }
-
-    function testClaimRedeemWithInsufficientOwnedShares() public {
-        // This test covers the ownedShares < sharesToRedeem branch in RedeemLib.claimRedeem
-        uint256 shares = 1000 * 10 ** 6;
-
-        // Set up user with shares
-        cupToken.mint(user1, shares);
-        vm.startPrank(user1);
-        cupToken.approve(address(xcup), shares);
-        xcup.deposit(shares, user1);
-        vm.stopPrank();
-
-        // Request redeem
-        vm.startPrank(user1);
-        bytes32 redeemId = zapper.requestRedeem(shares);
-        vm.stopPrank();
-
-        // Approve redeem
-        vm.prank(vaultCurator);
-        zapper.approveRedeem(redeemId, 1000 * 10 ** 6);
-
-        // Transfer shares away from user
-        vm.startPrank(user1);
-        xcup.transfer(user2, shares);
-        vm.stopPrank();
-
-        // Try to claim redeem (should revert due to insufficient shares)
-        vm.expectRevert(); // Should revert due to insufficient shares
-        vm.startPrank(user1);
-        zapper.claimRedeem(redeemId);
+        // Try to send both ETH and USDC - should revert
+        vm.expectRevert("Cannot send ETH with ERC20 token");
+        zapper.zapAndDepositWithPermit{value: ethAmount}(
+            IERC20(address(usdc)),
+            usdcAmount,
+            permitParams,
+            depositId,
+            100
+        );
         vm.stopPrank();
     }
+
+    /**
+     * @notice Test that zapAndDeposit works correctly with ETH only (no ERC20)
+     */
+    function testZapAndDepositETHOnly() public {
+        uint256 ethAmount = 1 ether;
+        bytes32 depositId = keccak256(abi.encodePacked("test-deposit-eth"));
+
+        vm.deal(user1, ethAmount);
+        vm.startPrank(user1);
+
+        // Should work with ETH only
+        zapper.zapAndDeposit{value: ethAmount}(IERC20(address(0)), ethAmount, depositId, 100);
+        vm.stopPrank();
+
+        // Verify deposit was created
+        DepositLib.Deposit memory deposit = zapper.getDeposit(depositId);
+        assertEq(deposit.user, user1);
+        assertTrue(deposit.amount > 0);
+    }
+
+    /**
+     * @notice Test that zapAndDeposit works correctly with ERC20 only (no ETH)
+     */
+    function testZapAndDepositERC20Only() public {
+        uint256 usdcAmount = 1000 * 10 ** 6;
+        bytes32 depositId = keccak256(abi.encodePacked("test-deposit-usdc"));
+
+        usdc.mint(user1, usdcAmount);
+        vm.startPrank(user1);
+        usdc.approve(address(zapper), usdcAmount);
+
+        // Should work with ERC20 only (no ETH sent)
+        zapper.zapAndDeposit(IERC20(address(usdc)), usdcAmount, depositId, 100);
+        vm.stopPrank();
+
+        // Verify deposit was created
+        DepositLib.Deposit memory deposit = zapper.getDeposit(depositId);
+        assertEq(deposit.user, user1);
+        assertEq(deposit.amount, usdcAmount);
+    }
+
+    // ───────────────────────────── REDEEM TESTS MOVED TO RedeemEngine.t.sol ─────────────────────────────
 }
