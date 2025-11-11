@@ -127,8 +127,8 @@ contract TestRedeemContract {
     bytes32[] public pendingRedeemIds;
     mapping(address => bytes32[]) public userRedeems;
 
-    function requestRedeem(address user, uint256 shares) external returns (bytes32) {
-        return RedeemLib.requestRedeem(redeems, pendingRedeemIds, userRedeems, user, shares);
+    function requestRedeem(bytes32 redeemId, address user, uint256 shares) external {
+        RedeemLib.requestRedeem(redeems, pendingRedeemIds, userRedeems, redeemId, user, shares);
     }
 
     function approveRedeem(bytes32 redeemId, uint256 usdcAmount) external {
@@ -139,12 +139,13 @@ contract TestRedeemContract {
         bytes32 redeemId,
         address user,
         IERC4626 vault,
-        IERC20 cup,
         IERC20 usdc,
         address silo,
+        address zapper,
         address copperPriceConsumer
     ) external returns (uint256) {
-        return RedeemLib.claimRedeem(redeems, redeemId, user, vault, cup, usdc, silo, copperPriceConsumer);
+        return
+            RedeemLib.claimRedeem(redeems, redeemId, user, vault, usdc, silo, zapper, copperPriceConsumer, userRedeems);
     }
 
     function getRedeem(bytes32 redeemId) external view returns (RedeemLib.RedeemRequest memory) {
@@ -159,6 +160,7 @@ contract RedeemLibTest is Test {
     MockVault public vault;
     MockPriceConsumer public priceConsumer;
     MockSilo public silo;
+    address public zapper; // Mock Zapper address (where CUP tokens are sent)
     address public user1;
     address public user2;
 
@@ -169,6 +171,7 @@ contract RedeemLibTest is Test {
         vault = new MockVault(cupToken);
         priceConsumer = new MockPriceConsumer(450000000); // $4.50 with 8 decimals
         silo = new MockSilo(usdcToken);
+        zapper = makeAddr("zapper"); // Mock Zapper address
 
         user1 = makeAddr("user1");
         user2 = makeAddr("user2");
@@ -195,7 +198,8 @@ contract RedeemLibTest is Test {
 
     function testRequestRedeem() public {
         uint256 shares = 1000 * 10 ** 6;
-        bytes32 redeemId = testContract.requestRedeem(user1, shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        testContract.requestRedeem(redeemId, user1, shares);
 
         RedeemLib.RedeemRequest memory req = testContract.getRedeem(redeemId);
         assertEq(req.user, user1);
@@ -206,30 +210,36 @@ contract RedeemLibTest is Test {
     }
 
     function testRequestRedeemInvalidUser() public {
+        uint256 shares = 1000 * 10 ** 6;
+        bytes32 redeemId = keccak256(abi.encodePacked(address(0), block.timestamp, shares));
         vm.expectRevert(RedeemLib.InvalidRedeemRequest.selector);
-        testContract.requestRedeem(address(0), 1000 * 10 ** 6);
+        testContract.requestRedeem(redeemId, address(0), shares);
     }
 
     function testRequestRedeemInvalidAmount() public {
+        uint256 zeroShares = 0;
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, zeroShares));
         vm.expectRevert(RedeemLib.InvalidAmount.selector);
-        testContract.requestRedeem(user1, 0);
+        testContract.requestRedeem(redeemId, user1, 0);
     }
 
     function testRequestRedeemCollision() public {
-        // Create two requests with same parameters in same block (should fail on second)
+        // Create two requests with same redeemId (should fail on second)
         uint256 shares = 1000 * 10 ** 6;
-        bytes32 redeemId1 = testContract.requestRedeem(user1, shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        testContract.requestRedeem(redeemId, user1, shares);
 
-        // Second request with same params in same block should fail due to collision
-        vm.expectRevert(RedeemLib.InvalidRedeemRequest.selector);
-        testContract.requestRedeem(user1, shares);
+        // Second request with same redeemId should fail due to collision
+        vm.expectRevert(RedeemLib.RedeemIdAlreadyExists.selector);
+        testContract.requestRedeem(redeemId, user1, shares);
     }
 
     // ───────────────────────────── APPROVE REDEEM TESTS ─────────────────────────────
 
     function testApproveRedeem() public {
         uint256 shares = 1000 * 10 ** 6;
-        bytes32 redeemId = testContract.requestRedeem(user1, shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        testContract.requestRedeem(redeemId, user1, shares);
         uint256 usdcAmount = 4500 * 10 ** 6;
 
         testContract.approveRedeem(redeemId, usdcAmount);
@@ -247,7 +257,8 @@ contract RedeemLibTest is Test {
 
     function testApproveRedeemAlreadyApproved() public {
         uint256 shares = 1000 * 10 ** 6;
-        bytes32 redeemId = testContract.requestRedeem(user1, shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        testContract.requestRedeem(redeemId, user1, shares);
         uint256 usdcAmount = 4500 * 10 ** 6;
 
         testContract.approveRedeem(redeemId, usdcAmount);
@@ -257,15 +268,17 @@ contract RedeemLibTest is Test {
 
     function testApproveRedeemAlreadyClaimed() public {
         uint256 shares = 1000 * 10 ** 6;
-        bytes32 redeemId = testContract.requestRedeem(user1, shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        testContract.requestRedeem(redeemId, user1, shares);
         uint256 usdcAmount = 4500 * 10 ** 6;
 
         testContract.approveRedeem(redeemId, usdcAmount);
 
-        // Claim the redeem
+        // Transfer xCUP shares to testContract (simulating requestRedeem behavior)
         vm.startPrank(user1);
         vault.approve(address(testContract), shares);
-        testContract.claimRedeem(redeemId, user1, vault, cupToken, usdcToken, address(silo), address(priceConsumer));
+        vault.transfer(address(testContract), shares);
+        testContract.claimRedeem(redeemId, user1, vault, usdcToken, address(silo), zapper, address(priceConsumer));
         vm.stopPrank();
 
         // After claiming, trying to approve again should fail with AlreadyApproved
@@ -278,23 +291,25 @@ contract RedeemLibTest is Test {
 
     function testClaimRedeem() public {
         uint256 shares = 1000 * 10 ** 6;
-        bytes32 redeemId = testContract.requestRedeem(user1, shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        testContract.requestRedeem(redeemId, user1, shares);
         uint256 usdcAmount = 4500 * 10 ** 6;
 
         testContract.approveRedeem(redeemId, usdcAmount);
 
-        // User approves testContract to spend vault shares
+        // Transfer xCUP shares to testContract (simulating requestRedeem behavior)
         vm.startPrank(user1);
         vault.approve(address(testContract), shares);
+        vault.transfer(address(testContract), shares);
 
         uint256 usdcBefore = usdcToken.balanceOf(user1);
         uint256 usdcReceived = testContract.claimRedeem(
             redeemId,
             user1,
             vault,
-            cupToken,
             usdcToken,
             address(silo),
+            zapper,
             address(priceConsumer)
         );
         uint256 usdcAfter = usdcToken.balanceOf(user1);
@@ -310,68 +325,84 @@ contract RedeemLibTest is Test {
     function testClaimRedeemInvalidRequest() public {
         bytes32 fakeId = keccak256("fake");
         vm.expectRevert(RedeemLib.InvalidRedeemRequest.selector);
-        testContract.claimRedeem(fakeId, user1, vault, cupToken, usdcToken, address(silo), address(priceConsumer));
+        testContract.claimRedeem(fakeId, user1, vault, usdcToken, address(silo), zapper, address(priceConsumer));
     }
 
     function testClaimRedeemNotApproved() public {
         uint256 shares = 1000 * 10 ** 6;
-        bytes32 redeemId = testContract.requestRedeem(user1, shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        testContract.requestRedeem(redeemId, user1, shares);
 
+        // Transfer xCUP shares to testContract (simulating requestRedeem behavior)
         vm.startPrank(user1);
         vault.approve(address(testContract), shares);
+        vault.transfer(address(testContract), shares);
         vm.expectRevert(RedeemLib.NotApproved.selector);
-        testContract.claimRedeem(redeemId, user1, vault, cupToken, usdcToken, address(silo), address(priceConsumer));
+        testContract.claimRedeem(redeemId, user1, vault, usdcToken, address(silo), zapper, address(priceConsumer));
         vm.stopPrank();
     }
 
     function testClaimRedeemNotUser() public {
         uint256 shares = 1000 * 10 ** 6;
-        bytes32 redeemId = testContract.requestRedeem(user1, shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        testContract.requestRedeem(redeemId, user1, shares);
         uint256 usdcAmount = 4500 * 10 ** 6;
 
         testContract.approveRedeem(redeemId, usdcAmount);
 
-        vm.startPrank(user2);
+        // Transfer xCUP shares to testContract (simulating requestRedeem behavior)
+        vm.startPrank(user1);
         vault.approve(address(testContract), shares);
+        vault.transfer(address(testContract), shares);
+        vm.stopPrank();
+
+        vm.startPrank(user2);
         vm.expectRevert(RedeemLib.NotUser.selector);
-        testContract.claimRedeem(redeemId, user2, vault, cupToken, usdcToken, address(silo), address(priceConsumer));
+        testContract.claimRedeem(redeemId, user2, vault, usdcToken, address(silo), zapper, address(priceConsumer));
         vm.stopPrank();
     }
 
     function testClaimRedeemAlreadyClaimed() public {
         uint256 shares = 1000 * 10 ** 6;
-        bytes32 redeemId = testContract.requestRedeem(user1, shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        testContract.requestRedeem(redeemId, user1, shares);
         uint256 usdcAmount = 4500 * 10 ** 6;
 
         testContract.approveRedeem(redeemId, usdcAmount);
 
+        // Transfer xCUP shares to testContract (simulating requestRedeem behavior)
         vm.startPrank(user1);
         vault.approve(address(testContract), shares);
-        testContract.claimRedeem(redeemId, user1, vault, cupToken, usdcToken, address(silo), address(priceConsumer));
+        vault.transfer(address(testContract), shares);
+        testContract.claimRedeem(redeemId, user1, vault, usdcToken, address(silo), zapper, address(priceConsumer));
 
         vm.expectRevert(RedeemLib.AlreadyClaimed.selector);
-        testContract.claimRedeem(redeemId, user1, vault, cupToken, usdcToken, address(silo), address(priceConsumer));
+        testContract.claimRedeem(redeemId, user1, vault, usdcToken, address(silo), zapper, address(priceConsumer));
         vm.stopPrank();
     }
 
     function testClaimRedeemInsufficientBalance() public {
         uint256 shares = 20000 * 10 ** 6; // More than user has (user has 10000)
-        bytes32 redeemId = testContract.requestRedeem(user1, shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        testContract.requestRedeem(redeemId, user1, shares);
         uint256 usdcAmount = 90000 * 10 ** 6;
 
         testContract.approveRedeem(redeemId, usdcAmount);
 
+        // Transfer only part of shares (less than requested) to testContract
         vm.startPrank(user1);
-        vault.approve(address(testContract), shares);
-        // Should revert with InsufficientBalance because user doesn't have enough shares
+        vault.approve(address(testContract), 10000 * 10 ** 6);
+        vault.transfer(address(testContract), 10000 * 10 ** 6);
+        // Should revert with InsufficientBalance because contract doesn't have enough shares
         vm.expectRevert(RedeemLib.InsufficientBalance.selector);
-        testContract.claimRedeem(redeemId, user1, vault, cupToken, usdcToken, address(silo), address(priceConsumer));
+        testContract.claimRedeem(redeemId, user1, vault, usdcToken, address(silo), zapper, address(priceConsumer));
         vm.stopPrank();
     }
 
     function testClaimRedeemInvalidPrice() public {
         uint256 shares = 1000 * 10 ** 6;
-        bytes32 redeemId = testContract.requestRedeem(user1, shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        testContract.requestRedeem(redeemId, user1, shares);
         uint256 usdcAmount = 4500 * 10 ** 6;
 
         testContract.approveRedeem(redeemId, usdcAmount);
@@ -379,24 +410,19 @@ contract RedeemLibTest is Test {
         // Create price consumer with zero price
         MockPriceConsumer zeroPriceConsumer = new MockPriceConsumer(0);
 
+        // Transfer xCUP shares to testContract (simulating requestRedeem behavior)
         vm.startPrank(user1);
         vault.approve(address(testContract), shares);
+        vault.transfer(address(testContract), shares);
         vm.expectRevert(RedeemLib.InvalidPrice.selector);
-        testContract.claimRedeem(
-            redeemId,
-            user1,
-            vault,
-            cupToken,
-            usdcToken,
-            address(silo),
-            address(zeroPriceConsumer)
-        );
+        testContract.claimRedeem(redeemId, user1, vault, usdcToken, address(silo), zapper, address(zeroPriceConsumer));
         vm.stopPrank();
     }
 
     function testClaimRedeemPriceOracleCallFailed() public {
         uint256 shares = 1000 * 10 ** 6;
-        bytes32 redeemId = testContract.requestRedeem(user1, shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        testContract.requestRedeem(redeemId, user1, shares);
         uint256 usdcAmount = 4500 * 10 ** 6;
 
         testContract.approveRedeem(redeemId, usdcAmount);
@@ -404,16 +430,18 @@ contract RedeemLibTest is Test {
         // Use contract without price() function that returns invalid data
         MockInvalidPriceConsumer invalidPriceConsumer = new MockInvalidPriceConsumer();
 
+        // Transfer xCUP shares to testContract (simulating requestRedeem behavior)
         vm.startPrank(user1);
         vault.approve(address(testContract), shares);
+        vault.transfer(address(testContract), shares);
         vm.expectRevert("Price oracle call failed");
         testContract.claimRedeem(
             redeemId,
             user1,
             vault,
-            cupToken,
             usdcToken,
             address(silo),
+            zapper,
             address(invalidPriceConsumer)
         );
         vm.stopPrank();
@@ -423,7 +451,8 @@ contract RedeemLibTest is Test {
 
     function testGetRedeem() public {
         uint256 shares = 1000 * 10 ** 6;
-        bytes32 redeemId = testContract.requestRedeem(user1, shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        testContract.requestRedeem(redeemId, user1, shares);
 
         RedeemLib.RedeemRequest memory req = testContract.getRedeem(redeemId);
         assertEq(req.user, user1);

@@ -126,6 +126,8 @@ contract RedeemEngineTest is Test {
         xcup = xCUP(address(xcupProxy));
 
         // Deploy RedeemEngine
+        // Use a mock Zapper address (CUP tokens will be sent here after redeem)
+        address mockZapper = makeAddr("mockZapper");
         RedeemEngine redeemEngineImpl = new RedeemEngine();
         bytes memory redeemEngineInitData = abi.encodeWithSelector(
             RedeemEngine.initialize.selector,
@@ -133,6 +135,7 @@ contract RedeemEngineTest is Test {
             address(usdc),
             address(xcup),
             address(copperPriceConsumer),
+            mockZapper,
             0 // 0% commission initially
         );
         ERC1967Proxy redeemEngineProxy = new ERC1967Proxy(address(redeemEngineImpl), redeemEngineInitData);
@@ -169,6 +172,7 @@ contract RedeemEngineTest is Test {
     }
 
     function testInitializeInvalidAddress() public {
+        address mockZapper = makeAddr("mockZapper");
         RedeemEngine newImpl = new RedeemEngine();
         bytes memory initData = abi.encodeWithSelector(
             RedeemEngine.initialize.selector,
@@ -176,6 +180,7 @@ contract RedeemEngineTest is Test {
             address(usdc),
             address(xcup),
             address(copperPriceConsumer),
+            mockZapper,
             0
         );
         vm.expectRevert();
@@ -183,6 +188,7 @@ contract RedeemEngineTest is Test {
     }
 
     function testInitializeInvalidCommission() public {
+        address mockZapper = makeAddr("mockZapper");
         RedeemEngine newImpl = new RedeemEngine();
         bytes memory initData = abi.encodeWithSelector(
             RedeemEngine.initialize.selector,
@@ -190,6 +196,7 @@ contract RedeemEngineTest is Test {
             address(usdc),
             address(xcup),
             address(copperPriceConsumer),
+            mockZapper,
             10001 // 100.01% - invalid
         );
         vm.expectRevert("Commission cannot exceed 100%");
@@ -217,8 +224,11 @@ contract RedeemEngineTest is Test {
         uint256 initialContractShares = xcup.balanceOf(address(redeemEngine));
         uint256 initialUserShares = xcup.balanceOf(user1);
 
+        // Generate unique redeemId
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Check that redeem request was created
@@ -235,19 +245,22 @@ contract RedeemEngineTest is Test {
     }
 
     function testRequestRedeemZeroShares() public {
+        uint256 zeroShares = 0;
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, zeroShares));
         vm.startPrank(user1);
         vm.expectRevert("Shares must be greater than 0");
-        redeemEngine.requestRedeem(0);
+        redeemEngine.requestRedeem(0, redeemId);
         vm.stopPrank();
     }
 
     function testRequestRedeemInsufficientShares() public {
         uint256 shares = 1000 * 10 ** 6;
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
 
         // User has no shares
         vm.startPrank(user1);
         vm.expectRevert("Insufficient shares to redeem");
-        redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
     }
 
@@ -262,9 +275,10 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Try to request redeem without approval
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
         vm.expectRevert(); // ERC20InsufficientAllowance
-        redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
     }
 
@@ -283,9 +297,10 @@ contract RedeemEngineTest is Test {
         redeemEngine.pause();
 
         // Try to request redeem when paused
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
         vm.expectRevert();
-        redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
     }
 
@@ -302,8 +317,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Request redeem (shares are transferred to contract)
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Approve redeem
@@ -330,8 +346,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Request redeem
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Try to approve without role
@@ -364,8 +381,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Request redeem
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Pause the contract
@@ -391,8 +409,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Request redeem (shares are transferred to contract)
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Approve redeem
@@ -407,6 +426,10 @@ contract RedeemEngineTest is Test {
 
         // Claim redeem (shares are already in contract, no need to approve)
         uint256 initialUsdcBalance = usdc.balanceOf(user1);
+        address zapperAddress = redeemEngine.zapper();
+        uint256 initialCupBalanceInZapper = cupToken.balanceOf(zapperAddress);
+        uint256 initialCupBalanceInRedeemEngine = cupToken.balanceOf(address(redeemEngine));
+
         vm.startPrank(user1);
         uint256 claimedAmount = redeemEngine.claimRedeem(redeemId);
         vm.stopPrank();
@@ -416,6 +439,9 @@ contract RedeemEngineTest is Test {
         assertTrue(usdc.balanceOf(user1) > initialUsdcBalance);
         // Check that shares were used from contract
         assertEq(xcup.balanceOf(address(redeemEngine)), 0);
+        // Check that CUP tokens were sent to Zapper (not RedeemEngine)
+        assertGt(cupToken.balanceOf(zapperAddress), initialCupBalanceInZapper);
+        assertEq(cupToken.balanceOf(address(redeemEngine)), initialCupBalanceInRedeemEngine);
     }
 
     function testClaimRedeemNotApproved() public {
@@ -430,8 +456,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Request redeem (shares are transferred to contract)
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Try to claim without approval
@@ -454,8 +481,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Request redeem (shares are transferred to contract)
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Approve redeem
@@ -497,8 +525,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Request redeem (shares are transferred to contract)
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Approve redeem
@@ -534,8 +563,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Request redeem (shares are transferred to contract)
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Approve redeem
@@ -556,7 +586,7 @@ contract RedeemEngineTest is Test {
 
         // Try to claim without sufficient shares in contract
         vm.startPrank(user1);
-        vm.expectRevert("Insufficient shares in contract");
+        vm.expectRevert(RedeemLib.InsufficientBalance.selector);
         redeemEngine.claimRedeem(redeemId);
         vm.stopPrank();
     }
@@ -574,8 +604,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Request redeem (shares are transferred to contract)
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Approve redeem
@@ -593,7 +624,7 @@ contract RedeemEngineTest is Test {
 
         // Try to claim with zero copper price
         vm.startPrank(user1);
-        vm.expectRevert("Copper price is 0");
+        vm.expectRevert(RedeemLib.InvalidPrice.selector);
         redeemEngine.claimRedeem(redeemId);
         vm.stopPrank();
     }
@@ -611,8 +642,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Request redeem (shares are transferred to contract)
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Approve redeem
@@ -628,7 +660,7 @@ contract RedeemEngineTest is Test {
 
         // Try to claim with insufficient USDC in redeem silo
         vm.startPrank(user1);
-        vm.expectRevert("Insufficient USDC in redeem silo");
+        vm.expectRevert(RedeemLib.InsufficientBalance.selector);
         redeemEngine.claimRedeem(redeemId);
         vm.stopPrank();
     }
@@ -651,8 +683,9 @@ contract RedeemEngineTest is Test {
 
         // Step 3: Request redeem (shares are transferred to contract)
         uint256 initialContractShares = xcup.balanceOf(address(redeemEngine));
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, depositedShares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(depositedShares);
+        redeemEngine.requestRedeem(depositedShares, redeemId);
         vm.stopPrank();
 
         // Verify shares were transferred
@@ -672,6 +705,9 @@ contract RedeemEngineTest is Test {
         // Step 6: Claim redeem
         uint256 initialUsdcBalance = usdc.balanceOf(user1);
         uint256 initialCupBalance = cupToken.balanceOf(user1);
+        address zapperAddress = redeemEngine.zapper();
+        uint256 initialCupBalanceInZapper = cupToken.balanceOf(zapperAddress);
+        uint256 initialCupBalanceInRedeemEngine = cupToken.balanceOf(address(redeemEngine));
 
         vm.startPrank(user1);
         uint256 claimedAmount = redeemEngine.claimRedeem(redeemId);
@@ -683,6 +719,9 @@ contract RedeemEngineTest is Test {
         assertEq(cupToken.balanceOf(user1), initialCupBalance); // CUP should be converted to USDC
         assertEq(xcup.balanceOf(user1), 0); // All xCUP shares should be redeemed
         assertEq(xcup.balanceOf(address(redeemEngine)), 0); // Shares should be used from contract
+        // Check that CUP tokens were sent to Zapper (not RedeemEngine)
+        assertGt(cupToken.balanceOf(zapperAddress), initialCupBalanceInZapper);
+        assertEq(cupToken.balanceOf(address(redeemEngine)), initialCupBalanceInRedeemEngine);
     }
 
     function testMultipleRedeemRequests() public {
@@ -698,9 +737,11 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Create two redeem requests (shares are transferred to contract)
+        bytes32 redeemId1 = keccak256(abi.encodePacked(user1, block.timestamp, shares1));
+        bytes32 redeemId2 = keccak256(abi.encodePacked(user1, block.timestamp + 1, shares2));
         vm.startPrank(user1);
-        bytes32 redeemId1 = redeemEngine.requestRedeem(shares1);
-        bytes32 redeemId2 = redeemEngine.requestRedeem(shares2);
+        redeemEngine.requestRedeem(shares1, redeemId1);
+        redeemEngine.requestRedeem(shares2, redeemId2);
         vm.stopPrank();
 
         // Verify different redeem IDs
@@ -726,8 +767,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Request redeem (shares are transferred to contract)
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Approve redeem first time
@@ -755,8 +797,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Request redeem (shares are transferred to contract)
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Approve redeem
@@ -793,8 +836,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Request redeem (shares are transferred to contract)
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Get redeem information
@@ -861,6 +905,9 @@ contract RedeemEngineTest is Test {
 
         // Record initial balances
         uint256 initialUserUsdcBalance = usdc.balanceOf(user1);
+        address zapperAddress = redeemEngine.zapper();
+        uint256 initialCupBalanceInZapper = cupToken.balanceOf(zapperAddress);
+        uint256 initialCupBalanceInRedeemEngine = cupToken.balanceOf(address(redeemEngine));
 
         // Perform redeem (this should apply commission)
         vm.startPrank(user1);
@@ -873,6 +920,10 @@ contract RedeemEngineTest is Test {
 
         // Since commission is 0 by default, user should receive full amount
         assertEq(receivedUsdc, expectedUsdcAmount);
+
+        // Check that CUP tokens were sent to Zapper (not RedeemEngine)
+        assertGt(cupToken.balanceOf(zapperAddress), initialCupBalanceInZapper);
+        assertEq(cupToken.balanceOf(address(redeemEngine)), initialCupBalanceInRedeemEngine);
     }
 
     function testRedeemInsufficientShares() public {
@@ -1341,14 +1392,15 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // First request (shares are transferred to contract)
+        bytes32 redeemId1 = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId1 = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId1);
         vm.stopPrank();
 
-        // Second request with same parameters in same block (should revert due to duplicate ID)
+        // Second request with same redeemId (should revert due to duplicate ID)
         vm.startPrank(user1);
-        vm.expectRevert(RedeemLib.InvalidRedeemRequest.selector);
-        redeemEngine.requestRedeem(shares);
+        vm.expectRevert(RedeemLib.RedeemIdAlreadyExists.selector);
+        redeemEngine.requestRedeem(shares, redeemId1);
         vm.stopPrank();
     }
 
@@ -1374,8 +1426,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Request redeem (shares are transferred to contract)
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Approve redeem
@@ -1420,8 +1473,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Request redeem (shares are transferred to contract)
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Approve redeem
@@ -1439,7 +1493,7 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Try to claim redeem (should revert due to insufficient shares in contract)
-        vm.expectRevert("Insufficient shares in contract");
+        vm.expectRevert(RedeemLib.InsufficientBalance.selector);
         vm.startPrank(user1);
         redeemEngine.claimRedeem(redeemId);
         vm.stopPrank();
@@ -1459,9 +1513,11 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Create multiple redeem requests
+        bytes32 redeemId1 = keccak256(abi.encodePacked(user1, block.timestamp, shares1));
+        bytes32 redeemId2 = keccak256(abi.encodePacked(user1, block.timestamp + 1, shares2));
         vm.startPrank(user1);
-        bytes32 redeemId1 = redeemEngine.requestRedeem(shares1);
-        bytes32 redeemId2 = redeemEngine.requestRedeem(shares2);
+        redeemEngine.requestRedeem(shares1, redeemId1);
+        redeemEngine.requestRedeem(shares2, redeemId2);
         vm.stopPrank();
 
         // Approve both redeems
@@ -1517,10 +1573,13 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Create multiple redeem requests
+        bytes32 redeemId1 = keccak256(abi.encodePacked(user1, block.timestamp, shares1));
+        bytes32 redeemId2 = keccak256(abi.encodePacked(user1, block.timestamp + 1, shares2));
+        bytes32 redeemId3 = keccak256(abi.encodePacked(user1, block.timestamp + 2, shares3));
         vm.startPrank(user1);
-        bytes32 redeemId1 = redeemEngine.requestRedeem(shares1);
-        bytes32 redeemId2 = redeemEngine.requestRedeem(shares2);
-        bytes32 redeemId3 = redeemEngine.requestRedeem(shares3);
+        redeemEngine.requestRedeem(shares1, redeemId1);
+        redeemEngine.requestRedeem(shares2, redeemId2);
+        redeemEngine.requestRedeem(shares3, redeemId3);
         vm.stopPrank();
 
         // Approve only first two redeems (third remains pending)
@@ -1572,7 +1631,9 @@ contract RedeemEngineTest is Test {
         cupToken.approve(address(xcup), shares);
         xcup.deposit(shares, user1);
         xcup.approve(address(redeemEngine), shares);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        vm.startPrank(user1);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Don't approve the redeem
@@ -1622,11 +1683,13 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Create redeem requests
+        bytes32 redeemId1 = keccak256(abi.encodePacked(user1, block.timestamp, shares1));
         vm.startPrank(user1);
-        bytes32 redeemId1 = redeemEngine.requestRedeem(shares1);
+        redeemEngine.requestRedeem(shares1, redeemId1);
         vm.stopPrank();
+        bytes32 redeemId2 = keccak256(abi.encodePacked(user2, block.timestamp, shares2));
         vm.startPrank(user2);
-        bytes32 redeemId2 = redeemEngine.requestRedeem(shares2);
+        redeemEngine.requestRedeem(shares2, redeemId2);
         vm.stopPrank();
 
         // Get pending redeem IDs
@@ -1664,11 +1727,13 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Create redeem requests
+        bytes32 redeemId1 = keccak256(abi.encodePacked(user1, block.timestamp, shares1));
         vm.startPrank(user1);
-        bytes32 redeemId1 = redeemEngine.requestRedeem(shares1);
+        redeemEngine.requestRedeem(shares1, redeemId1);
         vm.stopPrank();
+        bytes32 redeemId2 = keccak256(abi.encodePacked(user2, block.timestamp, shares2));
         vm.startPrank(user2);
-        bytes32 redeemId2 = redeemEngine.requestRedeem(shares2);
+        redeemEngine.requestRedeem(shares2, redeemId2);
         vm.stopPrank();
 
         // Get pending redeems
@@ -1691,9 +1756,11 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Create multiple redeem requests from same user
+        bytes32 redeemId1 = keccak256(abi.encodePacked(user1, block.timestamp, shares1));
+        bytes32 redeemId2 = keccak256(abi.encodePacked(user1, block.timestamp + 1, shares2));
         vm.startPrank(user1);
-        bytes32 redeemId1 = redeemEngine.requestRedeem(shares1);
-        bytes32 redeemId2 = redeemEngine.requestRedeem(shares2);
+        redeemEngine.requestRedeem(shares1, redeemId1);
+        redeemEngine.requestRedeem(shares2, redeemId2);
         vm.stopPrank();
 
         // Get user's redeem IDs
@@ -1716,9 +1783,11 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Create multiple redeem requests from same user
+        bytes32 redeemId1 = keccak256(abi.encodePacked(user1, block.timestamp, shares1));
+        bytes32 redeemId2 = keccak256(abi.encodePacked(user1, block.timestamp + 1, shares2));
         vm.startPrank(user1);
-        bytes32 redeemId1 = redeemEngine.requestRedeem(shares1);
-        bytes32 redeemId2 = redeemEngine.requestRedeem(shares2);
+        redeemEngine.requestRedeem(shares1, redeemId1);
+        redeemEngine.requestRedeem(shares2, redeemId2);
         vm.stopPrank();
 
         // Get user's redeems
@@ -1747,11 +1816,13 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Create redeem requests
+        bytes32 redeemId1 = keccak256(abi.encodePacked(user1, block.timestamp, shares1));
+        bytes32 redeemId2 = keccak256(abi.encodePacked(user2, block.timestamp, shares2));
         vm.startPrank(user1);
-        redeemEngine.requestRedeem(shares1);
+        redeemEngine.requestRedeem(shares1, redeemId1);
         vm.stopPrank();
         vm.startPrank(user2);
-        redeemEngine.requestRedeem(shares2);
+        redeemEngine.requestRedeem(shares2, redeemId2);
         vm.stopPrank();
 
         // Get total pending shares
@@ -1773,8 +1844,9 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Create redeem request (shares are transferred to contract)
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        redeemEngine.requestRedeem(shares, redeemId);
         uint256 contractSharesBefore = xcup.balanceOf(address(redeemEngine));
         assertEq(contractSharesBefore, shares);
         vm.stopPrank();
@@ -1802,7 +1874,9 @@ contract RedeemEngineTest is Test {
         cupToken.approve(address(xcup), shares);
         xcup.deposit(shares, user1);
         xcup.approve(address(redeemEngine), shares);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        vm.startPrank(user1);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Try to cancel from different user
@@ -1822,7 +1896,9 @@ contract RedeemEngineTest is Test {
         cupToken.approve(address(xcup), shares);
         xcup.deposit(shares, user1);
         xcup.approve(address(redeemEngine), shares);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        vm.startPrank(user1);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Approve redeem
@@ -1849,9 +1925,11 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Create multiple redeem requests
+        bytes32 redeemId1 = keccak256(abi.encodePacked(user1, block.timestamp, shares1));
+        bytes32 redeemId2 = keccak256(abi.encodePacked(user1, block.timestamp + 1, shares2));
         vm.startPrank(user1);
-        bytes32 redeemId1 = redeemEngine.requestRedeem(shares1);
-        bytes32 redeemId2 = redeemEngine.requestRedeem(shares2);
+        redeemEngine.requestRedeem(shares1, redeemId1);
+        redeemEngine.requestRedeem(shares2, redeemId2);
         uint256 contractSharesBefore = xcup.balanceOf(address(redeemEngine));
         assertEq(contractSharesBefore, shares1 + shares2);
         vm.stopPrank();
@@ -1889,7 +1967,9 @@ contract RedeemEngineTest is Test {
         cupToken.approve(address(xcup), shares);
         xcup.deposit(shares, user1);
         xcup.approve(address(redeemEngine), shares);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        vm.startPrank(user1);
+        redeemEngine.requestRedeem(shares, redeemId);
         uint256 contractSharesBefore = xcup.balanceOf(address(redeemEngine));
         assertEq(contractSharesBefore, shares);
         vm.stopPrank();
@@ -1915,7 +1995,9 @@ contract RedeemEngineTest is Test {
         cupToken.approve(address(xcup), shares);
         xcup.deposit(shares, user1);
         xcup.approve(address(redeemEngine), shares);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        vm.startPrank(user1);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Try to decline without role
@@ -1935,7 +2017,9 @@ contract RedeemEngineTest is Test {
         cupToken.approve(address(xcup), shares);
         xcup.deposit(shares, user1);
         xcup.approve(address(redeemEngine), shares);
-        bytes32 redeemId = redeemEngine.requestRedeem(shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        vm.startPrank(user1);
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Approve redeem
@@ -1968,11 +2052,13 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Create redeem requests
+        bytes32 redeemId1 = keccak256(abi.encodePacked(user1, block.timestamp, shares1));
         vm.startPrank(user1);
-        bytes32 redeemId1 = redeemEngine.requestRedeem(shares1);
+        redeemEngine.requestRedeem(shares1, redeemId1);
         vm.stopPrank();
+        bytes32 redeemId2 = keccak256(abi.encodePacked(user2, block.timestamp, shares2));
         vm.startPrank(user2);
-        bytes32 redeemId2 = redeemEngine.requestRedeem(shares2);
+        redeemEngine.requestRedeem(shares2, redeemId2);
         vm.stopPrank();
 
         // Approve proportionally
@@ -2001,7 +2087,8 @@ contract RedeemEngineTest is Test {
         cupToken.approve(address(xcup), shares);
         xcup.deposit(shares, user1);
         xcup.approve(address(redeemEngine), shares);
-        redeemEngine.requestRedeem(shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Try to approve proportionally without role
@@ -2027,7 +2114,8 @@ contract RedeemEngineTest is Test {
         cupToken.approve(address(xcup), shares);
         xcup.deposit(shares, user1);
         xcup.approve(address(redeemEngine), shares);
-        redeemEngine.requestRedeem(shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Try to approve more than total
@@ -2056,11 +2144,13 @@ contract RedeemEngineTest is Test {
         vm.stopPrank();
 
         // Create redeem requests
+        bytes32 redeemId1 = keccak256(abi.encodePacked(user1, block.timestamp, shares1));
         vm.startPrank(user1);
-        bytes32 redeemId1 = redeemEngine.requestRedeem(shares1);
+        redeemEngine.requestRedeem(shares1, redeemId1);
         vm.stopPrank();
+        bytes32 redeemId2 = keccak256(abi.encodePacked(user2, block.timestamp, shares2));
         vm.startPrank(user2);
-        bytes32 redeemId2 = redeemEngine.requestRedeem(shares2);
+        redeemEngine.requestRedeem(shares2, redeemId2);
         vm.stopPrank();
 
         // Approve all redeems
@@ -2092,7 +2182,8 @@ contract RedeemEngineTest is Test {
         cupToken.approve(address(xcup), shares);
         xcup.deposit(shares, user1);
         xcup.approve(address(redeemEngine), shares);
-        redeemEngine.requestRedeem(shares);
+        bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
+        redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
         // Try to approve all without role

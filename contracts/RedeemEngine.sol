@@ -50,6 +50,9 @@ contract RedeemEngine is
     /// @notice Dedicated Silo contract for redeem operations
     Silo private _redeemSilo;
 
+    /// @notice Zapper contract address (where CUP tokens are sent after redeem)
+    address private _zapper;
+
     /// @notice Mapping of redeem IDs to redeem requests
     mapping(bytes32 => RedeemLib.RedeemRequest) private _redeems;
 
@@ -116,6 +119,7 @@ contract RedeemEngine is
      * @param usdc_ The address of the USDC token contract
      * @param vault_ The address of the xCUP vault contract (ERC4626)
      * @param copperPriceConsumer_ The address of the copper price oracle consumer
+     * @param zapper_ The address of the Zapper contract (where CUP tokens are sent after redeem)
      * @param redeemCommissionBps_ Initial commission rate in basis points (e.g., 200 = 2%)
      */
     function initialize(
@@ -123,12 +127,14 @@ contract RedeemEngine is
         address usdc_,
         address vault_,
         address copperPriceConsumer_,
+        address zapper_,
         uint256 redeemCommissionBps_
     ) public initializer {
         require(cup_ != address(0), "Invalid CUP address");
         require(usdc_ != address(0), "Invalid USDC address");
         require(vault_ != address(0), "Invalid Vault address");
         require(copperPriceConsumer_ != address(0), "Invalid Copper Price Consumer address");
+        require(zapper_ != address(0), "Invalid Zapper address");
         require(redeemCommissionBps_ <= 10000, "Commission cannot exceed 100%");
 
         __AccessControl_init();
@@ -142,6 +148,7 @@ contract RedeemEngine is
         _usdc = IERC20(usdc_);
         _vault = IERC4626(vault_);
         _copperPriceConsumer = ICopperPriceConsumer(copperPriceConsumer_);
+        _zapper = zapper_;
         _redeemCommissionBps = redeemCommissionBps_;
 
         // Deploy dedicated Silo for redeem operations
@@ -152,11 +159,12 @@ contract RedeemEngine is
 
     /**
      * @notice Creates a new redeem request and transfers xCUP shares to the contract
-     * @dev User must approve this contract to spend their xCUP shares before calling
+     * @dev User must approve this contract to spend their xCUP shares before calling.
+     *      The redeemId must be unique - if it already exists, the transaction will revert.
      * @param shares The number of xCUP vault shares to redeem
-     * @return redeemId The unique identifier for the redeem request
+     * @param redeemId The unique identifier for the redeem request (must be unique)
      */
-    function requestRedeem(uint256 shares) external nonReentrant whenNotPaused returns (bytes32 redeemId) {
+    function requestRedeem(uint256 shares, bytes32 redeemId) external nonReentrant whenNotPaused {
         require(shares > 0, "Shares must be greater than 0");
 
         uint256 ownedShares = _vault.balanceOf(_msgSender());
@@ -166,7 +174,7 @@ contract RedeemEngine is
         IERC20(address(_vault)).safeTransferFrom(_msgSender(), address(this), shares);
 
         // Create redeem request (adds to pending list and user's list)
-        redeemId = RedeemLib.requestRedeem(_redeems, _pendingRedeemIds, _userRedeems, msg.sender, shares);
+        RedeemLib.requestRedeem(_redeems, _pendingRedeemIds, _userRedeems, redeemId, msg.sender, shares);
         emit RedeemRequested(msg.sender, redeemId, shares);
     }
 
@@ -201,47 +209,18 @@ contract RedeemEngine is
      * @return usdcAmount The amount of USDC received
      */
     function _claimRedeem(bytes32 redeemId) internal returns (uint256 usdcAmount) {
-        RedeemLib.RedeemRequest storage req = _redeems[redeemId];
-        if (req.user == address(0)) revert RedeemLib.InvalidRedeemRequest();
-        if (req.claimed) revert RedeemLib.AlreadyClaimed();
-        if (!req.approved) revert RedeemLib.NotApproved();
-        if (req.user != msg.sender) revert RedeemLib.NotUser();
-
-        uint256 sharesToRedeem = req.shares;
-        if (sharesToRedeem == 0) revert RedeemLib.InvalidAmount();
-
-        // Check that contract has the shares (they were transferred during requestRedeem)
-        uint256 contractShares = _vault.balanceOf(address(this));
-        require(contractShares >= sharesToRedeem, "Insufficient shares in contract");
-
-        req.claimed = true;
-
-        // Redeem xCUP → CUP (shares are already in this contract)
-        _vault.approve(address(_vault), sharesToRedeem);
-        uint256 withdrawnCup = _vault.redeem(sharesToRedeem, address(this), address(this));
-
-        // Get current copper price
-        uint256 copperPrice = getCopperPrice();
-        require(copperPrice > 0, "Copper price is 0");
-
-        // Convert CUP → USDC (no commission for request-based redeem)
-        uint256 totalUsdcAmount = (withdrawnCup * copperPrice) / (10 ** 8);
-
-        // Pull USDC from redeem silo (redeem silo must be pre-funded)
-        require(_usdc.balanceOf(address(_redeemSilo)) >= totalUsdcAmount, "Insufficient USDC in redeem silo");
-        _usdc.safeTransferFrom(address(_redeemSilo), address(this), totalUsdcAmount);
-
-        require(_usdc.balanceOf(address(this)) >= totalUsdcAmount, "Insufficient USDC balance");
-
-        // Send USDC to user (no commission)
-        _usdc.safeTransfer(msg.sender, totalUsdcAmount);
-
-        // Remove from user's list when claimed
-        RedeemLib.removeUserRedeem(_userRedeems, msg.sender, redeemId);
-
-        emit RedeemClaimed(msg.sender, redeemId, totalUsdcAmount);
-
-        return totalUsdcAmount;
+        return
+            RedeemLib.claimRedeem(
+                _redeems,
+                redeemId,
+                msg.sender,
+                _vault,
+                _usdc,
+                address(_redeemSilo),
+                _zapper,
+                address(_copperPriceConsumer),
+                _userRedeems
+            );
     }
 
     /**
@@ -343,7 +322,8 @@ contract RedeemEngine is
 
         _vault.approve(address(_vault), sharesToRedeem);
 
-        uint256 withdrawnCup = _vault.redeem(sharesToRedeem, address(this), address(this));
+        // CUP tokens are sent directly to Zapper contract
+        uint256 withdrawnCup = _vault.redeem(sharesToRedeem, address(_zapper), address(this));
 
         uint256 copperPrice = getCopperPrice();
         require(copperPrice > 0, "Copper price is 0");
@@ -656,5 +636,13 @@ contract RedeemEngine is
      */
     function vault() public view returns (address) {
         return address(_vault);
+    }
+
+    /**
+     * @notice Returns the address of the Zapper contract
+     * @return The Zapper contract address
+     */
+    function zapper() public view returns (address) {
+        return _zapper;
     }
 }

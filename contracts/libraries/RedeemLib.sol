@@ -37,6 +37,7 @@ library RedeemLib {
     // ───────────────────────────── ERRORS ─────────────────────────────
 
     error InvalidRedeemRequest();
+    error RedeemIdAlreadyExists();
     error AlreadyApproved();
     error AlreadyClaimed();
     error NotApproved();
@@ -58,24 +59,24 @@ library RedeemLib {
      * @param self Mapping of redeem IDs to redeem requests
      * @param pendingRedeemIds Array of pending redeem IDs
      * @param userRedeems Mapping of user addresses to their redeem IDs
+     * @param redeemId The unique identifier for the redeem request (must be unique)
      * @param user The user address requesting the redeem
      * @param shares The number of xCUP shares to redeem
-     * @return redeemId The unique identifier for the redeem request
      */
     function requestRedeem(
         mapping(bytes32 => RedeemRequest) storage self,
         bytes32[] storage pendingRedeemIds,
         mapping(address => bytes32[]) storage userRedeems,
+        bytes32 redeemId,
         address user,
         uint256 shares
-    ) external returns (bytes32 redeemId) {
+    ) external {
         if (user == address(0)) revert InvalidRedeemRequest();
         if (shares == 0) revert InvalidAmount();
 
-        redeemId = keccak256(abi.encodePacked(user, block.timestamp, shares));
-
-        RedeemRequest storage req = self[redeemId];
-        if (req.user != address(0)) revert InvalidRedeemRequest();
+        // Check for collision (redeemId must be unique)
+        // Check if redeemId already exists (even if deleted, we check by user address)
+        if (self[redeemId].user != address(0)) revert RedeemIdAlreadyExists();
 
         self[redeemId] = RedeemRequest({user: user, shares: shares, usdcAmount: 0, approved: false, claimed: false});
 
@@ -106,71 +107,70 @@ library RedeemLib {
     }
 
     /**
-     * @notice Performs redeem without commission using same logic as Zapper.redeem().
-     * @dev User calls this after curator approval. Executes full redeem flow internally.
+     * @notice Claims an approved redeem request
+     * @dev xCUP shares must already be in the contract (transferred during requestRedeem).
+     *      CUP tokens are sent directly to Zapper contract.
      * @param self Redeem storage mapping
      * @param redeemId Redeem request ID
-     * @param user Address claiming the redeem
+     * @param user Address claiming the redeem (must be msg.sender)
      * @param vault ERC4626 vault (xCUP)
-     * @param cup CUP token
      * @param usdc USDC token
-     * @param silo Silo contract (holding USDC)
+     * @param silo Silo contract (holding USDC for redeems)
+     * @param zapper Zapper contract address (where CUP tokens are sent)
      * @param copperPriceConsumer Oracle contract with price() view returning uint256
-     * @return usdcToWithdraw The amount of USDC sent to user
+     * @param userRedeems Mapping of user addresses to their redeem IDs (for removal)
+     * @return usdcAmount The amount of USDC sent to user
      */
     function claimRedeem(
         mapping(bytes32 => RedeemRequest) storage self,
         bytes32 redeemId,
         address user,
         IERC4626 vault,
-        IERC20 cup,
         IERC20 usdc,
         address silo,
-        address copperPriceConsumer
-    ) external returns (uint256 usdcToWithdraw) {
+        address zapper,
+        address copperPriceConsumer,
+        mapping(address => bytes32[]) storage userRedeems
+    ) external returns (uint256 usdcAmount) {
         RedeemRequest storage req = self[redeemId];
         if (req.user == address(0)) revert InvalidRedeemRequest();
         if (req.claimed) revert AlreadyClaimed();
         if (!req.approved) revert NotApproved();
         if (req.user != user) revert NotUser();
+        if (req.shares == 0) revert InvalidAmount();
+
+        // Check that contract has the shares (they were transferred during requestRedeem)
+        if (vault.balanceOf(address(this)) < req.shares) revert InsufficientBalance();
 
         req.claimed = true;
 
-        uint256 sharesToRedeem = req.shares;
-        if (sharesToRedeem == 0) revert InvalidAmount();
+        // Redeem xCUP → CUP (shares are already in this contract)
+        // CUP tokens are sent directly to Zapper contract
+        IERC20(address(vault)).approve(address(vault), req.shares);
 
-        //  Check ownership
-        uint256 ownedShares = vault.balanceOf(user);
-        if (ownedShares < sharesToRedeem) revert InsufficientBalance();
-
-        // Pull xCUP shares from user
-        IERC20(address(vault)).safeTransferFrom(user, address(this), sharesToRedeem);
-
-        //  Redeem xCUP → CUP
-        vault.approve(address(vault), sharesToRedeem);
-        uint256 withdrawnCup = vault.redeem(sharesToRedeem, address(this), address(this));
-
-        //  Get current copper price
+        // Get current copper price
         (bool ok, bytes memory data) = copperPriceConsumer.staticcall(abi.encodeWithSignature("price()"));
         require(ok, "Price oracle call failed");
         require(data.length >= 32, "Invalid price data returned");
         uint256 copperPrice = abi.decode(data, (uint256));
         if (copperPrice == 0) revert InvalidPrice();
 
-        //  Convert CUP → USDC (no commission)
-        uint256 totalUsdcAmount = (withdrawnCup * copperPrice) / (10 ** 8);
+        // Redeem and calculate USDC amount in one step
+        usdcAmount = (vault.redeem(req.shares, zapper, address(this)) * copperPrice) / (10 ** 8);
 
-        //  Pull USDC from Silo
-        usdc.safeTransferFrom(silo, address(this), totalUsdcAmount);
+        // Pull USDC from redeem silo (redeem silo must be pre-funded)
+        if (usdc.balanceOf(silo) < usdcAmount) revert InsufficientBalance();
+        usdc.safeTransferFrom(silo, address(this), usdcAmount);
 
-        if (usdc.balanceOf(address(this)) < totalUsdcAmount) revert InsufficientBalance();
+        // Send USDC to user (no commission)
+        usdc.safeTransfer(user, usdcAmount);
 
-        // Send to user
-        usdc.safeTransfer(user, totalUsdcAmount);
+        // Remove from user's list when claimed
+        removeUserRedeem(userRedeems, user, redeemId);
 
-        emit RedeemClaimed(user, redeemId, totalUsdcAmount);
+        emit RedeemClaimed(user, redeemId, usdcAmount);
 
-        return totalUsdcAmount;
+        return usdcAmount;
     }
 
     /**
