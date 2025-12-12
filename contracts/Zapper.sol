@@ -757,19 +757,21 @@ contract Zapper is
     }
 
     /**
-     * @notice Allows the contract owner to withdraw USDC from the Silo for management purposes
-     * @dev This function provides the owner with the ability to withdraw USDC from the Silo
+     * @notice Allows vault curators to withdraw USDC from the Silo to a specified address
+     * @dev This function provides curators with the ability to withdraw USDC from the Silo
      *      for operational purposes such as rebalancing, emergency management, or protocol
      *      maintenance. This is an administrative function with significant privileges.
      *
      * @param amount The amount of USDC to withdraw from the Silo (6 decimals)
+     * @param to The address to receive the withdrawn USDC
      */
-    function withdraw(uint256 amount) external nonReentrant onlyRole(VAULT_CURATOR_ROLE) {
+    function withdraw(uint256 amount, address to) external nonReentrant onlyRole(VAULT_CURATOR_ROLE) {
+        require(to != address(0), "Invalid recipient address");
         require(_usdc.balanceOf(address(silo())) >= amount, "Insufficient USDC balance");
 
-        _usdc.safeTransferFrom(silo(), owner(), amount);
+        _usdc.safeTransferFrom(silo(), to, amount);
 
-        emit Withdraw(owner(), amount);
+        emit Withdraw(to, amount);
     }
 
     /**

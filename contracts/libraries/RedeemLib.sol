@@ -18,6 +18,7 @@ library RedeemLib {
     // ───────────────────────────── STRUCTS ─────────────────────────────
 
     struct RedeemRequest {
+        bytes32 redeemId; // unique identifier for the redeem request
         address user; // requester
         uint256 shares; // xCUP shares to redeem
         uint256 usdcAmount; // approved payout
@@ -78,7 +79,14 @@ library RedeemLib {
         // Check if redeemId already exists (even if deleted, we check by user address)
         if (self[redeemId].user != address(0)) revert RedeemIdAlreadyExists();
 
-        self[redeemId] = RedeemRequest({user: user, shares: shares, usdcAmount: 0, approved: false, claimed: false});
+        self[redeemId] = RedeemRequest({
+            redeemId: redeemId,
+            user: user,
+            shares: shares,
+            usdcAmount: 0,
+            approved: false,
+            claimed: false
+        });
 
         // Add to pending list and user's list
         pendingRedeemIds.push(redeemId);

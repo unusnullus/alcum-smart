@@ -9,6 +9,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IUniswapRouterV2} from "./interfaces/IUniswapRouterV2.sol";
 import {IXCUPRatePool} from "./interfaces/IXCUPRatePool.sol";
 import {IWETH} from "./interfaces/IWETH.sol";
+import {IXCUPPriceView} from "./interfaces/IXCUPPriceView.sol";
 
 /**
  * @title XCUP Zap Router
@@ -236,15 +237,19 @@ contract XCUPZapRouter is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
         // Special case: XCUP -> USDC (direct swap via pool, skip Uniswap)
         if (tokenOut == address(usdc)) {
             // Calculate USDC after XCUP -> USDC swap
-            (uint256 reserveXCUP, uint256 reserveUSDC) = xcupPool.getReserves();
-            if (reserveXCUP == 0 || reserveUSDC == 0) {
-                return (0, 0);
-            }
-
+            // Use oracle-based pricing (same as actual swap)
             uint16 poolFeeBps = xcupPool.swapFee();
             uint256 xcupAmountWithFee = (amountIn * (10000 - poolFeeBps)) / 10000;
-            // Conservative estimate based on reserves
-            usdcAmount = (xcupAmountWithFee * reserveUSDC) / (reserveXCUP + xcupAmountWithFee);
+
+            // Use oracle-based pricing instead of reserve-based formula
+            usdcAmount = IXCUPPriceView(address(xcup)).getXcupPriceInToken(address(usdc), xcupAmountWithFee);
+
+            // Check reserves limit (same as in actual swap)
+            (, uint256 reserveUSDC) = xcupPool.getReserves();
+            if (usdcAmount > reserveUSDC) {
+                usdcAmount = reserveUSDC;
+            }
+
             tokenAmount = usdcAmount; // For USDC output, tokenAmount = usdcAmount
             return (usdcAmount, tokenAmount);
         }
@@ -255,16 +260,18 @@ contract XCUPZapRouter is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
         }
 
         // Calculate USDC after XCUP -> USDC swap
-        // For oracle-based pool, use conservative estimate
-        (uint256 rX, uint256 rU) = xcupPool.getReserves();
-        if (rX == 0 || rU == 0) {
-            return (0, 0);
-        }
-
+        // Use oracle-based pricing instead of reserve-based formula
         uint16 feeBps = xcupPool.swapFee();
         uint256 amountInWithFee = (amountIn * (10000 - feeBps)) / 10000;
-        // Conservative estimate based on reserves
-        usdcAmount = (amountInWithFee * rU) / (rX + amountInWithFee);
+
+        // Use oracle-based pricing (same as actual swap)
+        usdcAmount = IXCUPPriceView(address(xcup)).getXcupPriceInToken(address(usdc), amountInWithFee);
+
+        // Check reserves limit (same as in actual swap)
+        (, uint256 reserveUSDC) = xcupPool.getReserves();
+        if (usdcAmount > reserveUSDC) {
+            usdcAmount = reserveUSDC;
+        }
 
         // Build path automatically: USDC -> TokenOut
         address[] memory path = new address[](2);
@@ -295,19 +302,32 @@ contract XCUPZapRouter is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
         }
 
         // Calculate required USDC to get desired XCUP
-        // For oracle-based pool, use conservative estimate
-        (uint256 rX, uint256 rU) = xcupPool.getReserves();
-        if (rX == 0 || rU == 0) {
+        // Use oracle-based pricing for reverse calculation
+        uint16 feeBps = xcupPool.swapFee();
+
+        // Reverse calculation: we need to find USDC amount that gives us amountOut XCUP
+        // We can use binary search or approximation, but simpler: use getXcupPriceInToken to find USDC value of XCUP
+        // Then reverse it: if 1 XCUP = X USDC, then to get amountOut XCUP we need amountOut * X USDC
+        // But we need to account for fee, so: usdcAmount = (usdcValue * 10000) / (10000 - feeBps)
+
+        // Get USDC value of 1 XCUP (with 6 decimals)
+        uint256 oneXCUP = 1_000_000; // 1 XCUP with 6 decimals
+        uint256 usdcPerXCUP = IXCUPPriceView(address(xcup)).getXcupPriceInToken(address(usdc), oneXCUP);
+
+        if (usdcPerXCUP == 0) {
             return (0, 0);
         }
 
-        uint16 feeBps = xcupPool.swapFee();
-        // Reverse calculation: XCUP -> USDC
-        // Conservative estimate: usdcAmount = (amountOut * rU) / (rX - amountOut)
-        // But we need to account for fee, so: usdcAmount = (amountOut * rU) / ((rX - amountOut) * (10000 - feeBps) / 10000)
-        uint256 amountOutWithFee = (amountOut * 10000) / (10000 - feeBps);
-        usdcAmount = (amountOutWithFee * rU) / (rX > amountOutWithFee ? rX - amountOutWithFee : 1);
-        if (rX <= amountOutWithFee) {
+        // Calculate required USDC: amountOut * (usdcPerXCUP / oneXCUP)
+        // Since both have 6 decimals, we can simplify
+        uint256 usdcValue = (amountOut * usdcPerXCUP) / oneXCUP;
+
+        // Account for fee (reverse): usdcAmount = usdcValue * 10000 / (10000 - feeBps)
+        usdcAmount = (usdcValue * 10000) / (10000 - feeBps);
+
+        // Check reserves limit
+        (uint256 reserveXCUP, ) = xcupPool.getReserves();
+        if (amountOut > reserveXCUP) {
             return (0, 0);
         }
 
@@ -343,15 +363,19 @@ contract XCUPZapRouter is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
             usdcAmount = amountIn; // No swap needed, already USDC
 
             // Calculate XCUP after USDC -> XCUP swap via XCUPOraclePool
-            (uint256 reserveXCUP, uint256 reserveUSDC) = xcupPool.getReserves();
-            if (reserveXCUP == 0 || reserveUSDC == 0) {
-                return (usdcAmount, 0);
-            }
-
+            // Use oracle-based pricing (same as actual swap)
             uint16 poolFeeBps = xcupPool.swapFee();
             uint256 usdcAmountWithFee = (usdcAmount * (10000 - poolFeeBps)) / 10000;
-            // Conservative estimate based on reserves
-            xcupAmount = (usdcAmountWithFee * reserveXCUP) / (reserveUSDC + usdcAmountWithFee);
+
+            // Use oracle-based pricing instead of reserve-based formula
+            xcupAmount = IXCUPPriceView(address(xcup)).getTokenToXcupExchangeRate(address(usdc), usdcAmountWithFee);
+
+            // Check reserves limit (same as in actual swap)
+            (uint256 reserveXCUP, ) = xcupPool.getReserves();
+            if (xcupAmount > reserveXCUP) {
+                xcupAmount = reserveXCUP;
+            }
+
             return (usdcAmount, xcupAmount);
         }
 
@@ -373,16 +397,18 @@ contract XCUPZapRouter is Initializable, OwnableUpgradeable, ReentrancyGuardUpgr
         usdcAmount = amountsOut[amountsOut.length - 1];
 
         // Step 2: Calculate XCUP after USDC -> XCUP swap via XCUPOraclePool
-        // For oracle-based pool, use conservative estimate
-        (uint256 rX, uint256 rU) = xcupPool.getReserves();
-        if (rX == 0 || rU == 0 || usdcAmount == 0) {
-            return (usdcAmount, 0);
-        }
-
+        // Use oracle-based pricing instead of reserve-based formula
         uint16 feeBps = xcupPool.swapFee();
         uint256 amountInWithFee = (usdcAmount * (10000 - feeBps)) / 10000;
-        // Conservative estimate based on reserves
-        xcupAmount = (amountInWithFee * rX) / (rU + amountInWithFee);
+
+        // Use oracle-based pricing (same as actual swap)
+        xcupAmount = IXCUPPriceView(address(xcup)).getTokenToXcupExchangeRate(address(usdc), amountInWithFee);
+
+        // Check reserves limit (same as in actual swap)
+        (uint256 rXCUP, ) = xcupPool.getReserves();
+        if (xcupAmount > rXCUP) {
+            xcupAmount = rXCUP;
+        }
     }
 
     // --- Internal Functions ---
