@@ -97,6 +97,9 @@ contract SettlementEngine is
     /// @notice Thrown when zapper address is zero during initialization
     error InvalidZapperAddress();
 
+    /// @notice Thrown when redeem silo address is zero during initialization
+    error InvalidRedeemSiloAddress();
+
     /// @notice Thrown when epoch manager address is zero during initialization
     error InvalidEpochManagerAddress();
 
@@ -188,6 +191,7 @@ contract SettlementEngine is
         uint256 averagePurchasePrice;
         uint256 averageSalePrice;
         bool isSettled;
+        uint256 totalSupplyAtClose; // Total xCUP supply at epoch closure (for price calculation)
     }
 
     /// @notice Basis points denominator (10,000 = 100%)
@@ -240,15 +244,20 @@ contract SettlementEngine is
     ///      Used for protocol operations, development, and maintenance costs.
     address public _treasury;
 
-    /// @notice Zapper contract address for revenue transfers
-    /// @dev Receives net revenue after fees for further processing.
-    ///      Part of the revenue distribution flow to convert USDC to CUP tokens.
+    /// @notice Zapper contract address (where CUP tokens are sent after redeem)
+    /// @dev Used for reference, but revenue now goes to redeem silo instead
     address public _zapper;
 
     /// @notice Mapping of epoch ID to system fees collected
     /// @dev Tracks fees collected per epoch for transparency and accounting.
     ///      Key: epochId (uint256), Value: fee amount in USDC (6 decimals).
     mapping(uint256 => uint256) public _epochSystemFees;
+
+    /// @notice Redeem Silo contract address for USDC liquidity
+    /// @dev Receives net revenue after fees to provide USDC liquidity for redemption operations.
+    ///      This ensures users can redeem their xCUP shares for USDC.
+    ///      IMPORTANT: Added after _epochSystemFees to maintain storage layout compatibility for upgrades.
+    address public _redeemSilo;
 
     /**
      * @notice Emitted when NAV components are updated
@@ -276,7 +285,10 @@ contract SettlementEngine is
      * @param systemFee Amount of fees collected for the treasury (USDC, 6 decimals)
      */
     event RevenueDistributed(
-        uint256 indexed epochId, uint256 revenueDistributed, uint256 distributedCupTokens, uint256 systemFee
+        uint256 indexed epochId,
+        uint256 revenueDistributed,
+        uint256 distributedCupTokens,
+        uint256 systemFee
     );
 
     /**
@@ -309,6 +321,13 @@ contract SettlementEngine is
      * @param newZapper New zapper address
      */
     event ZapperUpdated(address indexed oldZapper, address indexed newZapper);
+
+    /**
+     * @notice Emitted when redeem silo address is updated
+     * @param oldRedeemSilo Previous redeem silo address
+     * @param newRedeemSilo New redeem silo address
+     */
+    event RedeemSiloUpdated(address indexed oldRedeemSilo, address indexed newRedeemSilo);
 
     /**
      * @notice Emitted when tokens are recovered in emergency
@@ -344,7 +363,8 @@ contract SettlementEngine is
      *
      * @param vault Address of the ERC4626 vault contract for revenue distribution
      * @param treasury Address of the treasury for fee collection
-     * @param zapper Address of the zapper contract for revenue transfers
+     * @param zapper Address of the zapper contract (where CUP tokens are sent after redeem)
+     * @param redeemSilo Address of the redeem silo contract for USDC liquidity
      * @param epochManager Address of the epoch manager contract for time validation
      * @param copperPriceConsumer Address of the copper price oracle for NAV calculations
      * @param usdc Address of the USDC token contract for revenue handling
@@ -354,6 +374,7 @@ contract SettlementEngine is
         address vault,
         address treasury,
         address zapper,
+        address redeemSilo,
         address epochManager,
         address copperPriceConsumer,
         address usdc,
@@ -362,6 +383,7 @@ contract SettlementEngine is
         if (vault == address(0)) revert InvalidVaultAddress();
         if (treasury == address(0)) revert InvalidTreasuryAddress();
         if (zapper == address(0)) revert InvalidZapperAddress();
+        if (redeemSilo == address(0)) revert InvalidRedeemSiloAddress();
         if (epochManager == address(0)) revert InvalidEpochManagerAddress();
         if (copperPriceConsumer == address(0)) revert InvalidCopperPriceConsumerAddress();
         if (usdc == address(0)) revert InvalidUSDCAddress();
@@ -379,6 +401,7 @@ contract SettlementEngine is
         _vault = IERC4626(vault);
         _treasury = treasury;
         _zapper = zapper;
+        _redeemSilo = redeemSilo;
         _epochManager = IEpochManager(epochManager);
         _copperPriceConsumer = ICopperPriceConsumer(copperPriceConsumer);
 
@@ -467,7 +490,8 @@ contract SettlementEngine is
             cupSold: cupSold,
             averagePurchasePrice: averagePurchasePrice,
             averageSalePrice: averageSalePrice,
-            isSettled: false
+            isSettled: false,
+            totalSupplyAtClose: 0 // Will be set when epoch is settled
         });
 
         emit EpochRevenueRecorded(epochId, netRevenue, cupSold);
@@ -482,8 +506,15 @@ contract SettlementEngine is
      *      Settlement Process:
      *      1. Validates epoch exists and has recorded revenue
      *      2. Ensures epoch is not already settled
-     *      3. Marks epoch as settled (prevents re-settlement)
-     *      4. Adds net revenue to retained earnings for NAV calculation
+     *      3. Saves totalSupplyAtClose snapshot (used for redemption price calculations)
+     *      4. Marks epoch as settled (prevents re-settlement)
+     *      5. Adds net revenue to retained earnings for NAV calculation
+     *
+     *      Important Notes:
+     *      - totalSupplyAtClose is saved at settlement time, not distribution time
+     *      - This ensures consistent pricing for redemptions based on epoch closure
+     *      - retainedEarnings will be reduced by the distributed amount in distributeRevenueToVault()
+     *      - If updateNAV() is called between settle and distribute, retainedEarnings will include this revenue
      *
      *      After settlement, the epoch is ready for distributeRevenueToVault().
      *
@@ -495,6 +526,9 @@ contract SettlementEngine is
         if (revenue.epochId != epochId) revert EpochRevenueNotFound();
         if (revenue.isSettled) revert EpochAlreadySettled();
         if (revenue.netRevenue == 0) revert NoRevenueToDistribute();
+
+        // Save total supply snapshot at epoch closure (for price calculation in redemptions)
+        revenue.totalSupplyAtClose = _vault.totalSupply();
 
         // Mark as settled
         revenue.isSettled = true;
@@ -543,6 +577,41 @@ contract SettlementEngine is
      */
     function getEpochRevenue(uint256 epochId) external view returns (EpochRevenue memory) {
         return epochRevenues[epochId];
+    }
+
+    /**
+     * @notice Finds and returns revenue data for the last settled epoch
+     * @dev Searches backwards from current epoch to find the most recent settled epoch.
+     *      This is useful for redemption price calculations that need the latest settled epoch data.
+     *      Limits search to 100 epochs back to prevent gas issues.
+     *
+     *      Returns an empty struct (epochId = 0) if no settled epoch is found.
+     *
+     * @return epochRevenue The EpochRevenue struct for the last settled epoch, or empty struct if none found
+     * @return found Whether a settled epoch was found
+     */
+    function getLastSettledEpochRevenue() external view returns (EpochRevenue memory epochRevenue, bool found) {
+        uint256 currentEpochId = _epochManager.currentEpochId();
+        uint256 maxSearchDepth = 100;
+        uint256 searchDepth = 0;
+
+        // Start from current epoch - 1 (previous epoch) and go backwards
+        // We don't check current epoch itself as it's likely not settled yet
+        uint256 startEpochId = currentEpochId > 0 ? currentEpochId - 1 : 0;
+
+        for (uint256 epochId = startEpochId; epochId > 0 && searchDepth < maxSearchDepth; epochId--) {
+            EpochRevenue memory revenue = epochRevenues[epochId];
+
+            // Check if this epoch exists, is settled, and has valid totalSupplyAtClose
+            if (revenue.epochId == epochId && revenue.isSettled && revenue.totalSupplyAtClose > 0) {
+                return (revenue, true);
+            }
+
+            searchDepth++;
+        }
+
+        // Return empty struct if no settled epoch found
+        return (EpochRevenue(0, 0, 0, 0, 0, 0, 0, false, 0), false);
     }
 
     /**
@@ -668,23 +737,25 @@ contract SettlementEngine is
      *      2. Calculate system fees and net revenue after fees
      *      3. Transfer total revenue in USDC from caller to contract
      *      4. Transfer system fees to treasury
-     *      5. Transfer net revenue to zapper for processing
+     *      5. Transfer net revenue to redeem silo (provides USDC liquidity for redemptions)
      *      6. Get current copper price from oracle
      *      7. Calculate CUP tokens to mint: (netRevenue × 1e8) ÷ copperPrice
      *      8. Mint CUP tokens directly to vault (increases vault assets)
      *      9. Mark revenue as distributed (set netRevenue to 0)
+     *
+     *      Note: This is NOT double accounting:
+     *      - CUP in vault = protocol assets (copper inventory, increases NAV)
+     *      - USDC in redeem silo = liquidity buffer for user redemptions
+     *      These serve different purposes and don't duplicate each other
      *
      *      The CUP token minting increases vault's totalAssets(), making all xCUP shares
      *      more valuable proportionally. This is how vault participants benefit from profits.
      *
      * @param epochId The epoch ID to distribute revenue for (must be settled)
      */
-    function distributeRevenueToVault(uint256 epochId)
-        external
-        onlyRole(REVENUE_MANAGER_ROLE)
-        whenNotPaused
-        nonReentrant
-    {
+    function distributeRevenueToVault(
+        uint256 epochId
+    ) external onlyRole(REVENUE_MANAGER_ROLE) whenNotPaused nonReentrant {
         if (epochId > _epochManager.currentEpochId()) revert FutureEpochId();
         EpochRevenue storage revenue = epochRevenues[epochId];
 
@@ -708,21 +779,27 @@ contract SettlementEngine is
             _usdc.safeTransfer(_treasury, systemFee);
         }
 
-        // Transfer net revenue to zapper
-        _usdc.safeTransfer(_zapper, netRevenueAfterFees);
+        // Transfer net revenue to redeem silo (provides USDC liquidity for redemption operations)
+        // This is NOT double accounting because:
+        // - CUP tokens minted to vault = protocol assets (copper inventory)
+        // - USDC in redeem silo = liquidity buffer for user redemptions
+        // These serve different purposes and don't duplicate each other
+        _usdc.safeTransfer(_redeemSilo, netRevenueAfterFees);
 
         // Get the underlying CUP token
         IERC20Mintable cupToken = IERC20Mintable(_vault.asset());
 
-        uint256 copperPriceUSD = _copperPriceConsumer.getPriceAsDecimal();
+        // Get copper price with 8 decimals (not getPriceAsDecimal which returns without decimals)
+        uint256 copperPriceUSD = _copperPriceConsumer.price();
 
         if (copperPriceUSD == 0) revert InvalidCopperPrice();
 
         // Convert net revenue (after fees) to CUP tokens
-        // revenueUSD: 6 decimals (e.g., 1000 USDC = 1,000,000,000)
+        // revenueUSD: 6 decimals (e.g., 100 USDC = 100,000,000)
         // copperPriceUSD: 8 decimals (e.g., $4.50 = 450,000,000)
         //
-        // Formula: cupTokens = (revenueUSD * 10^8) / copperPriceUSD
+        // Formula: cupTokens (6 decimals) = (revenueUSD (6 decimals) * 10^8) / copperPriceUSD (8 decimals)
+        // Example: (100,000,000 * 10^8) / 450,000,000 = 22,222,222 (6 decimals)
         uint256 cupTokensToMint = (netRevenueAfterFees * 1e8) / copperPriceUSD;
 
         // Ensure we're not minting zero tokens (would be a waste of gas)
@@ -730,6 +807,30 @@ contract SettlementEngine is
 
         // This requires the SettlementEngine to have MINTER_ROLE on CUP token
         cupToken.mint(address(_vault), cupTokensToMint);
+
+        // Update NAV components to reflect the distributed revenue
+        // 1. Subtract only the distributed revenue from retainedEarnings
+        //    This ensures we don't lose information about other epochs' retained earnings
+        //    The systemFee was already sent to treasury (leaves protocol, not part of NAV)
+        //    Note: retainedEarnings was increased in settleEpochRevenue() by revenue.netRevenue
+        //    We subtract totalRevenue (which equals revenue.netRevenue) to balance it out
+        if (_nav.retainedEarnings >= totalRevenue) {
+            _nav.retainedEarnings -= totalRevenue;
+        } else {
+            // If retainedEarnings is less than totalRevenue, it means there was an issue
+            // This could happen if updateNAV() was called with different retainedEarnings
+            // Set to 0 to prevent underflow, but this should be investigated
+            _nav.retainedEarnings = 0;
+        }
+
+        // 2. Synchronize cupInWarehouse with actual vault balance
+        //    This ensures NAV reflects the actual CUP tokens in the vault after minting
+        //    Get actual CUP balance in vault (6 decimals)
+        uint256 vaultCupBalance = cupToken.balanceOf(address(_vault));
+        // Convert to NAV format (8 decimals): multiply by 100 (1e2)
+        // Example: 22,222,222 CUP (6 decimals) = 2,222,222,200 (8 decimals)
+        uint256 cupInWarehouseNew = vaultCupBalance * 100;
+        _nav.cupInWarehouse = cupInWarehouseNew;
 
         // Mark revenue as distributed
         revenue.netRevenue = 0; // Prevent double distribution
@@ -814,7 +915,23 @@ contract SettlementEngine is
     }
 
     /**
-     * @notice Reserved storage space for future contract upgrades
+     * @notice Updates the redeem silo contract address
+     * @dev Only callable by the contract owner. Redeem silo cannot be zero address.
+     *
+     * @param newRedeemSilo New redeem silo contract address
      */
-    uint256[45] private __gap;
+    function updateRedeemSilo(address newRedeemSilo) external onlyOwner {
+        if (newRedeemSilo == address(0)) revert InvalidRedeemSiloAddress();
+
+        address oldRedeemSilo = _redeemSilo;
+        _redeemSilo = newRedeemSilo;
+
+        emit RedeemSiloUpdated(oldRedeemSilo, newRedeemSilo);
+    }
+
+    /**
+     * @notice Reserved storage space for future contract upgrades
+     * @dev Reduced from 45 to 44 slots to accommodate _redeemSilo addition
+     */
+    uint256[44] private __gap;
 }

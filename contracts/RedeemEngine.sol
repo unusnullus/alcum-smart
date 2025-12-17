@@ -10,12 +10,13 @@ import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Pau
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
-import {IERC20Mintable} from "./interfaces/IERC20Mintable.sol";
 
 import {ICopperPriceConsumer} from "./interfaces/ICopperPriceConsumer.sol";
 import {Silo} from "./Silo.sol";
 import {RedeemLib} from "./libraries/RedeemLib.sol";
 import {RedeemViewLib} from "./libraries/RedeemViewLib.sol";
+import {SettlementEngine} from "./SettlementEngine.sol";
+import {IEpochManager} from "./interfaces/IEpochManager.sol";
 
 /**
  * @title RedeemEngine
@@ -65,8 +66,15 @@ contract RedeemEngine is
     /// @notice Commission percentage for direct redeem operations (in basis points, e.g., 200 = 2%)
     uint256 private _redeemCommissionBps;
 
+    /// @notice SettlementEngine contract for accessing epoch revenue data
+    SettlementEngine public settlementEngine;
+
+    /// @notice EpochManager contract for getting current epoch ID
+    IEpochManager public epochManager;
+
     // Reserve storage gap for future upgrades
-    uint256[40] private __gap;
+    // Reduced from 40 to 38 to accommodate new fields (settlementEngine, epochManager)
+    uint256[38] private __gap;
 
     /**
      * @notice Emitted when a redeem request is created
@@ -161,6 +169,7 @@ contract RedeemEngine is
      * @notice Creates a new redeem request and transfers xCUP shares to the contract
      * @dev User must approve this contract to spend their xCUP shares before calling.
      *      The redeemId must be unique - if it already exists, the transaction will revert.
+     *      Requires that previous epoch exists and is settled.
      * @param shares The number of xCUP vault shares to redeem
      * @param redeemId The unique identifier for the redeem request (must be unique)
      */
@@ -174,23 +183,32 @@ contract RedeemEngine is
         IERC20(address(_vault)).safeTransferFrom(_msgSender(), address(this), shares);
 
         // Create redeem request (adds to pending list and user's list)
-        RedeemLib.requestRedeem(_redeems, _pendingRedeemIds, _userRedeems, redeemId, msg.sender, shares);
-        emit RedeemRequested(msg.sender, redeemId, shares);
+        // Use _msgSender() instead of msg.sender for consistency with access control
+        RedeemLib.requestRedeem(_redeems, _pendingRedeemIds, _userRedeems, redeemId, _msgSender(), shares);
+        emit RedeemRequested(_msgSender(), redeemId, shares);
     }
 
     /**
      * @notice Approves a pending redeem request
+     * @dev Calculates USDC amount based on previous epoch price if usdcAmount is 0
      * @param redeemId The unique identifier of the redeem request
-     * @param usdcAmount The USDC amount to approve for payout
+     * @param usdcAmount The USDC amount to approve for payout (0 to auto-calculate from previous epoch)
      */
     function approveRedeem(bytes32 redeemId, uint256 usdcAmount) external whenNotPaused onlyRole(VAULT_CURATOR_ROLE) {
-        RedeemLib.approveRedeem(_redeems, redeemId, usdcAmount);
-        RedeemLib.RedeemRequest storage req = _redeems[redeemId];
+        // Validate that settlementEngine is set (required for automatic price calculation)
+        require(address(settlementEngine) != address(0), "SettlementEngine not set");
+
+        // Approve redeem with automatic price calculation from last settled epoch if usdcAmount is 0
+        // Library emits RedeemApproved event internally
+        // Uses SettlementEngine.getLastSettledEpochRevenue() internally to find the most recent settled epoch
+        RedeemLib.approveRedeemWithEpochPrice(_redeems, redeemId, usdcAmount, address(settlementEngine));
 
         // Remove from pending list when approved
-        RedeemLib.removePendingRedeem(_pendingRedeemIds, redeemId);
-
-        emit RedeemApproved(redeemId, req.shares, usdcAmount);
+        // Note: removePendingRedeem is safe even if redeemId is not in the array (function will just not find it)
+        // It also checks for empty array to prevent underflow
+        if (_pendingRedeemIds.length > 0) {
+            RedeemLib.removePendingRedeem(_pendingRedeemIds, redeemId);
+        }
     }
 
     /**
@@ -365,6 +383,26 @@ contract RedeemEngine is
     }
 
     /**
+     * @notice Sets the SettlementEngine contract address
+     * @dev Only callable by the contract owner. Used for contract upgrades.
+     * @param settlementEngine_ The address of the SettlementEngine contract
+     */
+    function setSettlementEngine(address settlementEngine_) external onlyOwner {
+        require(settlementEngine_ != address(0), "Invalid SettlementEngine address");
+        settlementEngine = SettlementEngine(settlementEngine_);
+    }
+
+    /**
+     * @notice Sets the EpochManager contract address
+     * @dev Only callable by the contract owner. Used for contract upgrades.
+     * @param epochManager_ The address of the EpochManager contract
+     */
+    function setEpochManager(address epochManager_) external onlyOwner {
+        require(epochManager_ != address(0), "Invalid EpochManager address");
+        epochManager = IEpochManager(epochManager_);
+    }
+
+    /**
      * @notice Allows the contract owner to withdraw USDC from the Redeem Silo
      * @param amount The amount of USDC to withdraw from the Redeem Silo (6 decimals)
      */
@@ -486,18 +524,28 @@ contract RedeemEngine is
      * @notice Allows vault curators to approve multiple redeem requests proportionally
      * @dev This function enables curators to approve a specific total shares amount across
      *      all pending redeem requests, with each request receiving a proportional share.
-     *      USDC amounts are calculated based on current copper price.
+     *      USDC amounts are calculated based on previous epoch price.
      * @param targetTotalShares The total shares to approve across all redeems
      */
     function approveRedeemsProportionally(
         uint256 targetTotalShares
     ) external whenNotPaused onlyRole(VAULT_CURATOR_ROLE) {
-        // Get current copper price to calculate USDC amounts
-        uint256 copperPrice = getCopperPrice();
-        require(copperPrice > 0, "Copper price is 0");
+        // Validate that required contracts are set
+        require(address(epochManager) != address(0), "EpochManager not set");
+        require(address(settlementEngine) != address(0), "SettlementEngine not set");
 
-        // Calculate proportion and total pending shares
-        (uint256 proportion, uint256 totalPendingShares) = RedeemLib.calculateProportionalApproval(
+        // Get previous epoch price
+        uint256 currentEpochId = epochManager.currentEpochId();
+        uint256 previousEpochId = RedeemLib.getPreviousEpochId(currentEpochId);
+        require(previousEpochId > 0, "No previous epoch available");
+
+        uint256 pricePerShare = RedeemLib.calculateXcupPriceFromPreviousEpoch(
+            address(settlementEngine),
+            previousEpochId
+        );
+
+        // Calculate proportion
+        (uint256 proportion, ) = RedeemLib.calculateProportionalApproval(
             _redeems,
             _pendingRedeemIds,
             targetTotalShares
@@ -518,11 +566,8 @@ contract RedeemEngine is
                 uint256 approvedShares = (req.shares * proportion) / 1e18;
 
                 if (approvedShares > 0) {
-                    // Convert approved shares to CUP assets using vault
-                    uint256 cupValue = _vault.convertToAssets(approvedShares);
-
-                    // Convert CUP to USDC using copper price
-                    uint256 usdcAmount = (cupValue * copperPrice) / (10 ** 8);
+                    // Calculate USDC amount using previous epoch price
+                    uint256 usdcAmount = (approvedShares * pricePerShare) / 1e6;
 
                     // Approve the redeem
                     req.approved = true;
@@ -540,7 +585,7 @@ contract RedeemEngine is
     /**
      * @notice Allows vault curators to approve all pending redeem requests in full
      * @dev This function provides a convenient way to approve all pending redeem requests
-     *      for their complete shares. USDC amounts are calculated based on current copper price.
+     *      for their complete shares. USDC amounts are calculated based on previous epoch price.
      * @return totalShares The total shares approved across all redeems
      * @return redeemsApproved The number of individual redeems that were approved
      */
@@ -550,9 +595,19 @@ contract RedeemEngine is
         onlyRole(VAULT_CURATOR_ROLE)
         returns (uint256 totalShares, uint256 redeemsApproved)
     {
-        // Get current copper price to calculate USDC amounts
-        uint256 copperPrice = getCopperPrice();
-        require(copperPrice > 0, "Copper price is 0");
+        // Validate that required contracts are set
+        require(address(epochManager) != address(0), "EpochManager not set");
+        require(address(settlementEngine) != address(0), "SettlementEngine not set");
+
+        // Get previous epoch price
+        uint256 currentEpochId = epochManager.currentEpochId();
+        uint256 previousEpochId = RedeemLib.getPreviousEpochId(currentEpochId);
+        require(previousEpochId > 0, "No previous epoch available");
+
+        uint256 pricePerShare = RedeemLib.calculateXcupPriceFromPreviousEpoch(
+            address(settlementEngine),
+            previousEpochId
+        );
 
         // Create a copy of pending IDs since we'll be modifying the array
         bytes32[] memory pendingIds = new bytes32[](_pendingRedeemIds.length);
@@ -566,11 +621,8 @@ contract RedeemEngine is
             RedeemLib.RedeemRequest storage req = _redeems[redeemId];
 
             if (req.user != address(0) && !req.approved) {
-                // Convert shares to CUP assets using vault
-                uint256 cupValue = _vault.convertToAssets(req.shares);
-
-                // Convert CUP to USDC using copper price
-                uint256 usdcAmount = (cupValue * copperPrice) / (10 ** 8);
+                // Calculate USDC amount using previous epoch price
+                uint256 usdcAmount = (req.shares * pricePerShare) / 1e6;
 
                 // Approve the redeem
                 req.approved = true;

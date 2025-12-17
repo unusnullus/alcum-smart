@@ -52,6 +52,7 @@ library RedeemLib {
     error NoValidPendingRedeems();
     error TargetAmountExceedsTotal();
     error InvalidApprovedAmount();
+    error NoPreviousEpoch();
 
     // ───────────────────────────── REDEEM WORKFLOW ─────────────────────────────
 
@@ -115,9 +116,136 @@ library RedeemLib {
     }
 
     /**
+     * @notice Calculates xCUP price per share based on previous epoch data (internal)
+     * @dev This calculates the profit per share from the epoch, which is used for redemption pricing.
+     *      Note: This is NOT the full xCUP price, but rather the profit component per share.
+     *      The full xCUP price would be: totalAssets() / totalSupply() from the vault.
+     *      However, for redemptions, we use the profit per share to calculate the USDC payout.
+     *
+     *      Formula: pricePerShare = originalNetRevenue / totalSupplyAtClose
+     *      This represents the profit earned per xCUP share during the epoch.
+     *
+     * @param netRevenue Net revenue earned during previous epoch (USDC, 6 decimals)
+     * @param totalSupplyAtClose Total xCUP supply at epoch closure (xCUP shares, 6 decimals)
+     * @return pricePerShare The profit per xCUP share in USDC (6 decimals)
+     */
+    function calculateXcupPriceFromEpoch(
+        uint256 netRevenue,
+        uint256 totalSupplyAtClose
+    ) internal pure returns (uint256 pricePerShare) {
+        if (totalSupplyAtClose == 0) revert InvalidAmount();
+        pricePerShare = (netRevenue * 1e6) / totalSupplyAtClose;
+    }
+
+    /**
+     * @notice Gets previous epoch ID from current epoch ID (internal)
+     * @param currentEpochId Current epoch ID
+     * @return previousEpochId Previous epoch ID, or 0 if current epoch is 0
+     */
+    function _getPreviousEpochId(uint256 currentEpochId) internal pure returns (uint256 previousEpochId) {
+        if (currentEpochId == 0) {
+            return 0;
+        }
+        return currentEpochId - 1;
+    }
+
+    /**
+     * @notice Gets the last settled epoch revenue from SettlementEngine
+     * @param settlementEngine Address of SettlementEngine contract
+     * @return epochRevenue The EpochRevenue struct for the last settled epoch
+     * @return found Whether a settled epoch was found
+     */
+    function _getLastSettledEpochRevenue(
+        address settlementEngine
+    ) internal view returns (EpochRevenue memory epochRevenue, bool found) {
+        // Call SettlementEngine.getLastSettledEpochRevenue()
+        (bool success, bytes memory data) = settlementEngine.staticcall(
+            abi.encodeWithSignature("getLastSettledEpochRevenue()")
+        );
+        require(success, "Failed to get last settled epoch revenue");
+
+        // Decode the return value: (EpochRevenue memory, bool)
+        (epochRevenue, found) = abi.decode(data, (EpochRevenue, bool));
+    }
+
+    /**
+     * @notice Calculates xCUP price from previous epoch using SettlementEngine (internal)
+     * @param settlementEngine Address of SettlementEngine contract
+     * @param previousEpochId Previous epoch ID
+     * @return pricePerShare The price per xCUP share in USDC (6 decimals)
+     */
+    function _calculateXcupPriceFromPreviousEpoch(
+        address settlementEngine,
+        uint256 previousEpochId
+    ) internal view returns (uint256 pricePerShare) {
+        (bool success, bytes memory data) = settlementEngine.staticcall(
+            abi.encodeWithSignature("getEpochRevenue(uint256)", previousEpochId)
+        );
+        require(success, "Failed to get epoch revenue");
+
+        EpochRevenue memory epochRevenue = abi.decode(data, (EpochRevenue));
+
+        require(epochRevenue.epochId == previousEpochId, "Epoch not found");
+        require(epochRevenue.isSettled, "Epoch not settled");
+        require(epochRevenue.totalSupplyAtClose > 0, "Invalid total supply");
+
+        pricePerShare = calculateXcupPriceFromEpoch(epochRevenue.originalNetRevenue, epochRevenue.totalSupplyAtClose);
+    }
+
+    /**
+     * @notice Approves a pending redeem request with automatic price calculation from previous epoch
+     * @dev If usdcAmount is 0, calculates price from last settled epoch. Otherwise uses provided amount.
+     *      Uses SettlementEngine.getLastSettledEpochRevenue() to get the most recent settled epoch data.
+     * @param self Mapping of redeem IDs to redeem requests
+     * @param redeemId The unique identifier of the redeem request
+     * @param usdcAmount The USDC amount to approve (0 to auto-calculate from last settled epoch)
+     * @param settlementEngine Address of SettlementEngine contract
+     * @return calculatedUsdcAmount The USDC amount that was approved (calculated or provided)
+     */
+    function approveRedeemWithEpochPrice(
+        mapping(bytes32 => RedeemRequest) storage self,
+        bytes32 redeemId,
+        uint256 usdcAmount,
+        address settlementEngine
+    ) external returns (uint256 calculatedUsdcAmount) {
+        RedeemRequest storage req = self[redeemId];
+        if (req.user == address(0)) revert InvalidRedeemRequest();
+        if (req.approved) revert AlreadyApproved();
+        if (req.claimed) revert AlreadyClaimed();
+
+        // If usdcAmount is 0, calculate from last settled epoch
+        if (usdcAmount == 0) {
+            // Get the last settled epoch revenue directly from SettlementEngine
+            (EpochRevenue memory epochRevenue, bool found) = _getLastSettledEpochRevenue(settlementEngine);
+            if (!found) revert NoPreviousEpoch();
+
+            // Calculate price per share from the epoch revenue data
+            // pricePerShare: 6 decimals (USDC per share)
+            // req.shares: 6 decimals (xCUP shares)
+            // calculatedUsdcAmount: 6 decimals (USDC)
+            // Formula: (shares * pricePerShare) / 1e6
+            uint256 pricePerShare = calculateXcupPriceFromEpoch(
+                epochRevenue.originalNetRevenue,
+                epochRevenue.totalSupplyAtClose
+            );
+            calculatedUsdcAmount = (req.shares * pricePerShare) / 1e6;
+        } else {
+            calculatedUsdcAmount = usdcAmount;
+        }
+
+        req.approved = true;
+        req.usdcAmount = calculatedUsdcAmount;
+
+        emit RedeemApproved(redeemId, req.shares, calculatedUsdcAmount);
+
+        return calculatedUsdcAmount;
+    }
+
+    /**
      * @notice Claims an approved redeem request
      * @dev xCUP shares must already be in the contract (transferred during requestRedeem).
      *      CUP tokens are sent directly to Zapper contract.
+     *      Uses the approved usdcAmount (calculated from previous epoch price) instead of current vault price.
      * @param self Redeem storage mapping
      * @param redeemId Redeem request ID
      * @param user Address claiming the redeem (must be msg.sender)
@@ -127,7 +255,7 @@ library RedeemLib {
      * @param zapper Zapper contract address (where CUP tokens are sent)
      * @param copperPriceConsumer Oracle contract with price() view returning uint256
      * @param userRedeems Mapping of user addresses to their redeem IDs (for removal)
-     * @return usdcAmount The amount of USDC sent to user
+     * @return usdcAmount The amount of USDC sent to user (from approved amount)
      */
     function claimRedeem(
         mapping(bytes32 => RedeemRequest) storage self,
@@ -146,6 +274,7 @@ library RedeemLib {
         if (!req.approved) revert NotApproved();
         if (req.user != user) revert NotUser();
         if (req.shares == 0) revert InvalidAmount();
+        if (req.usdcAmount == 0) revert InvalidAmount();
 
         // Check that contract has the shares (they were transferred during requestRedeem)
         if (vault.balanceOf(address(this)) < req.shares) revert InsufficientBalance();
@@ -155,16 +284,11 @@ library RedeemLib {
         // Redeem xCUP → CUP (shares are already in this contract)
         // CUP tokens are sent directly to Zapper contract
         IERC20(address(vault)).approve(address(vault), req.shares);
+        vault.redeem(req.shares, zapper, address(this));
 
-        // Get current copper price
-        (bool ok, bytes memory data) = copperPriceConsumer.staticcall(abi.encodeWithSignature("price()"));
-        require(ok, "Price oracle call failed");
-        require(data.length >= 32, "Invalid price data returned");
-        uint256 copperPrice = abi.decode(data, (uint256));
-        if (copperPrice == 0) revert InvalidPrice();
-
-        // Redeem and calculate USDC amount in one step
-        usdcAmount = (vault.redeem(req.shares, zapper, address(this)) * copperPrice) / (10 ** 8);
+        // Use the approved USDC amount (calculated from previous epoch price at closure)
+        // This ensures consistency with approveRedeem which uses epoch closure price
+        usdcAmount = req.usdcAmount;
 
         // Pull USDC from redeem silo (redeem silo must be pre-funded)
         if (usdc.balanceOf(silo) < usdcAmount) revert InsufficientBalance();
@@ -198,6 +322,9 @@ library RedeemLib {
      */
     function removePendingRedeem(bytes32[] storage pendingRedeemIds, bytes32 redeemId) internal {
         uint256 length = pendingRedeemIds.length;
+        if (length == 0) {
+            return; // Nothing to remove
+        }
         for (uint256 i = 0; i < length; i++) {
             if (pendingRedeemIds[i] == redeemId) {
                 // Move last element to current position
@@ -221,6 +348,9 @@ library RedeemLib {
     ) internal {
         bytes32[] storage redeems = userRedeems[user];
         uint256 length = redeems.length;
+        if (length == 0) {
+            return; // Nothing to remove
+        }
         for (uint256 i = 0; i < length; i++) {
             if (redeems[i] == redeemId) {
                 // Move last element to current position
@@ -390,5 +520,81 @@ library RedeemLib {
                 currentIndex++;
             }
         }
+    }
+
+    /**
+     * @notice Epoch revenue data structure (matches SettlementEngine.EpochRevenue)
+     * @dev Used for price calculation based on previous epoch data
+     *      IMPORTANT: Field order must match SettlementEngine.EpochRevenue exactly!
+     */
+    struct EpochRevenue {
+        uint256 epochId;
+        uint256 netRevenue;
+        uint256 originalNetRevenue;
+        uint256 cupPurchased;
+        uint256 cupSold;
+        uint256 averagePurchasePrice;
+        uint256 averageSalePrice;
+        bool isSettled;
+        uint256 totalSupplyAtClose;
+    }
+
+    /**
+     * @notice Calculates xCUP price per share based on previous epoch data (public wrapper)
+     * @dev Price is calculated as: originalNetRevenue / totalSupplyAtClose
+     * @param netRevenue Net revenue earned during previous epoch (USDC, 6 decimals)
+     * @param totalSupplyAtClose Total xCUP supply at epoch closure (xCUP shares, 6 decimals)
+     * @return pricePerShare The price per xCUP share in USDC (6 decimals)
+     */
+    function calculateXcupPriceFromEpochPublic(
+        uint256 netRevenue,
+        uint256 totalSupplyAtClose
+    ) external pure returns (uint256 pricePerShare) {
+        return calculateXcupPriceFromEpoch(netRevenue, totalSupplyAtClose);
+    }
+
+    /**
+     * @notice Gets previous epoch ID from current epoch ID (public wrapper for external calls)
+     * @param currentEpochId Current epoch ID
+     * @return previousEpochId Previous epoch ID, or 0 if current epoch is 0
+     */
+    function getPreviousEpochId(uint256 currentEpochId) external pure returns (uint256 previousEpochId) {
+        return _getPreviousEpochId(currentEpochId);
+    }
+
+    /**
+     * @notice Validates that previous epoch exists and is settled
+     * @param settlementEngine Address of SettlementEngine contract
+     * @param previousEpochId Previous epoch ID to validate
+     */
+    function validatePreviousEpoch(address settlementEngine, uint256 previousEpochId) external view {
+        // Call SettlementEngine.getEpochRevenue(previousEpochId)
+        (bool success, bytes memory data) = settlementEngine.staticcall(
+            abi.encodeWithSignature("getEpochRevenue(uint256)", previousEpochId)
+        );
+        require(success, "Failed to get epoch revenue");
+
+        // Decode the struct
+        EpochRevenue memory epochRevenue = abi.decode(data, (EpochRevenue));
+
+        // Validate epoch data
+        require(epochRevenue.epochId == previousEpochId, "Epoch not found");
+        require(epochRevenue.isSettled, "Epoch not settled");
+        require(epochRevenue.totalSupplyAtClose > 0, "Invalid total supply at close");
+    }
+
+    /**
+     * @notice Calculates xCUP price from previous epoch using SettlementEngine (public wrapper)
+     * @dev Calls SettlementEngine to get epoch data and calculates price
+     *      Formula: pricePerShare = originalNetRevenue / totalSupplyAtClose
+     * @param settlementEngine Address of SettlementEngine contract
+     * @param previousEpochId Previous epoch ID
+     * @return pricePerShare The price per xCUP share in USDC (6 decimals)
+     */
+    function calculateXcupPriceFromPreviousEpoch(
+        address settlementEngine,
+        uint256 previousEpochId
+    ) external view returns (uint256 pricePerShare) {
+        return _calculateXcupPriceFromPreviousEpoch(settlementEngine, previousEpochId);
     }
 }

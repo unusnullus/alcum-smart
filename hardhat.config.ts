@@ -4,6 +4,7 @@ import "@openzeppelin/hardhat-upgrades";
 import "@nomicfoundation/hardhat-chai-matchers";
 import "hardhat-contract-sizer";
 import "@nomicfoundation/hardhat-foundry";
+import "@nomicfoundation/hardhat-verify";
 
 import * as dotenv from "dotenv";
 require("solidity-coverage");
@@ -12,48 +13,93 @@ dotenv.config();
 
 const RPC_URL = process.env.RPC_URL;
 const PRIVATE_KEY = process.env.PRIVATE_KEY || "";
-const COINMARKETCAP_API_KEY = process.env.COINMARKETCAP_API_KEY
+const COINMARKETCAP_API_KEY = process.env.COINMARKETCAP_API_KEY;
 
 const config: HardhatUserConfig = {
-  solidity: {
-    version: '0.8.24',
-    settings: {
-      optimizer: {
+    solidity: {
+        version: "0.8.24",
+        settings: {
+            viaIR: true,
+            optimizer: {
+                enabled: true,
+                runs: 100,
+            },
+            evmVersion: "paris",
+            metadata: {
+                bytecodeHash: "none",
+            },
+        },
+    },
+    defaultNetwork: "hardhat",
+    networks: {
+        mainnet: {
+            url: RPC_URL,
+            accounts: [PRIVATE_KEY],
+            chainId: 1,
+        },
+        sepolia: {
+            url: RPC_URL || process.env.SEPOLIA_RPC_URL || "",
+            accounts: PRIVATE_KEY ? [PRIVATE_KEY] : [],
+            timeout: 200000000,
+            chainId: 11155111,
+        },
+        testnet: {
+            url: RPC_URL,
+            accounts: [PRIVATE_KEY],
+            timeout: 200000000,
+            chainId: 11155111,
+        },
+        hardhat: {
+            blockGasLimit: 9999999999999,
+            gas: 30000000,
+            forking: {
+                url: process.env.RPC_URL || "",
+            },
+            accounts: [
+                {
+                    privateKey: PRIVATE_KEY,
+                    balance: "1000000000000000000000",
+                },
+            ],
+        },
+    },
+    gasReporter: {
         enabled: true,
-        runs: 100,
-      },
+        currency: "USD",
+        coinmarketcap: COINMARKETCAP_API_KEY,
     },
-  },
-  defaultNetwork: "hardhat",
-  networks: {
-    mainnet: {
-      url: RPC_URL,
-      accounts: [PRIVATE_KEY],
+    etherscan: {
+        apiKey: process.env.ETHERSCAN_API_KEY!,
+        customChains: [
+            {
+                network: "sepolia",
+                chainId: 11155111,
+                urls: {
+                    apiURL: "https://api-sepolia.etherscan.io/api",
+                    browserURL: "https://sepolia.etherscan.io",
+                },
+            },
+            {
+                network: "testnet",
+                chainId: 11155111,
+                urls: {
+                    apiURL: "https://api.etherscan.io/v2/api?chainid=11155111",
+                    browserURL: "https://sepolia.etherscan.io",
+                },
+            },
+            {
+                network: "mainnet",
+                chainId: 1,
+                urls: {
+                    apiURL: "https://api.etherscan.io/v2/api?chainid=1",
+                    browserURL: "https://etherscan.io",
+                },
+            },
+        ],
     },
-    testnet: {
-      url: RPC_URL,
-      accounts: [PRIVATE_KEY],
-      timeout: 200000000,
+    mocha: {
+        timeout: 100000000,
     },
-    hardhat: {
-      blockGasLimit: 9999999999999,
-      gas: 30000000,
-      forking: {
-        url: process.env.RPC_URL || "",
-      },
-    },
-  },
-  gasReporter: {
-    enabled: true,
-    currency: "USD",
-    coinmarketcap: COINMARKETCAP_API_KEY,
-  },
-  etherscan: {
-    apiKey: process.env.ETHERSCAN_KEY,
-  },
-  mocha: {
-    timeout: 100000000,
-  },
 };
 
 export default config;
