@@ -15,6 +15,9 @@ contract TestContract {
     bytes32[] public pendingDepositIds;
     mapping(address => bytes32[]) public userDeposits;
 
+    /// @dev Fixed oracle price (8 decimals) for unit tests — matches MockCopperPriceConsumer default
+    uint256 public constant MOCK_COPPER_PRICE = 450000000;
+
     function recordDeposit(bytes32 depositId, uint256 amount, address user) external {
         DepositLib.recordDeposit(deposits, pendingDepositIds, userDeposits, depositId, amount, user);
     }
@@ -49,7 +52,8 @@ contract TestContract {
     }
 
     function approveDeposit(bytes32 depositId, uint256 approvedAmount) external {
-        DepositLib.approveDeposit(deposits, depositId, approvedAmount);
+        uint256 cup = (approvedAmount * (10 ** 8)) / MOCK_COPPER_PRICE;
+        DepositLib.approveDeposit(deposits, depositId, approvedAmount, MOCK_COPPER_PRICE, cup);
     }
 
     function approveExternalDepositWithPrice(bytes32 depositId, uint256 approvedUsdc, uint256 price) external {
@@ -61,11 +65,11 @@ contract TestContract {
     }
 
     function approveDepositsProportionally(uint256 targetTotalAmount) external {
-        DepositLib.approveDepositsProportionally(deposits, pendingDepositIds, targetTotalAmount);
+        DepositLib.approveDepositsProportionally(deposits, pendingDepositIds, targetTotalAmount, MOCK_COPPER_PRICE);
     }
 
-    function approveAllDeposits() external returns (uint256 totalApproved, uint256 depositsApproved) {
-        return DepositLib.approveAllDeposits(deposits, pendingDepositIds);
+    function approveAllDeposits() external returns (uint256 totalApproved, uint256 depositsApproved, uint256 totalCupAmount) {
+        return DepositLib.approveAllDeposits(deposits, pendingDepositIds, MOCK_COPPER_PRICE);
     }
 
     function getDeposit(bytes32 depositId) external view returns (DepositLib.Deposit memory) {
@@ -254,6 +258,17 @@ contract DepositLibTest is Test {
         DepositLib.Deposit memory deposit = testContract.getDeposit(depositId);
         assertTrue(deposit.approved);
         assertEq(deposit.approvedAmount, approvedAmount);
+        assertEq(deposit.priceSnapshot, testContract.MOCK_COPPER_PRICE());
+        assertEq(deposit.approvedCupAmount, (approvedAmount * (10 ** 8)) / testContract.MOCK_COPPER_PRICE());
+    }
+
+    function testApproveDepositExternalRequiresDedicatedApproval() public {
+        uint256 amount = 1000 * 10 ** 6;
+        bytes32 tag = keccak256("tag1");
+        bytes32 depositId = testContract.recordExternalDeposit(amount, beneficiary1, tag);
+
+        vm.expectRevert(DepositLib.ExternalDepositRequiresPriceApproval.selector);
+        testContract.approveDeposit(depositId, amount);
     }
 
     function testApproveDepositNotFound() public {
@@ -430,7 +445,7 @@ contract DepositLibTest is Test {
         testContract.recordDeposit(depositId2, 2000 * 10 ** 6, user2);
         testContract.recordDeposit(depositId3, 3000 * 10 ** 6, user3);
 
-        (uint256 totalApproved, uint256 depositsApproved) = testContract.approveAllDeposits();
+        (uint256 totalApproved, uint256 depositsApproved, ) = testContract.approveAllDeposits();
 
         assertEq(totalApproved, 6000 * 10 ** 6);
         assertEq(depositsApproved, 3);
@@ -464,7 +479,7 @@ contract DepositLibTest is Test {
         testContract.approveDeposit(depositId1, 1000 * 10 ** 6);
 
         // Approve all should only approve the second one
-        (uint256 totalApproved, uint256 depositsApproved) = testContract.approveAllDeposits();
+        (uint256 totalApproved, uint256 depositsApproved, ) = testContract.approveAllDeposits();
 
         assertEq(totalApproved, 2000 * 10 ** 6);
         assertEq(depositsApproved, 1);

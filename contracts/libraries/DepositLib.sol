@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {IERC20Mintable} from "../interfaces/IERC20Mintable.sol";
+import {ITokenVesting} from "../interfaces/ITokenVesting.sol";
+
 /**
  * @title DepositLib
  * @notice External library for handling deposit operations in Zapper.
  * @dev Keeps Zapper bytecode small by moving deposit management logic here.
- *      Manages deposit lifecycle: creation, removal, approval, and decline.
+ *      Manages deposit lifecycle: creation, removal, approval, decline,
+ *      CUP minting, and governance-token vesting.
  */
 library DepositLib {
     // ───────────────────────────── STRUCTS ─────────────────────────────
@@ -22,8 +26,8 @@ library DepositLib {
         address claimedBy; // who executed the claim
         bool isExternal; // true if created via external adapter flow
         bytes32 tag; // integration tag/ID for marking
-        uint256 approvedCupAmount; // fixed CUP amount approved (for external)
-        uint256 priceSnapshot; // price used for approval (for external)
+        uint256 approvedCupAmount; // CUP amount fixed at approval (all deposit types)
+        uint256 priceSnapshot; // copper oracle price (8 decimals) locked at approval
     }
 
     // ───────────────────────────── EVENTS ─────────────────────────────
@@ -45,6 +49,8 @@ library DepositLib {
     error NoValidPendingDeposits();
     error TargetAmountExceedsTotal();
     error NotExternalDeposit();
+    /// @dev Regular approveDeposit cannot be used for host-to-host external deposits
+    error ExternalDepositRequiresPriceApproval();
 
     // ───────────────────────────── DEPOSIT MANAGEMENT ─────────────────────────────
 
@@ -211,16 +217,23 @@ library DepositLib {
      * @param deposits Mapping of deposit IDs to deposits
      * @param depositId The unique identifier of the deposit to approve
      * @param approvedAmount The amount to approve in USDC
+     * @param priceSnapshot Copper oracle price (8 decimals) locked at approval time
+     * @param approvedCupAmount CUP amount corresponding to this approval (computed off-chain or by caller)
      */
     function approveDeposit(
         mapping(bytes32 => Deposit) storage deposits,
         bytes32 depositId,
-        uint256 approvedAmount
+        uint256 approvedAmount,
+        uint256 priceSnapshot,
+        uint256 approvedCupAmount
     ) external {
         Deposit storage deposit = deposits[depositId];
 
         if (deposit.user == address(0)) {
             revert DepositNotFound();
+        }
+        if (deposit.isExternal) {
+            revert ExternalDepositRequiresPriceApproval();
         }
         if (deposit.approved) {
             revert DepositAlreadyApproved();
@@ -231,9 +244,14 @@ library DepositLib {
         if (approvedAmount > deposit.amount) {
             revert ApprovedAmountExceedsDeposit();
         }
+        if (priceSnapshot == 0 || approvedCupAmount == 0) {
+            revert InvalidApprovedAmount();
+        }
 
         deposit.approved = true;
         deposit.approvedAmount = approvedAmount;
+        deposit.priceSnapshot = priceSnapshot;
+        deposit.approvedCupAmount = approvedCupAmount;
 
         emit DepositApproved(depositId, approvedAmount);
     }
@@ -318,12 +336,18 @@ library DepositLib {
      * @param deposits Mapping of deposit IDs to deposits
      * @param pendingDepositIds Array of pending deposit IDs
      * @param targetTotalAmount The total USDC amount to approve across all deposits
+     * @param copperPrice Copper oracle price (8 decimals) locked for all approvals in this batch
+     * @return totalCupAmount Sum of CUP amounts allocated for all deposits approved in this call
      */
     function approveDepositsProportionally(
         mapping(bytes32 => Deposit) storage deposits,
         bytes32[] storage pendingDepositIds,
-        uint256 targetTotalAmount
-    ) external {
+        uint256 targetTotalAmount,
+        uint256 copperPrice
+    ) external returns (uint256 totalCupAmount) {
+        if (copperPrice == 0) {
+            revert InvalidApprovedAmount();
+        }
         if (targetTotalAmount == 0) {
             revert InvalidApprovedAmount();
         }
@@ -333,13 +357,11 @@ library DepositLib {
 
         // Calculate total pending deposits
         uint256 totalPendingAmount;
-        uint256 validDeposits;
 
         for (uint256 i = 0; i < pendingDepositIds.length; i++) {
             Deposit storage deposit = deposits[pendingDepositIds[i]];
-            if (deposit.user != address(0) && !deposit.approved) {
+            if (deposit.user != address(0) && !deposit.approved && !deposit.isExternal) {
                 totalPendingAmount += deposit.amount;
-                validDeposits++;
             }
         }
 
@@ -355,17 +377,22 @@ library DepositLib {
 
         bytes32 depositId;
         uint256 approvedAmount;
+        uint256 approvedCupAmount;
 
         // Approve deposits proportionally
         for (uint256 i = 0; i < pendingDepositIds.length; i++) {
             depositId = pendingDepositIds[i];
             Deposit storage deposit = deposits[depositId];
 
-            if (deposit.user != address(0) && !deposit.approved) {
+            if (deposit.user != address(0) && !deposit.approved && !deposit.isExternal) {
                 approvedAmount = (deposit.amount * proportion) / 1e18;
                 if (approvedAmount > 0) {
+                    approvedCupAmount = (approvedAmount * (10 ** 8)) / copperPrice;
                     deposit.approved = true;
                     deposit.approvedAmount = approvedAmount;
+                    deposit.priceSnapshot = copperPrice;
+                    deposit.approvedCupAmount = approvedCupAmount;
+                    totalCupAmount += approvedCupAmount;
                     emit DepositApproved(depositId, approvedAmount);
                 }
             }
@@ -378,28 +405,39 @@ library DepositLib {
      * @notice Approves all pending deposits in full
      * @param deposits Mapping of deposit IDs to deposits
      * @param pendingDepositIds Array of pending deposit IDs
+     * @param copperPrice Copper oracle price (8 decimals) locked for all approvals in this batch
      * @return totalApproved The total USDC amount approved across all deposits
      * @return depositsApproved The number of individual deposits that were approved
+     * @return totalCupAmount Sum of CUP amounts allocated for all deposits approved in this call
      */
     function approveAllDeposits(
         mapping(bytes32 => Deposit) storage deposits,
-        bytes32[] storage pendingDepositIds
-    ) external returns (uint256 totalApproved, uint256 depositsApproved) {
+        bytes32[] storage pendingDepositIds,
+        uint256 copperPrice
+    ) external returns (uint256 totalApproved, uint256 depositsApproved, uint256 totalCupAmount) {
+        if (copperPrice == 0) {
+            revert InvalidApprovedAmount();
+        }
         if (pendingDepositIds.length == 0) {
             revert NoPendingDeposits();
         }
 
         bytes32 depositId;
+        uint256 approvedCupAmount;
 
         // Approve all pending deposits in full
         for (uint256 i = 0; i < pendingDepositIds.length; i++) {
             depositId = pendingDepositIds[i];
             Deposit storage deposit = deposits[depositId];
 
-            if (deposit.user != address(0) && !deposit.approved) {
+            if (deposit.user != address(0) && !deposit.approved && !deposit.isExternal) {
+                approvedCupAmount = (deposit.amount * (10 ** 8)) / copperPrice;
                 deposit.approved = true;
                 deposit.approvedAmount = deposit.amount;
+                deposit.priceSnapshot = copperPrice;
+                deposit.approvedCupAmount = approvedCupAmount;
                 totalApproved += deposit.amount;
+                totalCupAmount += approvedCupAmount;
                 depositsApproved++;
 
                 emit DepositApproved(depositId, deposit.amount);
@@ -411,5 +449,66 @@ library DepositLib {
         }
 
         emit ProportionalApproval(totalApproved, totalApproved, 1e18); // 100% proportion
+    }
+
+    // ───────────────────────────── CUP MINTING ─────────────────────────────
+
+    /**
+     * @notice Mints CUP tokens to a recipient. No-op when amount is 0.
+     * @param cup CUP token (calling contract must hold MINTER_ROLE)
+     * @param recipient Address to receive minted tokens
+     * @param amount CUP amount to mint
+     */
+    function mintCupTokens(IERC20Mintable cup, address recipient, uint256 amount) external {
+        if (amount == 0) return;
+        try cup.mint(recipient, amount) {} catch {
+            revert("Failed to mint CUP tokens - check MINTER_ROLE");
+        }
+    }
+
+    // ───────────────────────────── GOVERNANCE VESTING ─────────────────────────────
+
+    struct VestingParams {
+        IERC20Mintable governanceToken;
+        ITokenVesting tokenVesting;
+        bytes32 depositId;
+        address beneficiary;
+        uint256 shares;
+        uint256 ratioBps;
+        uint256 vestingCliff;
+        uint256 vestingDuration;
+        uint256 vestingSlicePeriod;
+        bool vestingRevocable;
+    }
+
+    event VestingCreatedForDeposit(
+        bytes32 indexed depositId,
+        address indexed beneficiary,
+        uint256 governanceTokenAmount
+    );
+
+    /**
+     * @notice Mints governance tokens and creates a vesting schedule.
+     * @dev Normalises xCUP shares (6 dec) to governance units (18 dec):
+     *      governanceAmount = shares * ratioBps * 1e12 / 10 000.
+     * @param p Packed vesting parameters (avoids stack-too-deep at the call site)
+     */
+    function createGovernanceVesting(VestingParams memory p) external {
+        uint256 governanceAmount = (p.shares * p.ratioBps * 1e12) / 10000;
+        require(governanceAmount > 0, "Governance vesting amount is 0");
+
+        p.governanceToken.mint(address(p.tokenVesting), governanceAmount);
+
+        p.tokenVesting.createVestingSchedule(
+            p.beneficiary,
+            block.timestamp,
+            p.vestingCliff,
+            p.vestingDuration,
+            p.vestingSlicePeriod,
+            p.vestingRevocable,
+            governanceAmount
+        );
+
+        emit VestingCreatedForDeposit(p.depositId, p.beneficiary, governanceAmount);
     }
 }

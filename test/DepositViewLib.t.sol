@@ -14,6 +14,8 @@ contract TestContract {
     bytes32[] public pendingDepositIds;
     mapping(address => bytes32[]) public userDeposits;
 
+    uint256 public constant MOCK_COPPER_PRICE = 450000000;
+
     function recordDeposit(bytes32 depositId, uint256 amount, address user) external {
         DepositLib.recordDeposit(deposits, pendingDepositIds, userDeposits, depositId, amount, user);
     }
@@ -36,7 +38,8 @@ contract TestContract {
     }
 
     function approveDeposit(bytes32 depositId, uint256 approvedAmount) external {
-        DepositLib.approveDeposit(deposits, depositId, approvedAmount);
+        uint256 cup = (approvedAmount * (10 ** 8)) / MOCK_COPPER_PRICE;
+        DepositLib.approveDeposit(deposits, depositId, approvedAmount, MOCK_COPPER_PRICE, cup);
     }
 
     function getDeposit(bytes32 depositId) external view returns (DepositLib.Deposit memory) {

@@ -19,13 +19,13 @@ import {IUniswapV2Router02} from "@uniswap/v2-periphery/contracts/interfaces/IUn
 import {ICopperPriceConsumer} from "./interfaces/ICopperPriceConsumer.sol";
 import {IEpochManager} from "./interfaces/IEpochManager.sol";
 import {IERC20Mintable} from "./interfaces/IERC20Mintable.sol";
+import {ITokenVesting} from "./interfaces/ITokenVesting.sol";
 import {Silo} from "./Silo.sol";
 
 import {DepositLib} from "./libraries/DepositLib.sol";
 import {SwapLib} from "./libraries/SwapLib.sol";
 import {DepositViewLib} from "./libraries/DepositViewLib.sol";
 import {PermitLib} from "./libraries/PermitLib.sol";
-
 /**
  * @title Zapper
  * @notice A DeFi protocol contract that allows users to zap various tokens into the xCUP vault
@@ -97,8 +97,30 @@ contract Zapper is
     /// @dev Ensures unique deposit IDs for each user (used for receive/fallback and external deposits)
     mapping(address => uint256) private _userNonces;
 
+    /// @notice TokenVesting contract for automatic governance token vesting on deposit claims
+    ITokenVesting private _tokenVesting;
+
+    /// @notice Governance token (ERC20Votes) to be vested upon deposit claim
+    IERC20Mintable private _governanceToken;
+
+    /// @notice Cliff duration in seconds for auto-created vesting schedules
+    uint256 private _vestingCliff;
+
+    /// @notice Total vesting duration in seconds for auto-created vesting schedules
+    uint256 private _vestingDuration;
+
+    /// @notice Slice period in seconds for vesting release granularity
+    uint256 private _vestingSlicePeriod;
+
+    /// @notice Whether auto-created vesting schedules are revocable by the vesting owner
+    bool private _vestingRevocable;
+
+    /// @notice Ratio (in basis points) of governance tokens to xCUP shares. 10000 = 1:1.
+    uint256 private _vestingRatioBps;
+
     // Reserve storage gap for future upgrades (to avoid storage collisions)
-    uint256[45] private __gap;
+    // Reduced from 45 to 38 after adding 7 vesting-related storage slots
+    uint256[38] private __gap;
 
     /**
      * @notice Emitted when a user claims their approved deposit and receives vault shares
@@ -173,6 +195,14 @@ contract Zapper is
      */
     event ZapAndDeposit(address indexed router, address indexed tokenIn, uint256 amount);
 
+    /**
+     * @notice Emitted when the Silo contract is migrated to a new instance
+     * @param oldSilo The address of the previous Silo contract
+     * @param newSilo The address of the newly deployed Silo contract
+     * @param migratedAmount The amount of USDC transferred from old to new Silo
+     */
+    event SiloMigrated(address indexed oldSilo, address indexed newSilo, uint256 migratedAmount);
+
     /// @dev Emitted when an external deposit is registered (no token movement)
     event ExternalDepositRegistered(
         address indexed createdBy,
@@ -180,6 +210,38 @@ contract Zapper is
         bytes32 indexed depositId,
         bytes32 tag,
         uint256 usdcAmount
+    );
+
+    /**
+     * @notice Emitted when a governance token vesting schedule is created for a deposit claim
+     * @param depositId The unique identifier of the claimed deposit
+     * @param beneficiary The address receiving the vesting schedule
+     * @param governanceTokenAmount The amount of governance tokens vested
+     */
+    event VestingCreatedForDeposit(
+        bytes32 indexed depositId,
+        address indexed beneficiary,
+        uint256 governanceTokenAmount
+    );
+
+    /**
+     * @notice Emitted when the vesting configuration is updated
+     * @param tokenVesting The address of the TokenVesting contract
+     * @param governanceToken The address of the governance token
+     * @param vestingCliff Cliff duration in seconds
+     * @param vestingDuration Total vesting duration in seconds
+     * @param vestingSlicePeriod Slice period in seconds
+     * @param vestingRevocable Whether vestings are revocable
+     * @param vestingRatioBps Ratio of governance tokens to xCUP shares (10000 = 1:1)
+     */
+    event VestingConfigUpdated(
+        address indexed tokenVesting,
+        address indexed governanceToken,
+        uint256 vestingCliff,
+        uint256 vestingDuration,
+        uint256 vestingSlicePeriod,
+        bool vestingRevocable,
+        uint256 vestingRatioBps
     );
 
     /**
@@ -564,7 +626,11 @@ contract Zapper is
         bytes32 depositId,
         uint256 approvedAmount
     ) external whenNotPaused whenEpochActive onlyRole(VAULT_CURATOR_ROLE) {
-        DepositLib.approveDeposit(_approvedDeposits, depositId, approvedAmount);
+        uint256 price = getCopperPrice();
+        require(price > 0, "Copper price is 0");
+        uint256 approvedCupAmount = (approvedAmount * 1e8) / price;
+        DepositLib.approveDeposit(_approvedDeposits, depositId, approvedAmount, price, approvedCupAmount);
+        DepositLib.mintCupTokens(IERC20Mintable(address(_cup)), address(this), approvedCupAmount);
     }
 
     /**
@@ -583,6 +649,8 @@ contract Zapper is
         uint256 price
     ) external whenNotPaused whenEpochActive onlyRole(VAULT_CURATOR_ROLE) {
         DepositLib.approveExternalDepositWithPrice(_approvedDeposits, depositId, approvedUsdc, price);
+        uint256 cupAmount = _approvedDeposits[depositId].approvedCupAmount;
+        DepositLib.mintCupTokens(IERC20Mintable(address(_cup)), address(this), cupAmount);
     }
 
     /**
@@ -619,7 +687,15 @@ contract Zapper is
     function approveDepositsProportionally(
         uint256 targetTotalAmount
     ) external whenNotPaused whenEpochActive onlyRole(VAULT_CURATOR_ROLE) {
-        DepositLib.approveDepositsProportionally(_approvedDeposits, _pendingDepositIds, targetTotalAmount);
+        uint256 price = getCopperPrice();
+        require(price > 0, "Copper price is 0");
+        uint256 totalCup = DepositLib.approveDepositsProportionally(
+            _approvedDeposits,
+            _pendingDepositIds,
+            targetTotalAmount,
+            price
+        );
+        DepositLib.mintCupTokens(IERC20Mintable(address(_cup)), address(this), totalCup);
     }
 
     /**
@@ -638,7 +714,15 @@ contract Zapper is
         onlyRole(VAULT_CURATOR_ROLE)
         returns (uint256 totalApproved, uint256 depositsApproved)
     {
-        return DepositLib.approveAllDeposits(_approvedDeposits, _pendingDepositIds);
+        uint256 price = getCopperPrice();
+        require(price > 0, "Copper price is 0");
+        uint256 totalCup;
+        (totalApproved, depositsApproved, totalCup) = DepositLib.approveAllDeposits(
+            _approvedDeposits,
+            _pendingDepositIds,
+            price
+        );
+        DepositLib.mintCupTokens(IERC20Mintable(address(_cup)), address(this), totalCup);
     }
 
     /**
@@ -669,37 +753,39 @@ contract Zapper is
         // Mark who claimed the deposit before potential deletion
         deposit.claimedBy = _msgSender();
 
-        // Determine CUP amount to deposit and get shares
+        // CUP is minted at approval time; use the fixed amount.
+        // Legacy: deposits approved before the mint-at-approve upgrade have no snapshot — compute from oracle.
         uint256 cupValue;
-        if (isExternal) {
-            // For external deposits, use pre-approved CUP amount and price snapshot
-            require(deposit.approvedCupAmount > 0 && deposit.priceSnapshot > 0, "No snapshot");
+        if (deposit.approvedCupAmount > 0 && deposit.priceSnapshot > 0) {
             cupValue = deposit.approvedCupAmount;
         } else {
-            // For regular deposits, convert approved USDC amount to CUP value using current copper price
             uint256 currentCopperPrice = getCopperPrice();
             require(currentCopperPrice > 0, "Copper price is 0");
-            cupValue = (approvedAmount * (10 ** 8)) / currentCopperPrice;
-        }
-
-        uint256 currentCupBalance = _cup.balanceOf(address(this));
-        if (currentCupBalance < cupValue) {
-            // Mint the missing CUP tokens
-            uint256 missingAmount = cupValue - currentCupBalance;
-
-            // Cast to IERC20Mintable to access mint function
-            // This requires the contract to have MINTER_ROLE on CUP token
-            try IERC20Mintable(address(_cup)).mint(address(this), missingAmount) {
-                // Minting successful
-            } catch {
-                revert("Failed to mint CUP tokens - check MINTER_ROLE");
-            }
+            cupValue = (approvedAmount * 1e8) / currentCopperPrice;
         }
 
         // Deposit CUP to vault and get xCUP shares
         _cup.approve(address(_vault), cupValue);
         address sharesRecipient = isExternal ? beneficiary_ : _msgSender();
         shares = _vault.deposit(cupValue, sharesRecipient);
+
+        // Auto-create governance token vesting schedule
+        if (address(_tokenVesting) != address(0) && address(_governanceToken) != address(0) && _vestingDuration > 0) {
+            DepositLib.createGovernanceVesting(
+                DepositLib.VestingParams({
+                    governanceToken: _governanceToken,
+                    tokenVesting: _tokenVesting,
+                    depositId: depositId,
+                    beneficiary: sharesRecipient,
+                    shares: shares,
+                    ratioBps: _vestingRatioBps,
+                    vestingCliff: _vestingCliff,
+                    vestingDuration: _vestingDuration,
+                    vestingSlicePeriod: _vestingSlicePeriod,
+                    vestingRevocable: _vestingRevocable
+                })
+            );
+        }
 
         // Emit appropriate events
         emit DepositClaimed(depositId, sharesRecipient, shares);
@@ -718,6 +804,8 @@ contract Zapper is
             deposit.amount = deposit.amount - approvedAmount;
             deposit.approvedAmount = 0;
             deposit.approved = false;
+            deposit.approvedCupAmount = 0;
+            deposit.priceSnapshot = 0;
         }
     }
 
@@ -754,6 +842,88 @@ contract Zapper is
                 // processed in next iterations since we re-check bounds.
             }
         }
+    }
+
+    /**
+     * @notice Configures the automatic governance token vesting for deposit claims
+     * @dev Sets all parameters for auto-vesting. Pass tokenVesting_ = address(0) to disable.
+     *      The Zapper must have MINTER_ROLE on the governance token and vestingCreator role
+     *      on the TokenVesting contract for auto-vesting to work.
+     *
+     * @param tokenVesting_ The address of the TokenVesting contract (address(0) to disable)
+     * @param governanceToken_ The address of the governance token to be vested
+     * @param vestingCliff_ Cliff duration in seconds before tokens start vesting
+     * @param vestingDuration_ Total vesting duration in seconds (must be >= cliff)
+     * @param vestingSlicePeriod_ Release granularity in seconds (e.g. 1 day = 86400)
+     * @param vestingRevocable_ Whether the owner can revoke auto-created vestings
+     * @param vestingRatioBps_ Ratio of governance tokens to xCUP shares in basis points (10000 = 1:1)
+     */
+    function setVestingConfig(
+        address tokenVesting_,
+        address governanceToken_,
+        uint256 vestingCliff_,
+        uint256 vestingDuration_,
+        uint256 vestingSlicePeriod_,
+        bool vestingRevocable_,
+        uint256 vestingRatioBps_
+    ) external onlyRole(VAULT_CURATOR_ROLE) {
+        if (tokenVesting_ != address(0)) {
+            require(governanceToken_ != address(0), "Governance token required when vesting enabled");
+            require(vestingDuration_ > 0, "Vesting duration must be > 0");
+            require(vestingSlicePeriod_ >= 1, "Slice period must be >= 1");
+            require(vestingDuration_ >= vestingCliff_, "Duration must be >= cliff");
+            require(vestingRatioBps_ > 0, "Ratio must be > 0");
+        }
+
+        _tokenVesting = ITokenVesting(tokenVesting_);
+        _governanceToken = IERC20Mintable(governanceToken_);
+        _vestingCliff = vestingCliff_;
+        _vestingDuration = vestingDuration_;
+        _vestingSlicePeriod = vestingSlicePeriod_;
+        _vestingRevocable = vestingRevocable_;
+        _vestingRatioBps = vestingRatioBps_;
+
+        emit VestingConfigUpdated(
+            tokenVesting_,
+            governanceToken_,
+            vestingCliff_,
+            vestingDuration_,
+            vestingSlicePeriod_,
+            vestingRevocable_,
+            vestingRatioBps_
+        );
+    }
+
+    /**
+     * @notice Returns the current governance vesting configuration
+     * @return tokenVesting The address of the TokenVesting contract
+     * @return governanceToken The address of the governance token
+     * @return vestingCliff Cliff duration in seconds
+     * @return vestingDuration Total vesting duration in seconds
+     * @return vestingSlicePeriod Slice period in seconds
+     * @return vestingRevocable Whether vestings are revocable
+     * @return vestingRatioBps Ratio of governance tokens to xCUP shares (10000 = 1:1)
+     */
+    function getVestingConfig()
+        external
+        view
+        returns (
+            address tokenVesting,
+            address governanceToken,
+            uint256 vestingCliff,
+            uint256 vestingDuration,
+            uint256 vestingSlicePeriod,
+            bool vestingRevocable,
+            uint256 vestingRatioBps
+        )
+    {
+        tokenVesting = address(_tokenVesting);
+        governanceToken = address(_governanceToken);
+        vestingCliff = _vestingCliff;
+        vestingDuration = _vestingDuration;
+        vestingSlicePeriod = _vestingSlicePeriod;
+        vestingRevocable = _vestingRevocable;
+        vestingRatioBps = _vestingRatioBps;
     }
 
     /**
@@ -843,6 +1013,34 @@ contract Zapper is
      */
     function getTotalPendingAmount() external view returns (uint256) {
         return DepositViewLib.getTotalPendingAmount(_approvedDeposits, _pendingDepositIds);
+    }
+
+    /**
+     * @notice Migrates USDC from the current Silo to a newly deployed Silo
+     * @dev Deploys a new Silo contract (which auto-approves this contract for unlimited USDC),
+     *      transfers all USDC from the old Silo to the new one, and updates the internal reference.
+     *      Must be called while the contract is paused to prevent deposit/withdraw race conditions.
+     *      Only callable by the contract owner.
+     *
+     *      Migration flow:
+     *      1. Snapshot old Silo address and USDC balance
+     *      2. Deploy new Silo (constructor grants unlimited USDC approval to this contract)
+     *      3. Pull all USDC from old Silo to this contract (using existing approval)
+     *      4. Push all USDC from this contract to new Silo
+     *      5. Update _silo reference and emit event
+     */
+    function migrateSilo() external onlyOwner nonReentrant whenPaused {
+        Silo oldSilo = _silo;
+        uint256 balance = _usdc.balanceOf(address(oldSilo));
+
+        _silo = new Silo(_usdc);
+
+        if (balance > 0) {
+            _usdc.safeTransferFrom(address(oldSilo), address(this), balance);
+            _usdc.safeTransfer(address(_silo), balance);
+        }
+
+        emit SiloMigrated(address(oldSilo), address(_silo), balance);
     }
 
     /**

@@ -64,6 +64,7 @@ contract AlcumGovernor is
         uint256 voteEnd;
         uint256 eta;
         ProposalState state;
+        string description;
     }
 
     /// @notice Structure for vote receipt information
@@ -88,8 +89,23 @@ contract AlcumGovernor is
     /// @notice Mapping from (proposalId, voter) to vote support (0 = Against, 1 = For, 2 = Abstain)
     mapping(uint256 => mapping(address => uint8)) private _voteSupport;
 
+    /// @notice Mapping from proposal ID to full description text
+    mapping(uint256 => string) private _proposalDescriptions;
+
+    /// @notice Mapping from proposal ID to target addresses
+    mapping(uint256 => address[]) private _proposalTargets;
+
+    /// @notice Mapping from proposal ID to ETH values
+    mapping(uint256 => uint256[]) private _proposalValues;
+
+    /// @notice Mapping from proposal ID to calldatas
+    mapping(uint256 => bytes[]) private _proposalCalldatas;
+
+    /// @notice Emitted when the proposal threshold is updated by the owner
+    event ProposalThresholdUpdatedByOwner(uint256 oldThreshold, uint256 newThreshold);
+
     /// @notice Reserve storage gap for future upgrades
-    uint256[50] private __gap;
+    uint256[46] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -202,11 +218,14 @@ contract AlcumGovernor is
         bytes32 descriptionHash = keccak256(bytes(description));
         uint256 proposalId = super.propose(targets, values, calldatas, description);
 
-        // Track proposal ID and metadata
         _proposalIndex[proposalId] = _proposalIds.length;
         _proposalIds.push(proposalId);
         _proposalProposers[proposalId] = msg.sender;
         _proposalDescriptionHashes[proposalId] = descriptionHash;
+        _proposalDescriptions[proposalId] = description;
+        _proposalTargets[proposalId] = targets;
+        _proposalValues[proposalId] = values;
+        _proposalCalldatas[proposalId] = calldatas;
 
         return proposalId;
     }
@@ -413,12 +432,10 @@ contract AlcumGovernor is
         info.voteStart = proposalSnapshot(proposalId);
         info.voteEnd = proposalDeadline(proposalId);
         info.state = state(proposalId);
+        info.description = _proposalDescriptions[proposalId];
 
-        // Get ETA from Timelock if proposal is queued
         if (info.state == ProposalState.Queued) {
             bytes32 descriptionHash = _proposalDescriptionHashes[proposalId];
-            // Calculate timelock operation ID
-            // Timelock uses a hash of proposalId and descriptionHash as the operation ID
             bytes32 timelockId = keccak256(abi.encode(proposalId, descriptionHash));
             TimelockController timelockContract = TimelockController(payable(timelock()));
             info.eta = timelockContract.getTimestamp(timelockId);
@@ -428,10 +445,42 @@ contract AlcumGovernor is
     }
 
     /**
+     * @notice Returns the execution actions of a proposal
+     * @param proposalId The unique identifier of the proposal
+     * @return targets The addresses of contracts to call
+     * @return values The amounts of ETH to send with each call
+     * @return calldatas The calldata for each call
+     */
+    function getProposalActions(
+        uint256 proposalId
+    )
+        external
+        view
+        returns (address[] memory targets, uint256[] memory values, bytes[] memory calldatas)
+    {
+        targets = _proposalTargets[proposalId];
+        values = _proposalValues[proposalId];
+        calldatas = _proposalCalldatas[proposalId];
+    }
+
+    /**
      * @notice Returns the total number of proposals
      * @return The total count of proposals
      */
     function proposalCount() external view returns (uint256) {
         return _proposalIds.length;
+    }
+
+    /**
+     * @notice Allows the owner to update the proposal threshold
+     * @dev This is an emergency function to resolve chicken-and-egg situations
+     *      where no one can create proposals to change the threshold via governance.
+     *      Should be used sparingly; normal threshold changes should go through governance.
+     * @param newProposalThreshold The new proposal threshold value in token units
+     */
+    function setProposalThresholdByOwner(uint256 newProposalThreshold) external onlyOwner {
+        uint256 oldThreshold = proposalThreshold();
+        _setProposalThreshold(newProposalThreshold);
+        emit ProposalThresholdUpdatedByOwner(oldThreshold, newProposalThreshold);
     }
 }
