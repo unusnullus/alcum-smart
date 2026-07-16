@@ -118,9 +118,19 @@ contract Zapper is
     /// @notice Ratio (in basis points) of governance tokens to xCUP shares. 10000 = 1:1.
     uint256 private _vestingRatioBps;
 
+    /// @notice Allowlist of ERC20 tokens that may be used as `tokenIn` for zapAndDeposit
+    /// @dev Does NOT gate USDC (always allowed, direct-transfer path) or native ETH
+    ///      (address(0), no arbitrary contract code involved). Only applies to the
+    ///      "swap arbitrary ERC20 -> USDC via router" path, which is the path that can
+    ///      invoke attacker-controlled code (a malicious token's transferFrom/approve hooks).
+    mapping(address => bool) private _allowedTokens;
+
+    /// @notice Enumerable list of currently allowlisted tokens (for curator UIs / off-chain indexing)
+    address[] private _allowedTokensList;
+
     // Reserve storage gap for future upgrades (to avoid storage collisions)
-    // Reduced from 45 to 38 after adding 7 vesting-related storage slots
-    uint256[38] private __gap;
+    // Reduced from 38 to 36 after adding the token allowlist (mapping + array = 2 slots)
+    uint256[36] private __gap;
 
     /**
      * @notice Emitted when a user claims their approved deposit and receives vault shares
@@ -194,6 +204,13 @@ contract Zapper is
      * @param amount The amount of tokens zapped and deposited (in USDC)
      */
     event ZapAndDeposit(address indexed router, address indexed tokenIn, uint256 amount);
+
+    /**
+     * @notice Emitted when a token's allowlist status for zapAndDeposit `tokenIn` changes
+     * @param token The ERC20 token address affected
+     * @param allowed Whether the token is now allowed (true) or disallowed (false)
+     */
+    event TokenAllowlistUpdated(address indexed token, bool allowed);
 
     /**
      * @notice Emitted when the Silo contract is migrated to a new instance
@@ -312,6 +329,21 @@ contract Zapper is
     }
 
     /**
+     * @notice One-time upgrade initializer that seeds the zap token allowlist
+     * @dev Uses `reinitializer(2)` so it can only ever be called once, immediately
+     *      after upgrading an already-initialized proxy to this implementation.
+     *      Safe to pass an empty array (e.g. if the allowlist should start empty and
+     *      be populated later via setTokenAllowed/setTokensAllowed).
+     *
+     * @param initialAllowedTokens Tokens to seed into the allowlist on upgrade
+     */
+    function initializeTokenAllowlistV2(address[] calldata initialAllowedTokens) external reinitializer(2) {
+        for (uint256 i = 0; i < initialAllowedTokens.length; i++) {
+            _setTokenAllowed(initialAllowedTokens[i], true);
+        }
+    }
+
+    /**
      * @notice Records a new deposit in the system with comprehensive tracking
      * @dev Creates a new Deposit struct and adds it to all relevant tracking mappings.
      *      This function is the core deposit registration mechanism for regular user deposits.
@@ -419,8 +451,81 @@ contract Zapper is
             tokenIn.safeTransferFrom(_msgSender(), address(_silo), amount);
             depositValue = amount;
         } else {
+            // Native ETH (address(0)) never runs arbitrary token contract code, so it
+            // is not subject to the allowlist. Any other ERC20 must be curator-approved
+            // before it can be swapped via the router (see TokenAllowlistUpdated).
+            if (address(tokenIn) != address(0)) {
+                require(_allowedTokens[address(tokenIn)], "Token not allowlisted");
+            }
             depositValue = _zapIn(tokenIn, amount, slippageBps);
         }
+    }
+
+    /**
+     * @notice Internal helper to add/remove a token from the zap allowlist
+     * @dev No-op if the token is already in the requested state (keeps the list clean
+     *      and avoids duplicate entries / redundant events)
+     */
+    function _setTokenAllowed(address token, bool allowed) internal {
+        require(token != address(0), "Invalid token");
+        require(token != address(_usdc), "USDC is always allowed");
+
+        if (_allowedTokens[token] == allowed) return;
+        _allowedTokens[token] = allowed;
+
+        if (allowed) {
+            _allowedTokensList.push(token);
+        } else {
+            uint256 len = _allowedTokensList.length;
+            for (uint256 i = 0; i < len; i++) {
+                if (_allowedTokensList[i] == token) {
+                    _allowedTokensList[i] = _allowedTokensList[len - 1];
+                    _allowedTokensList.pop();
+                    break;
+                }
+            }
+        }
+
+        emit TokenAllowlistUpdated(token, allowed);
+    }
+
+    /**
+     * @notice Allows a vault curator to allow/disallow a single token for zapAndDeposit
+     * @dev USDC does not need to be (and cannot be) added — it always uses the direct
+     *      transfer path and is never subject to the allowlist.
+     * @param token The ERC20 token address to update
+     * @param allowed Whether the token should be allowed as `tokenIn`
+     */
+    function setTokenAllowed(address token, bool allowed) external onlyRole(VAULT_CURATOR_ROLE) {
+        _setTokenAllowed(token, allowed);
+    }
+
+    /**
+     * @notice Allows a vault curator to allow/disallow multiple tokens in one call
+     * @param tokens The ERC20 token addresses to update
+     * @param allowed Whether the tokens should be allowed as `tokenIn`
+     */
+    function setTokensAllowed(address[] calldata tokens, bool allowed) external onlyRole(VAULT_CURATOR_ROLE) {
+        for (uint256 i = 0; i < tokens.length; i++) {
+            _setTokenAllowed(tokens[i], allowed);
+        }
+    }
+
+    /**
+     * @notice Returns whether a token is currently allowed as `tokenIn` for zapAndDeposit
+     * @dev USDC is always implicitly allowed (direct-transfer path) even though it is
+     *      never added to `_allowedTokens`.
+     */
+    function isTokenAllowed(address token) public view returns (bool) {
+        if (token == address(_usdc)) return true;
+        return _allowedTokens[token];
+    }
+
+    /**
+     * @notice Returns the full list of currently allowlisted (non-USDC) tokens
+     */
+    function getAllowedTokens() external view returns (address[] memory) {
+        return _allowedTokensList;
     }
 
     /**
@@ -441,7 +546,7 @@ contract Zapper is
         PermitLib.PermitParams calldata permitParams,
         bytes32 depositId,
         uint256 slippageBps
-    ) external payable whenNotPaused {
+    ) external payable whenNotPaused nonReentrant {
         // allow address(0) for ETH
         require(amount != 0, "Invalid amount");
 
@@ -481,7 +586,7 @@ contract Zapper is
         uint256 amount,
         bytes32 depositId,
         uint256 slippageBps
-    ) external payable whenNotPaused {
+    ) external payable whenNotPaused nonReentrant {
         // allow address(0) for ETH
         require(amount != 0, "Invalid amount");
 
@@ -1087,7 +1192,7 @@ contract Zapper is
      *      address and have it automatically processed as a deposit. It provides
      *      a convenient way to deposit ETH without calling specific functions.
      */
-    receive() external payable whenNotPaused {
+    receive() external payable whenNotPaused nonReentrant {
         require(msg.value > 0, "No ETH sent");
         uint256 depositValue = _processDeposit(IERC20(address(0)), msg.value, 100); // Default 1% slippage
 
@@ -1119,7 +1224,7 @@ contract Zapper is
      *      with data or when calling non-existent functions. It processes any ETH
      *      value as a deposit, similar to the receive function.
      */
-    fallback() external payable whenNotPaused {
+    fallback() external payable whenNotPaused nonReentrant {
         if (msg.value > 0) {
             uint256 depositValue = _processDeposit(IERC20(address(0)), msg.value, 100); // Default 1% slippage
 

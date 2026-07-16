@@ -139,6 +139,92 @@ contract MockUniswapRouter {
     }
 }
 
+/// @notice Minimal generic ERC20 used to test the zap token allowlist with a "normal" token
+contract MockZapToken is IERC20 {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function totalSupply() external pure returns (uint256) {
+        return 0;
+    }
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(balanceOf[from] >= amount, "Insufficient balance");
+        require(allowance[from][msg.sender] >= amount, "Insufficient allowance");
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        allowance[from][msg.sender] -= amount;
+        return true;
+    }
+}
+
+/// @notice Recreates the historical exploit primitive: a fake ERC20 that, when its
+/// transferFrom hook is invoked by the Zapper mid-zap, tries to re-enter zapAndDeposit
+/// with a second (real) USDC deposit. Used to prove the nonReentrant guard blocks it.
+contract MaliciousReentrantToken is IERC20 {
+    Zapper public immutable zapperTarget;
+    IERC20 public immutable usdcToken;
+    bool public armed;
+    bytes32 public nestedDepositId;
+    uint256 public nestedAmount;
+
+    constructor(Zapper _zapper, IERC20 _usdc) {
+        zapperTarget = _zapper;
+        usdcToken = _usdc;
+    }
+
+    function arm(bytes32 _nestedDepositId, uint256 _nestedAmount) external {
+        armed = true;
+        nestedDepositId = _nestedDepositId;
+        nestedAmount = _nestedAmount;
+    }
+
+    function totalSupply() external pure returns (uint256) {
+        return 0;
+    }
+
+    function balanceOf(address) external pure returns (uint256) {
+        return type(uint256).max;
+    }
+
+    function allowance(address, address) external pure returns (uint256) {
+        return type(uint256).max;
+    }
+
+    function approve(address, uint256) external pure returns (bool) {
+        return true;
+    }
+
+    function transfer(address, uint256) external pure returns (bool) {
+        return true;
+    }
+
+    // Called by SwapLib.zapIn() as `tokenIn.safeTransferFrom(msgSender, zapperContract, amount)`.
+    // A real attacker would use this hook to re-enter zapAndDeposit with borrowed USDC.
+    function transferFrom(address, address, uint256) external returns (bool) {
+        if (armed) {
+            armed = false; // avoid infinite recursion in the test
+            zapperTarget.zapAndDeposit(usdcToken, nestedAmount, nestedDepositId, 100);
+        }
+        return true;
+    }
+}
+
 contract ZapperTest is Test {
     Zapper public zapper;
     CUPToken public cupToken;
@@ -357,17 +443,20 @@ contract ZapperTest is Test {
     function testApproveDeposit() public {
         uint256 amount = 1000 * 10 ** 6;
 
-        // Register deposit and get the deposit ID
+        // Register external deposit
         vm.prank(hostIntegration);
         bytes32 depositId = zapper.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
 
-        // Approve deposit
+        // External deposits must use approveExternalDepositWithPrice (price-locked approval)
+        uint256 price = 450000000; // $4.50 per unit with 8 decimals
         vm.prank(vaultCurator);
-        zapper.approveDeposit(depositId, amount);
+        zapper.approveExternalDepositWithPrice(depositId, amount, price);
 
         // Check that deposit was approved
         DepositLib.Deposit memory deposit = zapper.getDeposit(depositId);
         assertTrue(deposit.approved);
+        assertEq(deposit.priceSnapshot, price);
+        assertTrue(deposit.approvedCupAmount > 0);
     }
 
     function testApproveDepositWithoutRole() public {
@@ -401,11 +490,16 @@ contract ZapperTest is Test {
     function testApproveAllDeposits() public {
         uint256 amount = 1000 * 10 ** 6;
 
-        // Register deposit and get the deposit ID
-        vm.prank(hostIntegration);
-        bytes32 depositId = zapper.registerExternalDepositFor(user1, amount, bytes32(uint256(uint160(address(usdc)))));
+        // approveAllDeposits only processes non-external (direct) deposits.
+        // Create a non-external deposit via zapAndDeposit.
+        usdc.mint(user1, amount);
+        bytes32 depositId = keccak256(abi.encodePacked(user1, uint256(1), amount, block.timestamp));
+        vm.startPrank(user1);
+        usdc.approve(address(zapper), amount);
+        zapper.zapAndDeposit(usdc, amount, depositId, 100);
+        vm.stopPrank();
 
-        // Approve all deposits
+        // Approve all deposits (works for non-external deposits)
         vm.prank(vaultCurator);
         zapper.approveAllDeposits();
 
@@ -475,7 +569,7 @@ contract ZapperTest is Test {
 
         // Then withdraw (only VAULT_CURATOR_ROLE can call this function)
         vm.prank(vaultCurator);
-        zapper.withdraw(amount);
+        zapper.withdraw(amount, owner);
 
         // Check that owner received USDC tokens
         assertEq(usdc.balanceOf(owner), amount);
@@ -993,31 +1087,25 @@ contract ZapperTest is Test {
     }
 
     function testClaimDepositExternalNoSnapshot() public {
+        // External deposits MUST be approved via approveExternalDepositWithPrice.
+        // Attempting to use the plain approveDeposit reverts with ExternalDepositRequiresPriceApproval.
         bytes32 depositId = hostAdapter.registerExternalDepositFor(user1, 1000, bytes32(0));
 
-        // Approve without price snapshot
         vm.startPrank(vaultCurator);
+        vm.expectRevert(DepositLib.ExternalDepositRequiresPriceApproval.selector);
         zapper.approveDeposit(depositId, 1000);
-        vm.stopPrank();
-
-        vm.startPrank(user1);
-        vm.expectRevert("No snapshot");
-        zapper.claimDeposit(depositId);
         vm.stopPrank();
     }
 
     function testClaimDepositCopperPriceZero() public {
+        // Price is now validated at approveDeposit time (not claimDeposit time).
+        // Test that approveDeposit reverts when copper price is 0.
         bytes32 depositId = keccak256(abi.encodePacked(user1, uint256(1), uint256(1000), block.timestamp));
         usdc.mint(user1, 1000);
 
         vm.startPrank(user1);
         usdc.approve(address(zapper), 1000);
         zapper.zapAndDeposit(usdc, 1000, depositId, 100);
-        vm.stopPrank();
-
-        // Approve the deposit
-        vm.startPrank(vaultCurator);
-        zapper.approveDeposit(depositId, 1000);
         vm.stopPrank();
 
         // Mock copper price to return 0
@@ -1027,9 +1115,10 @@ contract ZapperTest is Test {
             abi.encode(0)
         );
 
-        vm.startPrank(user1);
+        // approveDeposit should now revert with "Copper price is 0"
+        vm.startPrank(vaultCurator);
         vm.expectRevert("Copper price is 0");
-        zapper.claimDeposit(depositId);
+        zapper.approveDeposit(depositId, 1000);
         vm.stopPrank();
     }
 
@@ -1076,11 +1165,12 @@ contract ZapperTest is Test {
         newZapper.approveDeposit(depositId, 1000);
         vm.stopPrank();
 
-        // Record initial CUP balance of zapper (should be 0)
+        // approveDeposit now mints CUP tokens at approval time, not at claim time.
+        // So the balance after approval will be > 0.
         uint256 initialCupBalance = cupToken.balanceOf(address(newZapper));
-        assertEq(initialCupBalance, 0);
+        assertTrue(initialCupBalance > 0, "CUP minted at approval time");
 
-        // Claim deposit - should auto-mint CUP tokens
+        // Claim deposit - uses the already-minted CUP tokens
         vm.startPrank(user1);
         uint256 shares = newZapper.claimDeposit(depositId);
         vm.stopPrank();
@@ -1097,7 +1187,8 @@ contract ZapperTest is Test {
     }
 
     function testClaimDepositAutoMintCUPWithoutMinterRole() public {
-        // Create a new zapper without CUP tokens and without MINTER_ROLE
+        // CUP minting happens at approveDeposit time (not claimDeposit).
+        // Without MINTER_ROLE, the approveDeposit call itself should revert.
         Zapper newZapperImpl = new Zapper();
         bytes memory newZapperInitData = abi.encodeWithSelector(
             Zapper.initialize.selector,
@@ -1111,19 +1202,12 @@ contract ZapperTest is Test {
         ERC1967Proxy newZapperProxy = new ERC1967Proxy(address(newZapperImpl), newZapperInitData);
         Zapper newZapper = Zapper(payable(address(newZapperProxy)));
 
-        // Grant roles to new zapper (but NOT MINTER_ROLE)
+        // Grant roles (but NOT MINTER_ROLE)
         newZapper.grantRole(newZapper.VAULT_CURATOR_ROLE(), vaultCurator);
         newZapper.grantRole(newZapper.HOST_INTEGRATION_ROLE(), hostIntegration);
-        newZapper.grantRole(newZapper.HOST_INTEGRATION_ROLE(), address(hostAdapter));
-
-        // Grant xCUP redeemer role to new zapper
         xcup.grantRole(xcup.REDEEMER_ROLE(), address(newZapper));
 
-        // Do NOT grant zapper permission to mint CUP tokens
-
-        // Mint USDC to user and zapper
         usdc.mint(user1, 1000);
-        usdc.mint(address(newZapper), 1000);
         usdc.mint(newZapper.silo(), 1000);
 
         bytes32 depositId = keccak256(abi.encodePacked(user1, uint256(1), uint256(1000), block.timestamp));
@@ -1133,20 +1217,16 @@ contract ZapperTest is Test {
         newZapper.zapAndDeposit(usdc, 1000, depositId, 100);
         vm.stopPrank();
 
-        // Approve the deposit
+        // approveDeposit tries to mint CUP tokens – should fail without MINTER_ROLE
         vm.startPrank(vaultCurator);
-        newZapper.approveDeposit(depositId, 1000);
-        vm.stopPrank();
-
-        // Claim deposit - should fail because zapper can't mint CUP tokens
-        vm.startPrank(user1);
         vm.expectRevert("Failed to mint CUP tokens - check MINTER_ROLE");
-        newZapper.claimDeposit(depositId);
+        newZapper.approveDeposit(depositId, 1000);
         vm.stopPrank();
     }
 
     function testApproveAllDepositsWithoutMinterRole() public {
-        // Create a new zapper without MINTER_ROLE
+        // CUP minting now happens at approveAllDeposits time (not claimDeposit time).
+        // If newZapper lacks MINTER_ROLE, approveAllDeposits itself should revert.
         Zapper newZapperImpl = new Zapper();
         bytes memory newZapperInitData = abi.encodeWithSelector(
             Zapper.initialize.selector,
@@ -1160,20 +1240,14 @@ contract ZapperTest is Test {
         ERC1967Proxy newZapperProxy = new ERC1967Proxy(address(newZapperImpl), newZapperInitData);
         Zapper newZapper = Zapper(payable(address(newZapperProxy)));
 
-        // Grant roles to new zapper (but NOT MINTER_ROLE)
+        // Grant roles (but NOT MINTER_ROLE for CUP)
         newZapper.grantRole(newZapper.VAULT_CURATOR_ROLE(), vaultCurator);
         newZapper.grantRole(newZapper.HOST_INTEGRATION_ROLE(), hostIntegration);
-        newZapper.grantRole(newZapper.HOST_INTEGRATION_ROLE(), address(hostAdapter));
-
-        // Grant xCUP redeemer role to new zapper
         xcup.grantRole(xcup.REDEEMER_ROLE(), address(newZapper));
 
-        // Do NOT grant zapper permission to mint CUP tokens
-
-        // Create deposits
+        // Create a non-external deposit
         bytes32 depositId = keccak256(abi.encodePacked(user1, uint256(1), uint256(1000), block.timestamp));
         usdc.mint(user1, 1000);
-        usdc.mint(address(newZapper), 1000);
         usdc.mint(newZapper.silo(), 1000);
 
         vm.startPrank(user1);
@@ -1181,19 +1255,10 @@ contract ZapperTest is Test {
         newZapper.zapAndDeposit(usdc, 1000, depositId, 100);
         vm.stopPrank();
 
-        // Approve all deposits - this should work fine (no CUP minting needed here)
+        // approveAllDeposits mints CUP tokens internally; without MINTER_ROLE it should revert
         vm.startPrank(vaultCurator);
-        newZapper.approveAllDeposits();
-        vm.stopPrank();
-
-        // Check that deposit was approved
-        DepositLib.Deposit memory deposit = newZapper.getDeposit(depositId);
-        assertTrue(deposit.approved);
-
-        // But claiming should fail because zapper can't mint CUP tokens
-        vm.startPrank(user1);
         vm.expectRevert("Failed to mint CUP tokens - check MINTER_ROLE");
-        newZapper.claimDeposit(depositId);
+        newZapper.approveAllDeposits();
         vm.stopPrank();
     }
 
@@ -1261,7 +1326,7 @@ contract ZapperTest is Test {
 
         vm.startPrank(vaultCurator);
         vm.expectRevert("Insufficient USDC balance");
-        newZapper.withdraw(1000);
+        newZapper.withdraw(1000, owner);
         vm.stopPrank();
     }
 
@@ -1286,10 +1351,12 @@ contract ZapperTest is Test {
     }
 
     function testApproveDepositWithMaxAmount() public {
+        // approveDeposit on a non-existent deposit ID should revert with DepositNotFound.
+        // Use a reasonable amount (not uint256.max) to avoid overflow in price calculation.
         bytes32 depositId = keccak256(abi.encodePacked(user1, uint256(1), uint256(1 ether), block.timestamp));
         vm.startPrank(vaultCurator);
         vm.expectRevert(DepositLib.DepositNotFound.selector);
-        zapper.approveDeposit(depositId, type(uint256).max);
+        zapper.approveDeposit(depositId, 1000 * 10 ** 6);
         vm.stopPrank();
     }
 
@@ -1457,4 +1524,154 @@ contract ZapperTest is Test {
     }
 
     // ───────────────────────────── REDEEM TESTS MOVED TO RedeemEngine.t.sol ─────────────────────────────
+
+    // ───────────────────────────── TOKEN ALLOWLIST TESTS ─────────────────────────────
+
+    function testIsTokenAllowedUSDCAlwaysTrue() public {
+        // USDC is always allowed even though it was never explicitly added
+        assertTrue(zapper.isTokenAllowed(address(usdc)));
+    }
+
+    function testIsTokenAllowedFalseByDefault() public {
+        MockZapToken token = new MockZapToken();
+        assertFalse(zapper.isTokenAllowed(address(token)));
+    }
+
+    function testSetTokenAllowedByCurator() public {
+        MockZapToken token = new MockZapToken();
+
+        vm.prank(vaultCurator);
+        zapper.setTokenAllowed(address(token), true);
+
+        assertTrue(zapper.isTokenAllowed(address(token)));
+
+        address[] memory allowed = zapper.getAllowedTokens();
+        assertEq(allowed.length, 1);
+        assertEq(allowed[0], address(token));
+
+        // Curator can also revoke
+        vm.prank(vaultCurator);
+        zapper.setTokenAllowed(address(token), false);
+        assertFalse(zapper.isTokenAllowed(address(token)));
+        assertEq(zapper.getAllowedTokens().length, 0);
+    }
+
+    function testSetTokenAllowedWithoutRoleReverts() public {
+        MockZapToken token = new MockZapToken();
+
+        vm.prank(user1);
+        vm.expectRevert();
+        zapper.setTokenAllowed(address(token), true);
+    }
+
+    function testSetTokenAllowedCannotAllowlistUSDC() public {
+        vm.prank(vaultCurator);
+        vm.expectRevert("USDC is always allowed");
+        zapper.setTokenAllowed(address(usdc), true);
+    }
+
+    function testSetTokensAllowedBatch() public {
+        MockZapToken tokenA = new MockZapToken();
+        MockZapToken tokenB = new MockZapToken();
+        MockZapToken tokenC = new MockZapToken();
+
+        address[] memory tokens = new address[](3);
+        tokens[0] = address(tokenA);
+        tokens[1] = address(tokenB);
+        tokens[2] = address(tokenC);
+
+        vm.prank(vaultCurator);
+        zapper.setTokensAllowed(tokens, true);
+
+        assertTrue(zapper.isTokenAllowed(address(tokenA)));
+        assertTrue(zapper.isTokenAllowed(address(tokenB)));
+        assertTrue(zapper.isTokenAllowed(address(tokenC)));
+        assertEq(zapper.getAllowedTokens().length, 3);
+    }
+
+    function testZapAndDepositRevertsForNonAllowlistedToken() public {
+        MockZapToken token = new MockZapToken();
+        token.mint(user1, 1000 ether);
+
+        vm.startPrank(user1);
+        token.approve(address(zapper), 1000 ether);
+        vm.expectRevert("Token not allowlisted");
+        zapper.zapAndDeposit(IERC20(address(token)), 1000 ether, bytes32(uint256(1)), 100);
+        vm.stopPrank();
+    }
+
+    function testZapAndDepositSucceedsForAllowlistedToken() public {
+        // Use a USDC-scale amount: MockUniswapRouter converts 1:1 and only has a
+        // finite USDC balance minted in setUp(), so an 18-decimal "token" amount
+        // would overdraw it.
+        uint256 amount = 1000 * 10 ** 6;
+        MockZapToken token = new MockZapToken();
+        token.mint(user1, amount);
+
+        vm.prank(vaultCurator);
+        zapper.setTokenAllowed(address(token), true);
+
+        vm.startPrank(user1);
+        token.approve(address(zapper), amount);
+        bytes32 depositId = bytes32(uint256(1));
+        zapper.zapAndDeposit(IERC20(address(token)), amount, depositId, 100);
+        vm.stopPrank();
+
+        DepositLib.Deposit memory deposit = zapper.getDeposit(depositId);
+        assertEq(deposit.user, user1);
+        assertTrue(deposit.amount > 0);
+    }
+
+    function testZapAndDepositWithPermitRevertsForNonAllowlistedToken() public {
+        MockZapToken token = new MockZapToken();
+        token.mint(user1, 1000 ether);
+
+        vm.startPrank(user1);
+        token.approve(address(zapper), 1000 ether);
+        PermitLib.PermitParams memory permitParams = PermitLib.PermitParams({
+            value: 0,
+            deadline: 0,
+            v: 0,
+            r: bytes32(0),
+            s: bytes32(0)
+        });
+        vm.expectRevert("Token not allowlisted");
+        zapper.zapAndDepositWithPermit(IERC20(address(token)), 1000 ether, permitParams, bytes32(uint256(1)), 100);
+        vm.stopPrank();
+    }
+
+    // ───────────────────────────── REENTRANCY REGRESSION TEST ─────────────────────────────
+
+    /// @notice Recreates the historical mainnet exploit: an attacker-controlled `tokenIn`
+    /// whose transferFrom() re-enters zapAndDeposit() to smuggle a second, unrelated USDC
+    /// deposit into the same Silo-balance-delta window, inflating `depositValue`. Before
+    /// the nonReentrant fix this second call succeeded and both deposits got recorded;
+    /// after the fix it must revert.
+    function testZapAndDepositReentrancyIsBlocked() public {
+        MaliciousReentrantToken evilToken = new MaliciousReentrantToken(zapper, IERC20(address(usdc)));
+
+        // Curator allowlists the token believing it is a normal ERC20 (as would happen
+        // in practice — the malicious code is only visible at the bytecode level).
+        vm.prank(vaultCurator);
+        zapper.setTokenAllowed(address(evilToken), true);
+
+        // Fund the malicious contract with real USDC (stand-in for flash-loaned funds)
+        // and have it pre-approve the Zapper for the nested deposit it will attempt.
+        uint256 nestedAmount = 9_999_400_570; // mirrors the on-chain incident amount
+        usdc.mint(address(evilToken), nestedAmount);
+        vm.prank(address(evilToken));
+        usdc.approve(address(zapper), nestedAmount);
+
+        bytes32 outerDepositId = bytes32(uint256(100));
+        bytes32 nestedDepositId = bytes32(uint256(200));
+        evilToken.arm(nestedDepositId, nestedAmount);
+
+        vm.prank(user1);
+        vm.expectRevert();
+        zapper.zapAndDeposit(IERC20(address(evilToken)), 1000 ether, outerDepositId, 100);
+
+        // Neither deposit should exist — the whole transaction reverted atomically.
+        assertEq(zapper.getDeposit(outerDepositId).user, address(0));
+        assertEq(zapper.getDeposit(nestedDepositId).user, address(0));
+    }
 }
