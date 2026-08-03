@@ -36,8 +36,8 @@ import {VaultRegistry} from "./VaultRegistry.sol";
  *      Fee distribution priority:
  *        1. feeDistributor (IFeeDistributor) — if set, receives the full fee slice.
  *        2. feeRecipients[]                  — multi-recipient split by basis points.
- *        3. treasury                         — fallback if neither above is configured.
- *        Any remainder when feeRecipients sum < 10_000 bps goes to treasury.
+ *        3. vault treasury (VaultRegistry)   — fallback if neither above is configured.
+ *        Any remainder when feeRecipients sum < 10_000 bps goes to the vault treasury.
  *
  *      Role layout:
  *        DEFAULT_ADMIN_ROLE    — protocol multisig
@@ -91,7 +91,7 @@ contract SharedSettlementEngine is
      * @notice A single recipient in the system-fee split.
      * @dev bps is expressed relative to 10_000 of the total system fee amount.
      *      The sum of all recipient bps must not exceed 10_000. Any shortfall
-     *      is automatically forwarded to `treasury`.
+     *      is automatically forwarded to the vault treasury.
      */
     struct FeeRecipient {
         address recipient;
@@ -102,7 +102,7 @@ contract SharedSettlementEngine is
 
     VaultRegistry public registry;
 
-    /// @notice Default fee destination when no feeRecipients or feeDistributor is set.
+    /// @notice Unused — slot retained for UUPS layout compatibility. Per-vault treasury is in VaultRegistry.
     address public treasury;
 
     uint256 public systemFeeBps;
@@ -110,7 +110,7 @@ contract SharedSettlementEngine is
 
     /**
      * @notice On-chain multi-recipient fee split configuration.
-     * @dev Empty array defers to `treasury`. Use setFeeDistribution() to configure.
+     * @dev Empty array defers to the vault treasury. Use setFeeDistribution() to configure.
      *      Takes lower precedence than `feeDistributor` if both are set.
      */
     FeeRecipient[] public feeRecipients;
@@ -118,7 +118,7 @@ contract SharedSettlementEngine is
     /**
      * @notice Pluggable fee routing module (IFeeDistributor).
      * @dev When non-zero, the full system fee is approved and distributed via this
-     *      contract rather than through feeRecipients or treasury directly.
+     *      contract rather than through feeRecipients or the vault treasury directly.
      *      Supports advanced routing such as buybacks or protocol-owned liquidity.
      */
     address public feeDistributor;
@@ -149,7 +149,6 @@ contract SharedSettlementEngine is
     );
     event NAVUpdated(uint256 indexed vaultId, uint256 netAssets, uint256 pricePerShare);
     event VaultOperatorSet(uint256 indexed vaultId, address indexed operator);
-    event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
     event SystemFeeUpdated(uint256 oldFee, uint256 newFee);
     event FeeDistributionUpdated(uint256 recipientCount);
     event FeeDistributorUpdated(address indexed oldDistributor, address indexed newDistributor);
@@ -180,12 +179,10 @@ contract SharedSettlementEngine is
 
     function initialize(
         address registry_,
-        address treasury_,
         uint256 systemFeeBps_,
         address admin_
     ) public initializer {
         if (registry_ == address(0)) revert ZeroAddress();
-        if (treasury_ == address(0)) revert ZeroAddress();
         if (admin_ == address(0)) revert ZeroAddress();
         if (systemFeeBps_ > BASIS_POINTS) revert InvalidSystemFee();
 
@@ -199,7 +196,6 @@ contract SharedSettlementEngine is
         _grantRole(REVENUE_MANAGER_ROLE, admin_);
 
         registry = VaultRegistry(registry_);
-        treasury = treasury_;
         systemFeeBps = systemFeeBps_;
     }
 
@@ -282,6 +278,9 @@ contract SharedSettlementEngine is
      *        b. Route system fee via the configured distribution path.
      *        c. Transfer net settlement tokens to the vault's CapitalFacility.
      *        d. Mint proportional asset tokens into the RWAVault (increases share price).
+     *        e. NAV warehouse inventory:
+     *           - default vaults: sync `assetInInventory` from vault.balanceOf.
+     *           - `reportedInventoryOnly` vaults: leave inventory unchanged (set via updateNAV).
      *
      * @param vaultId  Registry identifier of the target vault.
      * @param epochId  Epoch to distribute revenue for (must be settled).
@@ -326,6 +325,10 @@ contract SharedSettlementEngine is
             n.retainedEarnings -= total;
         } else {
             n.retainedEarnings = 0;
+        }
+
+        if (!v.reportedInventoryOnly) {
+            n.assetInInventory = IERC20(v.assetToken).balanceOf(v.vault);
         }
 
         r.netRevenue = 0;
@@ -408,8 +411,8 @@ contract SharedSettlementEngine is
     /**
      * @notice Configure multi-recipient system-fee splitting.
      * @dev bps values are relative to the system fee amount, not total revenue.
-     *      The sum of all bps must not exceed 10_000. Any shortfall is sent to `treasury`.
-     *      Pass an empty array to revert to single-treasury mode.
+     *      The sum of all bps must not exceed 10_000. Any shortfall is sent to the vault treasury.
+     *      Pass an empty array to revert to per-vault treasury mode.
      */
     function setFeeDistribution(FeeRecipient[] calldata recipients) external onlyOwner {
         uint256 total;
@@ -428,7 +431,7 @@ contract SharedSettlementEngine is
 
     /**
      * @notice Set or remove the pluggable IFeeDistributor.
-     * @dev Pass address(0) to disable and fall back to feeRecipients or treasury.
+     * @dev Pass address(0) to disable and fall back to feeRecipients or the vault treasury.
      *      Takes precedence over feeRecipients[] when both are configured.
      */
     function setFeeDistributor(address distributor) external onlyOwner {
@@ -438,12 +441,6 @@ contract SharedSettlementEngine is
 
     function getFeeRecipients() external view returns (FeeRecipient[] memory) {
         return feeRecipients;
-    }
-
-    function setTreasury(address newTreasury) external onlyOwner {
-        if (newTreasury == address(0)) revert ZeroAddress();
-        emit TreasuryUpdated(treasury, newTreasury);
-        treasury = newTreasury;
     }
 
     function setSystemFee(uint256 newFeeBps) external onlyOwner {
@@ -469,9 +466,11 @@ contract SharedSettlementEngine is
 
     /**
      * @dev Route the system fee according to the configured distribution path.
-     *      Priority: feeDistributor → feeRecipients → treasury.
+     *      Priority: feeDistributor → feeRecipients → vault treasury.
      */
     function _distributeFee(address settlementToken, uint256 fee, uint256 vaultId, uint256 epochId) internal {
+        address vaultTreasury = registry.getVault(vaultId).treasury;
+
         if (feeDistributor != address(0)) {
             IERC20(settlementToken).forceApprove(feeDistributor, fee);
             IFeeDistributor(feeDistributor).distribute(settlementToken, fee);
@@ -490,12 +489,12 @@ contract SharedSettlementEngine is
                 }
             }
             uint256 remainder = fee - distributed;
-            if (remainder > 0) IERC20(settlementToken).safeTransfer(treasury, remainder);
+            if (remainder > 0) IERC20(settlementToken).safeTransfer(vaultTreasury, remainder);
             emit FeeDistributed(vaultId, epochId, fee, len);
             return;
         }
 
-        IERC20(settlementToken).safeTransfer(treasury, fee);
+        IERC20(settlementToken).safeTransfer(vaultTreasury, fee);
         emit FeeDistributed(vaultId, epochId, fee, 1);
     }
 

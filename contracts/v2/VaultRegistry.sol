@@ -58,6 +58,7 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
     event VaultStatusChanged(uint256 indexed vaultId, bool active);
     event VaultOracleUpdated(uint256 indexed vaultId, address indexed oldOracle, address indexed newOracle);
     event VaultEpochManagerUpdated(uint256 indexed vaultId, address indexed oldEm, address indexed newEm);
+    event VaultTreasuryUpdated(uint256 indexed vaultId, address indexed oldTreasury, address indexed newTreasury);
     event GovernorGranted(address indexed account);
 
     // ─────────────────────────── ERRORS ─────────────────────────────────────
@@ -65,6 +66,7 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
     error ZeroAddress();
     error VaultAlreadyRegistered(address vault);
     error Unauthorized();
+    error ReportedInventoryRequiresEpochs();
 
     // ─────────────────────────── INIT ───────────────────────────────────────
 
@@ -98,7 +100,9 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
         address rfqEngine,
         address assetOracle,
         address uniswapRouter,
-        address epochManager
+        address epochManager,
+        address treasury,
+        bool reportedInventoryOnly
     ) external onlyRole(FACTORY_ROLE) returns (uint256 vaultId) {
         if (vault == address(0)) revert ZeroAddress();
         if (assetToken == address(0)) revert ZeroAddress();
@@ -107,7 +111,9 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
         if (rfqEngine == address(0)) revert ZeroAddress();
         if (assetOracle == address(0)) revert ZeroAddress();
         if (uniswapRouter == address(0)) revert ZeroAddress();
+        if (treasury == address(0)) revert ZeroAddress();
         // epochManager may be address(0) for non-epoch vaults
+        if (reportedInventoryOnly && epochManager == address(0)) revert ReportedInventoryRequiresEpochs();
         if (vaultIdByAddress[vault] != 0) revert VaultAlreadyRegistered(vault);
 
         vaultId = nextVaultId++;
@@ -121,7 +127,9 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
             assetOracle: assetOracle,
             uniswapRouter: uniswapRouter,
             epochManager: epochManager,
-            active: true
+            active: true,
+            treasury: treasury,
+            reportedInventoryOnly: reportedInventoryOnly
         });
 
         vaultIdByAddress[vault] = vaultId;
@@ -182,6 +190,21 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
         address old = _vaults[vaultId].epochManager;
         _vaults[vaultId].epochManager = newEm;
         emit VaultEpochManagerUpdated(vaultId, old, newEm);
+    }
+
+    /**
+     * @notice Replace the custodian treasury for a vault.
+     * @dev Receives USDC from deposit claims and serves as the fee-routing fallback
+     *      for this vault in SharedSettlementEngine.
+     */
+    function setVaultTreasury(uint256 vaultId, address newTreasury) external {
+        if (!hasRole(GOVERNOR_ROLE, msg.sender) && msg.sender != owner()) revert Unauthorized();
+        _requireExists(vaultId);
+        if (newTreasury == address(0)) revert ZeroAddress();
+
+        address old = _vaults[vaultId].treasury;
+        _vaults[vaultId].treasury = newTreasury;
+        emit VaultTreasuryUpdated(vaultId, old, newTreasury);
     }
 
     // ─────────────────────────── VIEWS ──────────────────────────────────────

@@ -24,6 +24,11 @@ library VaultLib {
         address uniswapRouter;     // Uniswap V2 router for price queries
         address epochManager;      // EpochManager — settlement cycle timing (address(0) for epoch-less vaults)
         bool    active;            // false → deposits and redemptions are paused
+        address treasury;          // custodian / issuer treasury — appended for upgrade-safe layout
+        /// @notice When true, epoch settlement writes NAV `assetInInventory` from the operator-reported
+        ///         warehouse amount (including zero). On-vault asset liquidity is never used as inventory.
+        /// @dev Only valid for epoch vaults (`epochManager != address(0)`).
+        bool    reportedInventoryOnly;
     }
 
     /// @notice Pending deposit tracked inside OpenLiquidityRouter.

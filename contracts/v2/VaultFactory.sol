@@ -65,6 +65,7 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         address epochManager,
         address assetToken,
         address settlementToken,
+        address treasury,
         string vaultName,
         string vaultSymbol
     );
@@ -80,6 +81,7 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error RouterNotSet();
     error RFQEngineNotSet();
     error EpochManagerImplNotSet();
+    error ReportedInventoryRequiresEpochs();
 
     // ─────────────────────────── PARAMS ─────────────────────────────────────
 
@@ -109,6 +111,12 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         ///         FACILITY_OPERATOR_ROLE on the deployed CapitalFacility.
         ///         Pass address(0) to skip — roles can be granted manually later.
         address operator;
+        /// @notice Custodian / issuer treasury for this vault.
+        ///         Receives USDC on deposit claims and serves as fee fallback in settlement.
+        address treasury;
+        /// @notice When true (requires `useEpochs`), settlement writes NAV warehouse inventory from the
+        ///         operator-reported amount. On-vault asset balance is never used as inventory.
+        bool reportedInventoryOnly;
     }
 
     // ─────────────────────────── INIT ───────────────────────────────────────
@@ -184,7 +192,9 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
             rfqEngine,
             p.assetOracle,
             p.uniswapRouter,
-            epochManagerAddr
+            epochManagerAddr,
+            p.treasury,
+            p.reportedInventoryOnly
         );
 
         _wireRoles(vaultAddr);
@@ -204,6 +214,7 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
             epochManagerAddr,
             p.assetToken,
             p.settlementToken,
+            p.treasury,
             p.vaultName,
             p.vaultSymbol
         );
@@ -361,7 +372,9 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         if (p.assetOracle == address(0)) revert ZeroAddress();
         if (p.uniswapRouter == address(0)) revert ZeroAddress();
         if (p.useEpochs && p.epochDuration == 0) revert InvalidEpochDuration();
+        if (p.reportedInventoryOnly && !p.useEpochs) revert ReportedInventoryRequiresEpochs();
         if (p.wethToken == address(0)) revert ZeroAddress();
+        if (p.treasury == address(0)) revert ZeroAddress();
     }
 
     function _authorizeUpgrade(address) internal override onlyOwner {}

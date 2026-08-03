@@ -77,7 +77,7 @@ contract OpenLiquidityRouter is
 
     VaultRegistry public registry;
 
-    /// @notice Destination for USDC collected during deposit claims (custodian / treasury).
+    /// @notice Unused — slot retained for UUPS layout compatibility. Per-vault treasury is in VaultRegistry.
     address public treasury;
 
     /// @notice Per-vault operator: the issuer's backend hot-wallet for that specific vault.
@@ -111,7 +111,6 @@ contract OpenLiquidityRouter is
 
     // ─────────────────────────── EVENTS ─────────────────────────────────────
 
-    event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
     event VaultVestingConfigSet(uint256 indexed vaultId, address vestingContract, uint256 cliff, uint256 duration);
     event VaultOperatorSet(uint256 indexed vaultId, address indexed operator);
 
@@ -142,7 +141,6 @@ contract OpenLiquidityRouter is
     error Unauthorized();
     error AlreadyClaimed();
     error VestingNotConfigured(uint256 vaultId);
-    error TreasuryNotSet();
     error EpochNotActive(uint256 vaultId);
 
     // ─────────────────────────── INIT ───────────────────────────────────────
@@ -152,10 +150,9 @@ contract OpenLiquidityRouter is
         _disableInitializers();
     }
 
-    function initialize(address registry_, address admin_, address treasury_) public initializer {
+    function initialize(address registry_, address admin_) public initializer {
         if (registry_ == address(0)) revert ZeroAddress();
         if (admin_ == address(0)) revert ZeroAddress();
-        if (treasury_ == address(0)) revert ZeroAddress();
 
         __AccessControl_init();
         __Ownable_init(admin_);
@@ -167,7 +164,6 @@ contract OpenLiquidityRouter is
         _grantRole(VAULT_CURATOR_ROLE, admin_);
 
         registry = VaultRegistry(registry_);
-        treasury = treasury_;
     }
 
     // ─────────────────────────── DEPOSIT FLOW ───────────────────────────────
@@ -294,10 +290,9 @@ contract OpenLiquidityRouter is
         if (d.claimedBy != address(0)) revert AlreadyClaimed();
 
         address beneficiary = d.beneficiary == address(0) ? d.user : d.beneficiary;
-        if (treasury == address(0)) revert TreasuryNotSet();
 
-        // Pull settlement tokens from CapitalFacility and forward to treasury (payment for custodied RWA).
-        IERC20(v.settlementToken).safeTransferFrom(v.capitalFacility, treasury, d.approvedAmount);
+        // Pull settlement tokens from CapitalFacility and forward to the vault's treasury (payment for custodied RWA).
+        IERC20(v.settlementToken).safeTransferFrom(v.capitalFacility, v.treasury, d.approvedAmount);
         IERC20Mintable(v.assetToken).mint(address(this), d.approvedAssetAmount);
         IERC20(v.assetToken).forceApprove(v.vault, d.approvedAssetAmount);
         shares = IERC4626(v.vault).deposit(d.approvedAssetAmount, beneficiary);
@@ -345,9 +340,8 @@ contract OpenLiquidityRouter is
         address beneficiary = d.beneficiary == address(0) ? d.user : d.beneficiary;
         uint256 effectiveCliff = cliff > 0 ? cliff : cfg.defaultCliff;
         uint256 effectiveDuration = duration > 0 ? duration : cfg.defaultDuration;
-        if (treasury == address(0)) revert TreasuryNotSet();
 
-        IERC20(v.settlementToken).safeTransferFrom(v.capitalFacility, treasury, d.approvedAmount);
+        IERC20(v.settlementToken).safeTransferFrom(v.capitalFacility, v.treasury, d.approvedAmount);
         IERC20Mintable(v.assetToken).mint(address(this), d.approvedAssetAmount);
         IERC20(v.assetToken).forceApprove(v.vault, d.approvedAssetAmount);
         shares = IERC4626(v.vault).deposit(d.approvedAssetAmount, cfg.vestingContract);
@@ -577,13 +571,6 @@ contract OpenLiquidityRouter is
     function setRegistry(address newRegistry) external onlyOwner {
         if (newRegistry == address(0)) revert ZeroAddress();
         registry = VaultRegistry(newRegistry);
-    }
-
-    /// @notice Update the treasury address that receives USDC on deposit claims.
-    function setTreasury(address newTreasury) external onlyOwner {
-        if (newTreasury == address(0)) revert ZeroAddress();
-        emit TreasuryUpdated(treasury, newTreasury);
-        treasury = newTreasury;
     }
 
     /**
