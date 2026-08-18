@@ -5,6 +5,7 @@ import {V2TestBase} from "./Helpers.sol";
 import {OpenLiquidityRouter} from "../../contracts/v2/OpenLiquidityRouter.sol";
 import {VaultFactory} from "../../contracts/v2/VaultFactory.sol";
 import {VaultLib} from "../../contracts/v2/libraries/VaultLib.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract OpenLiquidityRouterTest is V2TestBase {
     uint256 constant USDC_AMOUNT = 4500e6; // $4,500
@@ -404,6 +405,48 @@ contract OpenLiquidityRouterTest is V2TestBase {
         vm.prank(admin);
         vm.expectRevert();
         router.registerExternalDeposit(vaultId, user, USDC_AMOUNT, bytes32("tag"));
+    }
+
+    // ─── zapAndDeposit ─────────────────────────────────────────────────────
+
+    function test_zapAndDeposit_directSettlementTokenPath() public {
+        bytes32 did = keccak256("direct-usdc-zap");
+        uint256 amount = 123e6;
+
+        usdc.mint(user, amount);
+        vm.startPrank(user);
+        usdc.approve(address(router), amount);
+        router.zapAndDeposit(vaultId, IERC20(address(usdc)), amount, did, 100);
+        vm.stopPrank();
+
+        VaultLib.Deposit memory d = router.getDeposit(vaultId, did);
+        assertEq(d.user, user);
+        assertEq(d.amount, amount);
+        assertEq(usdc.balanceOf(facilityAddr), amount);
+    }
+
+    function test_zapAndDeposit_revertsZeroAmount() public {
+        vm.prank(user);
+        vm.expectRevert(OpenLiquidityRouter.ZeroAmount.selector);
+        router.zapAndDeposit(vaultId, IERC20(address(usdc)), 0, keccak256("z0"), 100);
+    }
+
+    function test_zapAndDeposit_revertsInvalidSlippage() public {
+        vm.prank(user);
+        vm.expectRevert(OpenLiquidityRouter.InvalidSlippage.selector);
+        router.zapAndDeposit(vaultId, IERC20(address(usdc)), 1, keccak256("z1"), 1001);
+    }
+
+    function test_zapAndDeposit_swapPathRevertsWhenNoOutput() public {
+        MockERC20Stub input = new MockERC20Stub();
+        uint256 amount = 10e18;
+        input.mint(user, amount);
+
+        vm.startPrank(user);
+        input.approve(address(router), amount);
+        vm.expectRevert(OpenLiquidityRouter.ZeroAmount.selector);
+        router.zapAndDeposit(vaultId, IERC20(address(input)), amount, keccak256("z2"), 100);
+        vm.stopPrank();
     }
 
     // ─── Internal helpers ─────────────────────────────────────────────────

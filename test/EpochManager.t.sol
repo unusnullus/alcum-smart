@@ -72,6 +72,13 @@ contract EpochManagerTest is Test {
         assertFalse(epochManager.paused());
     }
 
+    function testUnpauseWithoutRole() public {
+        epochManager.pause();
+        vm.prank(admin);
+        vm.expectRevert();
+        epochManager.unpause();
+    }
+
     function testPauseWithoutRole() public {
         vm.prank(admin);
         vm.expectRevert();
@@ -210,6 +217,12 @@ contract EpochManagerTest is Test {
         uint256 maxDuration = 366 days; // More than 365 days
         vm.expectRevert(EpochManager.EpochDurationTooLong.selector);
         epochManager.setEpochDuration(maxDuration);
+    }
+
+    function testSetEpochDurationWhenPaused() public {
+        epochManager.pause();
+        vm.expectRevert();
+        epochManager.setEpochDuration(30 days);
     }
 
     // Test initialization error cases for better branch coverage

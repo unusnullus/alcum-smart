@@ -203,6 +203,26 @@ contract VaultLibTest is Test {
         h.approveExternalDeposit(did, 9999e6, 450_000_000, 8); // > deposit amount
     }
 
+    function test_approveExternalDeposit_success() public {
+        bytes32 did = h.recordExternalDeposit(1000e6, userA, bytes32("t"), userB, 0);
+        h.approveExternalDeposit(did, 900e6, 450_000_000, 8);
+
+        VaultLib.Deposit memory d = h.getDeposit(did);
+        assertTrue(d.approved);
+        assertEq(d.approvedAmount, 900e6);
+        assertEq(d.priceSnapshot, 450_000_000);
+        assertEq(d.approvedAssetAmount, (900e6 * 1e8) / 450_000_000);
+    }
+
+    function test_recordExternalDeposit_nonceCollisionRehashes() public {
+        vm.warp(1_700_000_000);
+        bytes32 first = h.recordExternalDeposit(1000e6, userA, bytes32("same"), userB, 7);
+        bytes32 second = h.recordExternalDeposit(1000e6, userA, bytes32("same"), userB, 7);
+
+        assertTrue(first != second, "deposit id should rehash on collision");
+        assertEq(h.getPendingIds().length, 2);
+    }
+
     // ─── recordRedeemRequest ─────────────────────────────────────────────────
 
     function test_recordRedeemRequest_stores() public {

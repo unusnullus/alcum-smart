@@ -352,6 +352,46 @@ contract VaultFactoryTest is V2TestBase {
         factory.setEpochManagerImplementation(address(epochManagerImpl));
     }
 
+    function test_factory_setOpenLiquidityRouter_updates() public {
+        address newRouter = makeAddr("newRouter");
+        vm.prank(admin);
+        factory.setOpenLiquidityRouter(newRouter);
+        assertEq(factory.openLiquidityRouter(), newRouter);
+    }
+
+    function test_factory_setOpenLiquidityRouter_revertsZeroAddress() public {
+        vm.prank(admin);
+        vm.expectRevert(VaultFactory.ZeroAddress.selector);
+        factory.setOpenLiquidityRouter(address(0));
+    }
+
+    function test_factory_setRFQEngine_updates() public {
+        address newEngine = makeAddr("newRfq");
+        vm.prank(admin);
+        factory.setRFQEngine(newEngine);
+        assertEq(factory.rfqEngine(), newEngine);
+    }
+
+    function test_factory_setRFQEngine_revertsZeroAddress() public {
+        vm.prank(admin);
+        vm.expectRevert(VaultFactory.ZeroAddress.selector);
+        factory.setRFQEngine(address(0));
+    }
+
+    function test_factory_setRWAVaultImplementation_updates() public {
+        RWAVault newImpl = new RWAVault();
+        vm.prank(admin);
+        factory.setRWAVaultImplementation(address(newImpl));
+        assertEq(factory.rwavaultImplementation(), address(newImpl));
+    }
+
+    function test_factory_setCapitalFacilityImplementation_updates() public {
+        CapitalFacility newImpl = new CapitalFacility();
+        vm.prank(admin);
+        factory.setCapitalFacilityImplementation(address(newImpl));
+        assertEq(factory.capitalFacilityImplementation(), address(newImpl));
+    }
+
     function test_createVault_reportedInventoryOnly_requiresEpochs() public {
         vm.prank(admin);
         vm.expectRevert(VaultFactory.ReportedInventoryRequiresEpochs.selector);
@@ -392,5 +432,35 @@ contract VaultFactoryTest is V2TestBase {
             })
         );
         assertTrue(registry.getVault(vid).reportedInventoryOnly);
+    }
+
+    function test_createVault_withoutEpochs_setsZeroEpochManager() public {
+        vm.prank(admin);
+        (uint256 vid, , , address em) = factory.createVault(
+            VaultFactory.CreateVaultParams({
+                assetToken: address(assetToken),
+                settlementToken: address(usdc),
+                assetOracle: address(assetOracle),
+                uniswapRouter: address(uniswapRouter),
+                useEpochs: false,
+                epochDuration: 0,
+                wethToken: weth,
+                vaultName: "xNOEPOCH",
+                vaultSymbol: "xNOEPOCH",
+                operator: address(0),
+                treasury: treasury,
+                reportedInventoryOnly: false
+            })
+        );
+
+        assertEq(em, address(0));
+        assertEq(registry.getVault(vid).epochManager, address(0));
+    }
+
+    function test_factory_setSharedSettlementEngine() public {
+        address newEngine = makeAddr("newSettlementEngine");
+        vm.prank(admin);
+        factory.setSharedSettlementEngine(newEngine);
+        assertEq(factory.sharedSettlementEngine(), newEngine);
     }
 }

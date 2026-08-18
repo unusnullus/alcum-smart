@@ -62,6 +62,20 @@ contract RWAVaultTest is V2TestBase {
         assertEq(vault.totalAssets(), 2 * DEPOSIT_AMOUNT);
     }
 
+    function test_mint_mintsTargetShares() public {
+        uint256 targetShares = 2_000_000_000_000; // respects virtual offset in empty vault
+        uint256 assetsNeeded = vault.previewMint(targetShares);
+
+        assetToken.mint(user, assetsNeeded);
+        vm.startPrank(user);
+        assetToken.approve(address(vault), assetsNeeded);
+        uint256 paidAssets = vault.mint(targetShares, user);
+        vm.stopPrank();
+
+        assertEq(vault.balanceOf(user), targetShares);
+        assertEq(paidAssets, assetsNeeded);
+    }
+
     // ─── withdraw / redeem (REDEEMER_ROLE only) ───────────────────────────────
 
     function test_withdraw_revertsIfNotRedeemer() public {
@@ -241,6 +255,13 @@ contract RWAVaultTest is V2TestBase {
         vault.setWethToken(address(0));
     }
 
+    function test_setSwapIntermediary_updates() public {
+        address mid = makeAddr("swap-mid");
+        vm.prank(admin);
+        vault.setSwapIntermediary(mid);
+        assertEq(vault.swapIntermediary(), mid);
+    }
+
     // ─── getShareValueIn ─────────────────────────────────────────────────────
 
     function test_getShareValueIn_usdc() public {
@@ -256,6 +277,26 @@ contract RWAVaultTest is V2TestBase {
         vault.getShareValueIn(address(usdc), 0);
     }
 
+    function test_getShareValueIn_nonSettlementQuote_usesRouterQuote() public {
+        uint256 shares = _mintAndDeposit(user, DEPOSIT_AMOUNT);
+        uint256 value = vault.getShareValueIn(address(assetToken), shares);
+        // Mock router is 1:1, so non-settlement quote equals settlement value.
+        assertEq(value, 4500e6);
+    }
+
+    function test_getShareValueIn_nativeQuote_usesWethPath() public {
+        uint256 shares = _mintAndDeposit(user, DEPOSIT_AMOUNT);
+        uint256 value = vault.getShareValueIn(address(0), shares);
+        assertEq(value, 4500e6);
+    }
+
+    function test_getShareValueIn_revertsWhenOraclePriceZero() public {
+        MockAssetOracle(address(assetOracle)).setPrice(0);
+        uint256 shares = _mintAndDeposit(user, DEPOSIT_AMOUNT);
+        vm.expectRevert(RWAVault.InvalidAssetPrice.selector);
+        vault.getShareValueIn(address(usdc), shares);
+    }
+
     // ─── getTokenToShareRate ─────────────────────────────────────────────────
 
     function test_getTokenToShareRate_usdc() public {
@@ -268,6 +309,22 @@ contract RWAVaultTest is V2TestBase {
     function test_getTokenToShareRate_revertsZeroAmount() public {
         vm.expectRevert(RWAVault.InvalidAmount.selector);
         vault.getTokenToShareRate(address(usdc), 0);
+    }
+
+    function test_getTokenToShareRate_nonSettlementInput_usesRouterQuote() public {
+        uint256 shares = vault.getTokenToShareRate(address(assetToken), 1000e6);
+        assertGt(shares, 0);
+    }
+
+    function test_getTokenToShareRate_nativeInput_usesWethQuote() public {
+        uint256 shares = vault.getTokenToShareRate(address(0), 1000e6);
+        assertGt(shares, 0);
+    }
+
+    function test_getTokenToShareRate_revertsWhenOraclePriceZero() public {
+        MockAssetOracle(address(assetOracle)).setPrice(0);
+        vm.expectRevert(RWAVault.InvalidAssetPrice.selector);
+        vault.getTokenToShareRate(address(usdc), 1000e6);
     }
 
     // ─── convertToAssets / convertToShares ───────────────────────────────────
