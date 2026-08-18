@@ -182,6 +182,13 @@ contract EpochManagerTest is Test {
     }
 
     // Test error cases for better branch coverage
+    function testSetEpochDurationDoesNotChangeCurrentEpochEnd() public {
+        uint256 leftBefore = epochManager.timeLeftInEpoch();
+        epochManager.setEpochDuration(14 days);
+        assertEq(epochManager.timeLeftInEpoch(), leftBefore);
+        assertEq(epochManager.epochDuration(), 14 days);
+    }
+
     function testNextEpochBeforeFinished() public {
         // Try to advance epoch before it's finished
         vm.expectRevert(EpochManager.EpochNotFinished.selector);

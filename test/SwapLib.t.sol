@@ -376,7 +376,8 @@ contract TestContract {
                 silo,
                 address(this),
                 msgSender,
-                msgValue
+                msgValue,
+                address(0)
             );
     }
 
@@ -387,7 +388,7 @@ contract TestContract {
         uint256 slippageBps,
         uint256 msgValue
     ) external payable {
-        SwapLib.tradeForToken(tokenIn, tokenOut, amountIn, slippageBps, router, silo, address(this), msgValue);
+        SwapLib.tradeForToken(tokenIn, tokenOut, amountIn, slippageBps, router, silo, msgValue, address(0));
     }
 }
 
@@ -519,5 +520,18 @@ contract SwapLibTest is Test {
         uint256 finalSiloBalance = usdc.balanceOf(silo);
 
         assertTrue(finalSiloBalance > initialSiloBalance);
+    }
+
+    function testZapInRevertsUnexpectedETH() public {
+        uint256 amount = 1 ether;
+        token.mint(address(this), amount);
+        token.approve(address(testContract), amount);
+        vm.expectRevert(SwapLib.UnexpectedETH.selector);
+        testContract.zapIn{value: amount}(IERC20(address(token)), amount, 100, address(this), amount);
+    }
+
+    function testZapInRevertsInvalidSlippage() public {
+        vm.expectRevert(SwapLib.InvalidSlippage.selector);
+        testContract.zapIn(IERC20(address(token)), 1, 10_001, address(this), 0);
     }
 }
