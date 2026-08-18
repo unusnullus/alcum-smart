@@ -411,7 +411,8 @@ contract Zapper is
             address(_silo),
             address(this),
             _msgSender(),
-            msg.value
+            msg.value,
+            address(0)
         );
     }
 

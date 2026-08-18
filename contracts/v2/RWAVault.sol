@@ -11,6 +11,7 @@ import {ERC4626Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC2
 import {ERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 
 import {IERC20} from "@openzeppelin/contracts/interfaces/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/interfaces/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IUniswapV2Router02} from "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 
@@ -129,6 +130,35 @@ contract RWAVault is
     }
 
     // ─────────────────────────── ERC-4626 OVERRIDES ─────────────────────────
+
+    /**
+     * @inheritdoc ERC4626Upgradeable
+     * @dev Deposits are unrestricted (KYC is enforced at the router claim path).
+     *      Paused state blocks both deposit and mint.
+     */
+    function deposit(uint256 assets, address receiver)
+        public
+        override
+        nonReentrant
+        whenNotPaused
+        returns (uint256)
+    {
+        return super.deposit(assets, receiver);
+    }
+
+    /**
+     * @inheritdoc ERC4626Upgradeable
+     * @dev See {deposit}.
+     */
+    function mint(uint256 shares, address receiver)
+        public
+        override
+        nonReentrant
+        whenNotPaused
+        returns (uint256)
+    {
+        return super.mint(shares, receiver);
+    }
 
     /// @inheritdoc ERC4626Upgradeable
     function withdraw(
@@ -309,6 +339,7 @@ contract RWAVault is
 
     // ─────────────────────────── ADMIN ──────────────────────────────────────
 
+    /// @notice Replace the asset price oracle. Must implement IAssetOracle with 8-decimal prices.
     function setAssetOracle(address newOracle) external onlyOwner {
         if (newOracle == address(0)) revert InvalidAddress();
         emit AssetOracleUpdated(address(assetOracle), newOracle);
@@ -347,7 +378,21 @@ contract RWAVault is
     function pause()   external onlyOwner { _pause();   }
     function unpause() external onlyOwner { _unpause(); }
 
-    /// @dev Only the owner (protocol admin) may authorize an implementation upgrade.
+    /**
+     * @inheritdoc ERC4626Upgradeable
+     * @dev Uses a minimum virtual offset of 3 when asset and share decimals match,
+     *      so empty-vault share conversion follows OpenZeppelin ERC-4626 virtual-asset semantics.
+     */
+    function _decimalsOffset() internal view override returns (uint8) {
+        uint8 assetDecimals = IERC20Metadata(asset()).decimals();
+        uint8 shareDecimals = decimals();
+        if (assetDecimals > shareDecimals) {
+            return assetDecimals - shareDecimals;
+        }
+        return 3;
+    }
+
+    /// @dev Only the owner (vault issuer admin) may authorize an implementation upgrade.
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
     /// @dev 6 decimal shares align with 6-decimal settlement tokens (e.g. USDC, USDT) as the primary pricing unit.

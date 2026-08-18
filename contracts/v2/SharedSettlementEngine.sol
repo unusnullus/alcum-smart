@@ -169,6 +169,10 @@ contract SharedSettlementEngine is
     error ZeroAssetTokensToMint();
     error InvalidFeeDistribution();
     error Unauthorized();
+    error NoEpochManager(uint256 vaultId);
+    error EpochNotFinished(uint256 vaultId);
+    error InvalidEpochPrice();
+    error CannotRescueVaultShares(address vaultShareToken);
 
     // ─────────────────────────── INIT ───────────────────────────────────────
 
@@ -177,6 +181,12 @@ contract SharedSettlementEngine is
         _disableInitializers();
     }
 
+    /**
+     * @notice Initialize the settlement engine proxy. Can be called only once.
+     * @param registry_      VaultRegistry used to resolve per-vault addresses.
+     * @param systemFeeBps_  Protocol fee in basis points of epoch net revenue (max 10_000).
+     * @param admin_         Owner, DEFAULT_ADMIN_ROLE and REVENUE_MANAGER_ROLE holder.
+     */
     function initialize(
         address registry_,
         uint256 systemFeeBps_,
@@ -218,6 +228,8 @@ contract SharedSettlementEngine is
         _checkRevenueManager(vaultId);
         if (epochId == 0) revert ZeroEpochId();
         if (netRevenue == 0) revert ZeroNetRevenue();
+        if (assetBought > 0 && averageBuyPrice == 0) revert InvalidEpochPrice();
+        if (assetSold > 0 && averageSellPrice == 0) revert InvalidEpochPrice();
 
         EpochRevenue storage r = epochRevenues[vaultId][epochId];
         if (r.isSettled) revert EpochAlreadySettled(vaultId, epochId);
@@ -256,6 +268,8 @@ contract SharedSettlementEngine is
         if (r.netRevenue == 0) revert NoRevenueToDistribute(vaultId, epochId);
 
         VaultLib.VaultRecord memory v = registry.getVault(vaultId);
+        if (v.epochManager == address(0)) revert NoEpochManager(vaultId);
+        if (IEpochManager(v.epochManager).timeLeftInEpoch() > 0) revert EpochNotFinished(vaultId);
 
         // Verify the provided epochId matches the on-chain EpochManager state.
         uint256 onChainEpoch = IEpochManager(v.epochManager).currentEpochId();
@@ -311,11 +325,14 @@ contract SharedSettlementEngine is
 
         IERC20(v.settlementToken).safeTransfer(v.capitalFacility, netAfterFee);
 
-        uint256 assetPrice = IAssetOracle(v.assetOracle).price();
-        if (assetPrice == 0) revert InvalidAssetPrice();
+        uint256 mintPrice = r.averageBuyPrice;
+        if (mintPrice == 0) {
+            mintPrice = IAssetOracle(v.assetOracle).price();
+        }
+        if (mintPrice == 0) revert InvalidAssetPrice();
         uint8 dec = IAssetOracle(v.assetOracle).decimals();
 
-        uint256 assetToMint = (netAfterFee * 10 ** uint256(dec)) / assetPrice;
+        uint256 assetToMint = (netAfterFee * 10 ** uint256(dec)) / mintPrice;
         if (assetToMint == 0) revert ZeroAssetTokensToMint();
 
         IERC20Mintable(v.assetToken).mint(v.vault, assetToMint);
@@ -345,10 +362,14 @@ contract SharedSettlementEngine is
      */
     function updateNAV(uint256 vaultId, NAVComponents calldata newNav) external {
         _checkRevenueManager(vaultId);
-        registry.getVault(vaultId);
-        _nav[vaultId] = newNav;
-
         VaultLib.VaultRecord memory v = registry.getVault(vaultId);
+
+        NAVComponents memory nav = newNav;
+        if (!v.reportedInventoryOnly) {
+            nav.assetInInventory = IERC20(v.assetToken).balanceOf(v.vault);
+        }
+        _nav[vaultId] = nav;
+
         NAVComponents storage n = _nav[vaultId];
 
         uint8 dec = IAssetOracle(v.assetOracle).decimals();
@@ -456,9 +477,10 @@ contract SharedSettlementEngine is
         _unpause();
     }
 
-    /// @notice Recover any ERC-20 token accidentally sent to this contract.
+    /// @notice Recover ERC-20 tokens accidentally sent to this contract.
     function rescueTokens(address token, address to, uint256 amount) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
+        if (registry.vaultIdByAddress(token) != 0) revert CannotRescueVaultShares(token);
         IERC20(token).safeTransfer(to, amount);
     }
 
@@ -517,5 +539,9 @@ contract SharedSettlementEngine is
 
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
+    /**
+     * @dev Storage gap for future variable additions. Reduce this size by the number
+     *      of slots added in subsequent upgrades.
+     */
     uint256[43] private __gap;
 }

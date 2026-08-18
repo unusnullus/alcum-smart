@@ -5,63 +5,51 @@ import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Own
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 
 import {IEpochManager} from "./interfaces/IEpochManager.sol";
 
 /**
  * @title EpochManager
- * @notice Manages time-based epochs for organizing trading activities and revenue settlement cycles
- * @dev This contract handles the progression of epochs, which are fixed time periods
- *      used to organize trading activities and revenue settlement cycles. Each epoch
- *      represents a complete cycle of copper trading operations.
+ * @notice Time-boxed settlement cycle used by vaults that opt into epoch accounting.
+ *
+ * @dev Each vault that is created with `useEpochs = true` gets its own EpochManager
+ *      proxy. The current epoch ends at a fixed `_epochEnd` timestamp. Changing
+ *      `_epochDuration` via {setEpochDuration} applies only to epochs started after
+ *      the next {nextEpoch} call — it does not move the current epoch boundary.
+ *
+ *      Role layout:
+ *        DEFAULT_ADMIN_ROLE  — vault issuer admin (also initial `owner`)
+ *        EPOCH_MANAGER_ROLE  — may call `nextEpoch` and `setEpochDuration`
  */
 contract EpochManager is
     Initializable,
     IEpochManager,
     OwnableUpgradeable,
     AccessControlUpgradeable,
-    PausableUpgradeable
+    PausableUpgradeable,
+    UUPSUpgradeable
 {
-    /// @notice Role identifier for epoch managers
     bytes32 public constant EPOCH_MANAGER_ROLE = keccak256("EPOCH_MANAGER_ROLE");
 
-    /// @notice Current epoch identifier (starts from 0)
-    /// @dev Packed with _epochStart to save storage slot
+    /// @dev Packed with `_epochEnd`.
     uint128 private _currentEpochId;
 
-    /// @notice Timestamp when the current epoch started
-    /// @dev Packed with _currentEpochId to save storage slot
+    /// @dev Unix timestamp when the current epoch ends (exclusive boundary for nextEpoch).
+    uint128 private _epochEnd;
+
+    /// @dev Timestamp when the current epoch started.
     uint128 private _epochStart;
 
-    /// @notice Duration of each epoch in seconds
+    /// @dev Duration applied when the *next* epoch is started via {nextEpoch}.
     uint256 private _epochDuration;
 
-    /// @notice Thrown when epoch duration is zero
     error InvalidEpochDuration();
-
-    /// @notice Thrown when epoch duration exceeds maximum allowed
     error EpochDurationTooLong();
-
-    /// @notice Thrown when trying to advance epoch before it's finished
     error EpochNotFinished();
-
-    /// @notice Thrown when trying to set the same duration
     error SameDuration();
 
-    /**
-     * @notice Emitted when a new epoch begins
-     * @param epochId The identifier of the new epoch
-     * @param start The timestamp when the epoch started
-     * @param duration The duration of the epoch in seconds
-     */
-    event EpochStarted(uint256 indexed epochId, uint256 start, uint256 duration);
-
-    /**
-     * @notice Emitted when the epoch duration is updated
-     * @param oldDuration The previous epoch duration
-     * @param newDuration The new epoch duration
-     * @param updatedBy The address that updated the duration
-     */
+    event EpochStarted(uint256 indexed epochId, uint256 start, uint256 end, uint256 duration);
     event EpochDurationUpdated(uint256 oldDuration, uint256 newDuration, address indexed updatedBy);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
@@ -70,18 +58,8 @@ contract EpochManager is
     }
 
     /**
-     * @notice Initializes the EpochManager contract
-     * @dev This function replaces the constructor for upgradeable contracts.
-     *      Sets the initial epoch duration.
-     *
-     * Requirements:
-     * - Can only be called once due to initializer modifier
-     * - `epochDuration_` must be greater than 0
-     * - Caller becomes the owner of the contract
-     *
-     * @param epochDuration_ Duration of each epoch in seconds
-     *
-     * @custom:oz-initializer
+     * @notice Initializes the EpochManager proxy. Can be called only once.
+     * @dev Starts epoch 0 at `block.timestamp` with `_epochEnd = now + epochDuration_`.
      */
     function initialize(uint256 epochDuration_) public initializer {
         if (epochDuration_ == 0) revert InvalidEpochDuration();
@@ -90,99 +68,60 @@ contract EpochManager is
         __Ownable_init(_msgSender());
         __AccessControl_init();
         __Pausable_init();
+        __UUPSUpgradeable_init();
 
-        // Grant the deployer the default admin role and epoch manager role
         _grantRole(DEFAULT_ADMIN_ROLE, _msgSender());
         _grantRole(EPOCH_MANAGER_ROLE, _msgSender());
 
         _epochDuration = epochDuration_;
+        _epochStart = uint128(block.timestamp);
+        _epochEnd = uint128(block.timestamp + epochDuration_);
+
+        emit EpochStarted(_currentEpochId, _epochStart, _epochEnd, _epochDuration);
     }
 
-    /**
-     * @notice Advances to the next epoch
-     * @dev Only callable by addresses with EPOCH_MANAGER_ROLE. Requires the current epoch to be finished.
-     *      This function should be called at the end of each trading cycle to start
-     *      the next epoch for new trading activities.
-     *
-     * Requirements:
-     * - Caller must have EPOCH_MANAGER_ROLE
-     * - Current epoch must be finished (current time >= epoch start + duration)
-     * - Contract must not be paused
-     *
-     * Effects:
-     * - Increments the current epoch ID
-     * - Sets the new epoch start time to current block timestamp
-     * - Emits an EpochStarted event
-     */
+    /// @inheritdoc IEpochManager
     function nextEpoch() external onlyRole(EPOCH_MANAGER_ROLE) whenNotPaused {
-        if (block.timestamp < epochStart() + epochDuration()) revert EpochNotFinished();
+        if (block.timestamp < _epochEnd) revert EpochNotFinished();
 
         _currentEpochId++;
         _epochStart = uint128(block.timestamp);
+        _epochEnd = uint128(block.timestamp + _epochDuration);
 
-        emit EpochStarted(_currentEpochId, _epochStart, _epochDuration);
+        emit EpochStarted(_currentEpochId, _epochStart, _epochEnd, _epochDuration);
     }
 
-    /**
-     * @notice Calculates the time remaining in the current epoch
-     * @dev Returns 0 if the epoch has already ended. Used by other contracts
-     *      to check if operations are allowed within the current epoch.
-     *
-     * @return timeLeft The number of seconds remaining in the current epoch
-     */
+    /// @inheritdoc IEpochManager
     function timeLeftInEpoch() external view returns (uint256 timeLeft) {
-        uint256 epochEndTime = epochStart() + epochDuration();
-        if (block.timestamp >= epochEndTime) {
+        if (block.timestamp >= _epochEnd) {
             return 0;
         }
-        return epochEndTime - block.timestamp;
+        return _epochEnd - block.timestamp;
     }
 
-    /**
-     * @notice Returns the current epoch identifier
-     * @dev Epoch IDs start from 0 and increment with each new epoch.
-     *      Used by other contracts to track which epoch operations belong to.
-     *
-     * @return epochId The current epoch ID
-     */
+    /// @inheritdoc IEpochManager
     function currentEpochId() external view returns (uint256 epochId) {
         return _currentEpochId;
     }
 
-    /**
-     * @notice Returns the timestamp when the current epoch started
-     * @dev Used for calculating epoch progress and time remaining.
-     *
-     * @return startTime The epoch start timestamp in seconds since Unix epoch
-     */
+    /// @inheritdoc IEpochManager
     function epochStart() public view returns (uint256 startTime) {
         return _epochStart;
     }
 
-    /**
-     * @notice Returns the duration of each epoch in seconds
-     * @dev All epochs have the same duration.
-     *
-     * @return duration The epoch duration in seconds
-     */
+    /// @notice Unix timestamp when the current epoch ends.
+    function epochEnd() public view returns (uint256 endTime) {
+        return _epochEnd;
+    }
+
+    /// @inheritdoc IEpochManager
     function epochDuration() public view returns (uint256 duration) {
         return _epochDuration;
     }
 
     /**
-     * @notice Updates the duration for future epochs
-     * @dev Only callable by addresses with EPOCH_MANAGER_ROLE. Does not affect the current epoch.
-     *      The new duration will apply to epochs started after this change.
-     *
-     * Requirements:
-     * - Caller must have EPOCH_MANAGER_ROLE
-     * - `newDuration` must be greater than 0
-     * - `newDuration` must not exceed 365 days
-     * - Contract must not be paused
-     *
-     * @param newDuration The new epoch duration in seconds
-     *
-     * Emits an {EpochDurationUpdated} event.
+     * @notice Updates the duration for epochs started after the next {nextEpoch} call.
+     * @dev Does not change `_epochEnd` for the currently running epoch.
      */
     function setEpochDuration(uint256 newDuration) external onlyRole(EPOCH_MANAGER_ROLE) whenNotPaused {
         if (newDuration == 0) revert InvalidEpochDuration();
@@ -195,28 +134,15 @@ contract EpochManager is
         emit EpochDurationUpdated(oldDuration, newDuration, _msgSender());
     }
 
-    /**
-     * @notice Pauses all contract operations
-     * @dev Only callable by the contract owner. Prevents epoch advancement
-     *      and other state-changing operations.
-     *
-     * Requirements:
-     * - Caller must be the contract owner
-     * - Contract must not already be paused
-     */
     function pause() external onlyOwner {
         _pause();
     }
 
-    /**
-     * @notice Unpauses all contract operations
-     * @dev Only callable by the contract owner. Restores normal functionality.
-     *
-     * Requirements:
-     * - Caller must be the contract owner
-     * - Contract must be paused
-     */
     function unpause() external onlyOwner {
         _unpause();
     }
+
+    function _authorizeUpgrade(address) internal override onlyOwner {}
+
+    uint256[44] private __gap;
 }

@@ -14,14 +14,6 @@ pragma solidity ^0.8.24;
  *      before any redemption approval.
  */
 interface ICapitalFacility {
-
-    struct Deployment {
-        address protocol;    // whitelisted yield protocol
-        uint256 amount;      // stablecoin amount deployed
-        uint256 deployedAt;  // unix timestamp
-        bytes   data;        // protocol-specific calldata
-    }
-
     event CapitalDeployed(address indexed protocol, uint256 amount);
     event CapitalRecalled(address indexed protocol, uint256 amount);
     event ProtocolWhitelisted(address indexed protocol, bool whitelisted);
@@ -38,8 +30,11 @@ interface ICapitalFacility {
     /// @notice Deploy `amount` stablecoin into a whitelisted yield protocol.
     function deployCapital(address protocol, uint256 amount, bytes calldata data) external;
 
-    /// @notice Recall `amount` stablecoin from a deployed protocol.
+    /// @notice Recall `amount` stablecoin from a deployed protocol via transferFrom.
     function recallCapital(address protocol, uint256 amount) external;
+
+    /// @notice Sync accounting after a push-based protocol returned tokens to idle balance.
+    function acknowledgeCapitalRecall(address protocol, uint256 amount) external;
 
     /// @notice Emergency: recall all deployed capital across all protocols.
     function recallAll() external;

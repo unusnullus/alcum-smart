@@ -21,6 +21,7 @@ import {SwapLib} from "../libraries/SwapLib.sol";
 
 import {VaultLib} from "./libraries/VaultLib.sol";
 import {VaultRegistry} from "./VaultRegistry.sol";
+import {RWAVault} from "./RWAVault.sol";
 
 /**
  * @title OpenLiquidityRouter
@@ -129,6 +130,7 @@ contract OpenLiquidityRouter is
     event RedeemApproved(uint256 indexed vaultId, bytes32 indexed redeemId, uint256 tokenAmount);
     event RedeemClaimed(uint256 indexed vaultId, bytes32 indexed redeemId, address user, uint256 tokenAmount);
     event RedeemDeclined(uint256 indexed vaultId, bytes32 indexed redeemId, address user, uint256 shares);
+    event RegistryUpdated(address indexed previous, address indexed current);
 
     // ─────────────────────────── ERRORS ─────────────────────────────────────
 
@@ -142,6 +144,10 @@ contract OpenLiquidityRouter is
     error AlreadyClaimed();
     error VestingNotConfigured(uint256 vaultId);
     error EpochNotActive(uint256 vaultId);
+    error VestingRequired(uint256 vaultId);
+    error RedeemPayoutTooHigh(uint256 requested, uint256 maxAllowed);
+    error CannotRescueVaultShares(address vaultShareToken);
+    error InvalidAssetPrice();
 
     // ─────────────────────────── INIT ───────────────────────────────────────
 
@@ -150,6 +156,11 @@ contract OpenLiquidityRouter is
         _disableInitializers();
     }
 
+    /**
+     * @notice Initialize the router proxy. Can be called only once.
+     * @param registry_ VaultRegistry used to resolve per-vault addresses.
+     * @param admin_    Owner, DEFAULT_ADMIN_ROLE and VAULT_CURATOR_ROLE holder.
+     */
     function initialize(address registry_, address admin_) public initializer {
         if (registry_ == address(0)) revert ZeroAddress();
         if (admin_ == address(0)) revert ZeroAddress();
@@ -207,7 +218,8 @@ contract OpenLiquidityRouter is
                 v.capitalFacility,
                 address(this),
                 msg.sender,
-                msg.value
+                msg.value,
+                RWAVault(v.vault).swapIntermediary()
             );
         }
 
@@ -248,7 +260,8 @@ contract OpenLiquidityRouter is
         emit DepositApproved(vaultId, depositId, approvedAmount);
     }
 
-    /// @notice Curator declines a pending deposit. Settlement tokens are refunded from CapitalFacility.
+    /// @notice Curator declines a pending deposit. Zap deposits are refunded from CapitalFacility;
+    ///         external deposits are cancelled without a token movement.
     function declineDeposit(
         uint256 vaultId,
         bytes32 depositId
@@ -262,19 +275,27 @@ contract OpenLiquidityRouter is
         if (d.approved) revert VaultLib.DepositAlreadyApproved();
 
         address user = d.user;
+        address listOwner = d.isExternal ? d.beneficiary : d.user;
         uint256 refund = d.amount;
+        bool isExternal = d.isExternal;
 
         delete _deposits[vaultId][depositId];
         VaultLib.removeFromArray(_pendingDepositIds[vaultId], depositId);
-        VaultLib.removeUserEntry(_userDeposits[vaultId], user, depositId);
+        VaultLib.removeUserEntry(_userDeposits[vaultId], listOwner, depositId);
 
-        IERC20(v.settlementToken).safeTransferFrom(v.capitalFacility, user, refund);
+        // External deposits never pulled settlement tokens into the facility.
+        // Refunding them would drain idle capital to the host integrator.
+        if (!isExternal && refund > 0) {
+            IERC20(v.settlementToken).safeTransferFrom(v.capitalFacility, user, refund);
+        }
 
-        emit DepositDeclined(vaultId, depositId, user, refund);
+        emit DepositDeclined(vaultId, depositId, user, isExternal ? 0 : refund);
     }
 
     /**
      * @notice Claim an approved deposit: mint asset tokens, deposit into the vault, receive shares.
+     * @dev When a {VaultVestingConfig} is set, use {claimDepositWithVesting} instead.
+     *      Shares always go to the deposit beneficiary (or `user` if beneficiary is zero).
      * @return shares Vault shares minted for the beneficiary.
      */
     function claimDeposit(
@@ -282,6 +303,7 @@ contract OpenLiquidityRouter is
         bytes32 depositId
     ) external nonReentrant whenNotPaused returns (uint256 shares) {
         _checkEpochActive(vaultId);
+        if (vestingConfigs[vaultId].vestingContract != address(0)) revert VestingRequired(vaultId);
         VaultLib.VaultRecord memory v = _activeVault(vaultId);
         VaultLib.Deposit storage d = _deposits[vaultId][depositId];
 
@@ -298,7 +320,11 @@ contract OpenLiquidityRouter is
         shares = IERC4626(v.vault).deposit(d.approvedAssetAmount, beneficiary);
 
         d.claimedBy = msg.sender;
-        VaultLib.removeUserEntry(_userDeposits[vaultId], d.user, depositId);
+        VaultLib.removeUserEntry(
+            _userDeposits[vaultId],
+            d.isExternal ? d.beneficiary : d.user,
+            depositId
+        );
 
         emit DepositClaimed(vaultId, depositId, beneficiary, shares);
     }
@@ -357,7 +383,11 @@ contract OpenLiquidityRouter is
         );
 
         d.claimedBy = msg.sender;
-        VaultLib.removeUserEntry(_userDeposits[vaultId], d.user, depositId);
+        VaultLib.removeUserEntry(
+            _userDeposits[vaultId],
+            d.isExternal ? d.beneficiary : d.user,
+            depositId
+        );
 
         emit DepositClaimed(vaultId, depositId, beneficiary, shares);
     }
@@ -443,8 +473,8 @@ contract OpenLiquidityRouter is
 
     /**
      * @notice Curator approves a queued redemption with a settlement token payout amount.
-     * @dev Verifies the vault's CapitalFacility holds sufficient idle settlement tokens before
-     *      approving. Operators must recall any externally deployed capital first.
+     * @dev `tokenAmount` must not exceed the oracle-implied settlement value of the locked
+     *      shares. Operators must recall externally deployed capital first.
      */
     function approveRedeem(
         uint256 vaultId,
@@ -462,6 +492,9 @@ contract OpenLiquidityRouter is
         if (r.approved) revert VaultLib.RedeemAlreadyApproved();
         if (r.claimed) revert VaultLib.RedeemAlreadyClaimed();
 
+        uint256 maxPayout = _maxRedeemPayout(v, r.shares);
+        if (tokenAmount > maxPayout) revert RedeemPayoutTooHigh(tokenAmount, maxPayout);
+
         if (IERC20(v.settlementToken).balanceOf(v.capitalFacility) < tokenAmount) revert InsufficientFacilityBalance();
 
         r.approved = true;
@@ -474,6 +507,7 @@ contract OpenLiquidityRouter is
 
     /**
      * @notice Claim an approved redemption — burns shares and receives settlement tokens from CapitalFacility.
+     * @dev Redeemed RWA is sent to the vault treasury; settlement tokens are pulled from CapitalFacility.
      * @return tokenAmount Settlement tokens transferred to the caller.
      */
     function claimRedeem(
@@ -491,7 +525,7 @@ contract OpenLiquidityRouter is
         tokenAmount = r.tokenAmount;
         r.claimed = true;
 
-        IERC4626(v.vault).redeem(r.shares, v.capitalFacility, address(this));
+        IERC4626(v.vault).redeem(r.shares, v.treasury, address(this));
         IERC20(v.settlementToken).safeTransferFrom(v.capitalFacility, msg.sender, tokenAmount);
 
         VaultLib.removeUserEntry(_userRedeems[vaultId], msg.sender, redeemId);
@@ -570,16 +604,17 @@ contract OpenLiquidityRouter is
 
     function setRegistry(address newRegistry) external onlyOwner {
         if (newRegistry == address(0)) revert ZeroAddress();
+        emit RegistryUpdated(address(registry), newRegistry);
         registry = VaultRegistry(newRegistry);
     }
 
     /**
-     * @notice Recover any ERC-20 token accidentally sent to this contract.
-     * @dev Does not apply to vault shares locked for pending redeems — those are
-     *      tracked in _redeems and must be released via declineRedeem / claimRedeem.
+     * @notice Recover ERC-20 tokens accidentally sent to this contract.
+     * @dev Cannot rescue registered vault share tokens (ERC-4626 share addresses).
      */
     function rescueTokens(address token, address to, uint256 amount) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
+        if (registry.vaultIdByAddress(token) != 0) revert CannotRescueVaultShares(token);
         IERC20(token).safeTransfer(to, amount);
     }
 
@@ -650,6 +685,15 @@ contract OpenLiquidityRouter is
         if (em != address(0) && IEpochManager(em).timeLeftInEpoch() == 0) {
             revert EpochNotActive(vaultId);
         }
+    }
+
+    /// @dev Oracle-implied settlement payout for `shares` locked in a redeem request.
+    function _maxRedeemPayout(VaultLib.VaultRecord memory v, uint256 shares) internal view returns (uint256) {
+        uint256 assetAmount = IERC4626(v.vault).convertToAssets(shares);
+        uint256 assetPrice = IAssetOracle(v.assetOracle).price();
+        if (assetPrice == 0) revert InvalidAssetPrice();
+        uint8 dec = IAssetOracle(v.assetOracle).decimals();
+        return (assetAmount * assetPrice) / (10 ** uint256(dec));
     }
 
     function _authorizeUpgrade(address) internal override onlyOwner {}

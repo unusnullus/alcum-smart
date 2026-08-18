@@ -70,6 +70,8 @@ library VaultLib {
     error NotExternalDeposit();
     error ExternalDepositRequiresPriceApproval();
     error RedeemNotFound();
+    /// @notice A redeem request with this id already exists (not necessarily approved).
+    error RedeemAlreadyExists();
     error RedeemAlreadyApproved();
     error RedeemNotApproved();
     error RedeemAlreadyClaimed();
@@ -77,6 +79,11 @@ library VaultLib {
 
     // ─────────────────────────── DEPOSIT HELPERS ────────────────────────────
 
+    /**
+     * @notice Store a pending on-chain zap deposit.
+     * @dev Reverts if `depositId` is already used. `depositId` is caller-supplied;
+     *      the router should document that clients must use a unique id.
+     */
     function recordDeposit(
         mapping(bytes32 => Deposit) storage deposits,
         bytes32[] storage pendingIds,
@@ -105,6 +112,12 @@ library VaultLib {
         userDeposits[user].push(depositId);
     }
 
+    /**
+     * @notice Store a pending off-chain / host-to-host deposit.
+     * @dev No settlement tokens move. The id is derived from caller, timestamp,
+     *      amount, beneficiary, tag and nonce. Indexed under `beneficiary` in
+     *      `userDeposits` (not under `createdBy`).
+     */
     function recordExternalDeposit(
         mapping(bytes32 => Deposit) storage deposits,
         bytes32[] storage pendingIds,
@@ -144,6 +157,11 @@ library VaultLib {
         userDeposits[beneficiary_].push(depositId);
     }
 
+    /**
+     * @notice Curator-approve a zap deposit and lock `approvedAssetAmount`.
+     * @dev `approvedAssetAmount = approvedAmount * 10**oracleDecimals / assetPrice`.
+     *      Reverts for external deposits — use {approveExternalDeposit}.
+     */
     function approveDeposit(
         mapping(bytes32 => Deposit) storage deposits,
         bytes32 depositId,
@@ -164,6 +182,10 @@ library VaultLib {
         d.approvedAssetAmount = (approvedAmount * 10 ** uint256(oracleDecimals)) / assetPrice;
     }
 
+    /**
+     * @notice Curator-approve an external deposit and lock `approvedAssetAmount`.
+     * @dev Same pricing formula as {approveDeposit}. Reverts for non-external deposits.
+     */
     function approveExternalDeposit(
         mapping(bytes32 => Deposit) storage deposits,
         bytes32 depositId,
@@ -186,6 +208,9 @@ library VaultLib {
 
     // ─────────────────────────── REDEEM HELPERS ─────────────────────────────
 
+    /**
+     * @notice Store a queued redemption. Reverts if `redeemId` is already used.
+     */
     function recordRedeemRequest(
         mapping(bytes32 => RedeemRequest) storage redeems,
         bytes32[] storage pendingIds,
@@ -194,7 +219,7 @@ library VaultLib {
         address user,
         uint256 shares
     ) internal {
-        if (redeems[redeemId].user != address(0)) revert RedeemAlreadyApproved();
+        if (redeems[redeemId].user != address(0)) revert RedeemAlreadyExists();
 
         redeems[redeemId] = RedeemRequest({
             user:        user,

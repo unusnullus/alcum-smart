@@ -5,6 +5,7 @@ import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Own
 import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -24,20 +25,29 @@ import {ICapitalFacility} from "./interfaces/ICapitalFacility.sol";
  *      events. Before approving any redemption payout, operators must recall sufficient
  *      capital so that idleBalance() covers the obligation.
  *
- *      Capital recall via recallCapital() is intentionally flexible: it attempts a
- *      transferFrom from the protocol address after updating internal accounting. If the
- *      protocol has already settled out-of-band, the accounting adjustment is applied
- *      without reverting. Operators are responsible for ensuring actual fund recovery.
+ *      Capital recall:
+ *        - recallCapital() pulls via transferFrom and reverts unless idle balance
+ *          increases by the recalled amount.
+ *        - acknowledgeCapitalRecall() updates accounting when a push-based protocol
+ *          has already returned tokens to this contract (operator must fund idle first).
  *
  *      Role layout:
- *        DEFAULT_ADMIN_ROLE      — protocol multisig
- *        FACILITY_OPERATOR_ROLE  — may deploy and recall capital; whitelist protocols
+ *        DEFAULT_ADMIN_ROLE      — vault issuer admin (also initial `owner`)
+ *        FACILITY_OPERATOR_ROLE  — may deploy and recall capital (whitelisted targets only)
+ *        owner                   — protocol whitelist, authorizedSpender rotation, UUPS upgrade
+ *
+ *      `owner` (Ownable) and DEFAULT_ADMIN_ROLE can diverge after role grants.
+ *      Keep them on the same address unless a split-admin setup is intentional.
+ *
+ *      `authorizedSpender` (typically OpenLiquidityRouter) holds unlimited allowance to
+ *      pull idle tokens for approved redemption payouts.
  */
 contract CapitalFacility is
     Initializable,
     OwnableUpgradeable,
     AccessControlUpgradeable,
     ReentrancyGuardUpgradeable,
+    UUPSUpgradeable,
     ICapitalFacility
 {
     using SafeERC20 for IERC20;
@@ -62,6 +72,9 @@ contract CapitalFacility is
     /// @dev Ordered list of protocols with active deployments, used by recallAll().
     address[] private _activeProtocols;
 
+    /// @notice Maximum calldata length accepted by {deployCapital}.
+    uint256 public constant MAX_DEPLOY_CALLDATA = 4096;
+
     // ─────────────────────────── ERRORS ─────────────────────────────────────
 
     error ZeroAddress();
@@ -70,7 +83,13 @@ contract CapitalFacility is
     error InsufficientIdleBalance(uint256 available, uint256 requested);
     error DeploymentFailed();
     error RecallFailed();
+    error CalldataTooLong();
     error ZeroDeploymentInProtocol(address protocol);
+
+    // ─────────────────────────── EVENTS ─────────────────────────────────────
+
+    /// @notice Emitted when the unlimited spender is rotated.
+    event AuthorizedSpenderUpdated(address indexed previous, address indexed current);
 
     // ─────────────────────────── INIT ───────────────────────────────────────
 
@@ -80,10 +99,11 @@ contract CapitalFacility is
     }
 
     /**
-     * @param token_             Stablecoin this facility holds (USDC).
+     * @notice Initialize the facility proxy. Can be called only once.
+     * @param token_             Stablecoin this facility holds (e.g. USDC).
      * @param authorizedSpender_ Address that receives unlimited spending approval
-     *                           (OpenLiquidityRouter / RFQEngine).
-     * @param admin_             Initial owner and operator.
+     *                           (typically OpenLiquidityRouter).
+     * @param admin_             Initial owner, DEFAULT_ADMIN_ROLE and FACILITY_OPERATOR_ROLE.
      */
     function initialize(address token_, address authorizedSpender_, address admin_) public initializer {
         if (token_ == address(0)) revert ZeroAddress();
@@ -93,6 +113,7 @@ contract CapitalFacility is
         __Ownable_init(admin_);
         __AccessControl_init();
         __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin_);
         _grantRole(FACILITY_OPERATOR_ROLE, admin_);
@@ -135,6 +156,7 @@ contract CapitalFacility is
         if (protocol == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
         if (!isWhitelisted[protocol]) revert ProtocolNotWhitelisted(protocol);
+        if (data.length > MAX_DEPLOY_CALLDATA) revert CalldataTooLong();
 
         uint256 idle = idleBalance();
         if (idle < amount) revert InsufficientIdleBalance(idle, amount);
@@ -174,22 +196,62 @@ contract CapitalFacility is
         }
     }
 
+    /**
+     * @notice Sync accounting after a push-based protocol returned tokens to idle balance.
+     * @dev Use when the protocol sends stablecoin back directly (no transferFrom approval).
+     *      Requires `idleBalance() >= amount` so redemption liquidity is actually present.
+     * @param protocol Whitelisted protocol whose deployed balance is being reduced.
+     * @param amount   Amount to deduct from `_deployed[protocol]`.
+     */
+    function acknowledgeCapitalRecall(
+        address protocol,
+        uint256 amount
+    ) external onlyRole(FACILITY_OPERATOR_ROLE) nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        if (_deployed[protocol] == 0) revert ZeroDeploymentInProtocol(protocol);
+
+        uint256 toAck = amount > _deployed[protocol] ? _deployed[protocol] : amount;
+        if (idleBalance() < toAck) revert InsufficientIdleBalance(idleBalance(), toAck);
+
+        _deployed[protocol] -= toAck;
+        totalDeployed -= toAck;
+
+        if (_deployed[protocol] == 0) {
+            _removeActiveProtocol(protocol);
+        }
+
+        emit CapitalRecalled(protocol, toAck);
+    }
+
     // ─────────────────────────── ADMIN ──────────────────────────────────────
 
+    /**
+     * @notice Allow or revoke a yield protocol as a deployCapital target.
+     * @dev Whitelisting does not move funds. Only whitelisted protocols may receive
+     *      {deployCapital} transfers. Revoking a protocol does not auto-recall existing deployments.
+     * @param protocol Target protocol address.
+     * @param active   True to whitelist, false to revoke.
+     */
     function setProtocolWhitelisted(address protocol, bool active) external onlyOwner {
         if (protocol == address(0)) revert ZeroAddress();
         isWhitelisted[protocol] = active;
         emit ProtocolWhitelisted(protocol, active);
     }
 
-    /// @notice Replace the authorised spender and refresh the unlimited approval.
+    /**
+     * @notice Replace the authorised spender and refresh the unlimited approval.
+     * @dev Previous spender allowance is reset to 0 before the new unlimited approve.
+     */
     function setAuthorizedSpender(address newSpender) external onlyOwner {
         if (newSpender == address(0)) revert ZeroAddress();
-        token.forceApprove(authorizedSpender, 0);
+        address previous = authorizedSpender;
+        token.forceApprove(previous, 0);
         authorizedSpender = newSpender;
         token.forceApprove(newSpender, type(uint256).max);
+        emit AuthorizedSpenderUpdated(previous, newSpender);
     }
 
+    /// @notice Protocols that currently have a non-zero `_deployed` balance.
     function getActiveProtocols() external view returns (address[] memory) {
         return _activeProtocols;
     }
@@ -197,22 +259,18 @@ contract CapitalFacility is
     // ─────────────────────────── INTERNAL ───────────────────────────────────
 
     /**
-     * @dev Accounting is updated first (effects before interactions).
-     *      Then a transferFrom is attempted to pull funds from the protocol address.
-     *      This handles the common case where the protocol holds ERC-20 tokens on
-     *      behalf of this facility (e.g. shares in an ERC-4626 vault).
-     *
-     *      For protocols that push funds back automatically (e.g. after a withdraw call),
-     *      the operator should call recallCapital AFTER the protocol has already returned
-     *      the tokens. In that case the transferFrom will fail or be a no-op, which is
-     *      acceptable — the catch block preserves the accounting update.
-     *
-     *      Operators are responsible for confirming actual fund recovery off-chain.
+     * @dev Pulls tokens from `protocol` via transferFrom, then updates accounting.
+     *      Reverts with {RecallFailed} unless idle balance increases by `toRecall`.
+     *      For push-based withdrawals use {acknowledgeCapitalRecall} instead.
      */
     function _recallFrom(address protocol, uint256 amount) internal {
         if (_deployed[protocol] == 0) revert ZeroDeploymentInProtocol(protocol);
 
         uint256 toRecall = amount > _deployed[protocol] ? _deployed[protocol] : amount;
+        uint256 balBefore = idleBalance();
+
+        try token.transferFrom(protocol, address(this), toRecall) {} catch {}
+        if (idleBalance() - balBefore < toRecall) revert RecallFailed();
 
         _deployed[protocol] -= toRecall;
         totalDeployed -= toRecall;
@@ -221,16 +279,10 @@ contract CapitalFacility is
             _removeActiveProtocol(protocol);
         }
 
-        // Attempt to pull the tokens back. If the protocol has already pushed them
-        // (or the operator pre-withdrew), this will fail gracefully.
-        try token.transferFrom(protocol, address(this), toRecall) {
-            // funds pulled successfully
-        } catch {
-            // Operator confirmed out-of-band recovery; accounting is already updated.
-        }
         emit CapitalRecalled(protocol, toRecall);
     }
 
+    /// @dev Swap-and-pop from `_activeProtocols`. No-op if `protocol` is not listed.
     function _removeActiveProtocol(address protocol) internal {
         address[] storage arr = _activeProtocols;
         for (uint256 i; i < arr.length; i++) {
@@ -242,5 +294,12 @@ contract CapitalFacility is
         }
     }
 
+    /// @dev Only the owner (vault issuer admin) may authorize an implementation upgrade.
+    function _authorizeUpgrade(address) internal override onlyOwner {}
+
+    /**
+     * @dev Storage gap for future variable additions. Reduce this size by the number
+     *      of slots added in subsequent upgrades.
+     */
     uint256[45] private __gap;
 }

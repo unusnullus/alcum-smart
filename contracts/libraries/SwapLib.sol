@@ -7,123 +7,117 @@ import {IUniswapV2Router02} from "@uniswap/v2-periphery/contracts/interfaces/IUn
 
 /**
  * @title SwapLib
- * @notice External library for handling token swaps via Uniswap V2 in Zapper.
- * @dev Keeps Zapper bytecode small by moving swap logic here.
- *      Handles token-to-USDC conversion with slippage protection.
+ * @notice Uniswap V2 helper used by OpenLiquidityRouter to convert an input asset into
+ *         the vault settlement token.
+ *
+ * @dev Spot quotes come from `getAmountsOut` in the same transaction as the swap.
+ *      Callers must enforce a tight `slippageBps` (router maximum 1_000 bps).
+ *
+ *      Tries a direct 2-hop path first, then an optional 3-hop path via `swapIntermediary`
+ *      (should match the RWAVault configuration for consistent quoting).
+ *
+ *      Native ETH is `tokenIn == address(0)`. WETH uses `swapExactTokensForTokens`.
  */
 library SwapLib {
     using SafeERC20 for IERC20;
 
-    // ───────────────────────────── ERRORS ─────────────────────────────
+    uint256 internal constant BPS_DENOMINATOR = 10_000;
 
     error InvalidETHAmount();
+    error InvalidSlippage();
+    error UnexpectedETH();
+    error NoLiquidPath();
 
-    // ───────────────────────────── SWAP OPERATIONS ─────────────────────────────
-
-    /**
-     * @notice Swaps input tokens for USDC using Uniswap V2 with slippage protection
-     * @param tokenIn The token to swap from (address(0) for ETH)
-     * @param amount The amount of tokens to swap (in token's native decimals)
-     * @param slippageBps The slippage tolerance in basis points (100 = 1%, 1000 = 10%)
-     * @param router The Uniswap V2 router contract
-     * @param usdc The USDC token contract
-     * @param silo The Silo contract that receives USDC
-     * @param zapperContract The Zapper contract address (for receiving tokens)
-     * @param msgSender The address sending the transaction
-     * @param msgValue The ETH value sent with the transaction
-     * @return depositValue The net amount of USDC received from the swap (6 decimals)
-     */
     function zapIn(
         IERC20 tokenIn,
         uint256 amount,
         uint256 slippageBps,
         IUniswapV2Router02 router,
-        IERC20 usdc,
-        address silo,
-        address zapperContract,
+        IERC20 settlementToken,
+        address recipient,
+        address routerCaller,
         address msgSender,
-        uint256 msgValue
+        uint256 msgValue,
+        address swapIntermediary
     ) external returns (uint256 depositValue) {
-        uint256 initialTokenOutBalance = usdc.balanceOf(silo);
+        if (slippageBps > BPS_DENOMINATOR) revert InvalidSlippage();
 
-        // Handle token transfer based on input type (ERC20 vs ETH)
         if (address(tokenIn) != address(0)) {
-            // ERC20 token: Transfer from user to zapper contract for swap
-            tokenIn.safeTransferFrom(msgSender, zapperContract, amount);
+            if (msgValue != 0) revert UnexpectedETH();
+            tokenIn.safeTransferFrom(msgSender, routerCaller, amount);
+            tokenIn.forceApprove(address(router), amount);
+        } else if (msgValue != amount) {
+            revert InvalidETHAmount();
         }
 
-        // Handle router approval based on input type
-        if (address(tokenIn) != address(0)) {
-            // ERC20 token: Approve Uniswap router to spend tokens
-            // Use forceApprove to handle tokens with non-standard approval behavior
-            IERC20(address(tokenIn)).forceApprove(address(router), amount);
-        } else {
-            // ETH case: Validate that msg.value matches the specified amount
-            if (msgValue != amount) {
-                revert InvalidETHAmount();
-            }
-        }
+        uint256 initialTokenOutBalance = settlementToken.balanceOf(recipient);
 
-        tradeForToken(address(tokenIn), address(usdc), amount, slippageBps, router, silo, zapperContract, msgValue);
+        tradeForToken(
+            address(tokenIn),
+            address(settlementToken),
+            amount,
+            slippageBps,
+            router,
+            recipient,
+            msgValue,
+            swapIntermediary
+        );
 
-        uint256 balanceAfterZap = usdc.balanceOf(silo);
-
-        depositValue = balanceAfterZap - initialTokenOutBalance;
+        depositValue = settlementToken.balanceOf(recipient) - initialTokenOutBalance;
     }
 
-    /**
-     * @notice Executes a token swap on Uniswap V2 with automatic path routing
-     * @param tokenIn The address of the input token (address(0) for ETH)
-     * @param tokenOut The address of the output token (typically USDC)
-     * @param amountIn The amount of input tokens to swap
-     * @param slippageBps The slippage tolerance in basis points (100 = 1%)
-     * @param router The Uniswap V2 router contract
-     * @param silo The Silo contract that receives the output tokens
-     * @param zapperContract The Zapper contract address (for approving tokens)
-     * @param msgValue The ETH value sent with the transaction
-     */
     function tradeForToken(
         address tokenIn,
         address tokenOut,
         uint256 amountIn,
         uint256 slippageBps,
         IUniswapV2Router02 router,
-        address silo,
-        address zapperContract,
-        uint256 msgValue
+        address recipient,
+        uint256 msgValue,
+        address swapIntermediary
     ) public {
-        // Construct trading path for Uniswap V2 (direct pair assumed)
-        address[] memory path = new address[](2);
+        if (slippageBps > BPS_DENOMINATOR) revert InvalidSlippage();
 
-        // Handle ETH representation in trading path
+        address inputToken = tokenIn == address(0) ? router.WETH() : tokenIn;
+        (uint256 quotedOut, address[] memory path) =
+            _quotePath(router, inputToken, tokenOut, amountIn, swapIntermediary);
+        uint256 minOutput = (quotedOut * (BPS_DENOMINATOR - slippageBps)) / BPS_DENOMINATOR;
+
         if (tokenIn == address(0)) {
-            // ETH case: Use WETH address for Uniswap routing
-            path[0] = router.WETH();
-        } else {
-            // ERC20 token case: Use token address directly
-            path[0] = tokenIn;
-        }
-        path[1] = tokenOut;
-
-        // Query expected output amounts from Uniswap router
-        uint256[] memory amountsOut = router.getAmountsOut(amountIn, path);
-
-        // Calculate minimum output with custom slippage tolerance
-        // Formula: minOutput = amountsOut[1] * (10000 - slippageBps) / 10000
-        // To prevent overflow with very large values, use unchecked arithmetic
-        // since we're dividing by 10000 which ensures the result fits in uint256
-        uint256 minOutput;
-        unchecked {
-            minOutput = (amountsOut[1] * (10000 - slippageBps)) / 10000;
-        }
-
-        // Handle ETH swaps specially (require ETH to be sent with transaction)
-        if (tokenIn == address(0) || tokenIn == router.WETH()) {
-            // send ETH along with slippage protection
-            router.swapExactETHForTokens{value: msgValue}(minOutput, path, silo, block.timestamp);
+            router.swapExactETHForTokens{value: msgValue}(minOutput, path, recipient, block.timestamp);
             return;
         }
 
-        router.swapExactTokensForTokens(amountIn, minOutput, path, silo, block.timestamp);
+        router.swapExactTokensForTokens(amountIn, minOutput, path, recipient, block.timestamp);
+    }
+
+    function _quotePath(
+        IUniswapV2Router02 router,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        address swapIntermediary
+    ) internal view returns (uint256 amountOut, address[] memory path) {
+        path = new address[](2);
+        path[0] = tokenIn;
+        path[1] = tokenOut;
+
+        try router.getAmountsOut(amountIn, path) returns (uint256[] memory amounts) {
+            return (amounts[1], path);
+        } catch {
+            if (
+                swapIntermediary == address(0) ||
+                swapIntermediary == tokenIn ||
+                swapIntermediary == tokenOut
+            ) revert NoLiquidPath();
+
+            path = new address[](3);
+            path[0] = tokenIn;
+            path[1] = swapIntermediary;
+            path[2] = tokenOut;
+
+            uint256[] memory amounts = router.getAmountsOut(amountIn, path);
+            return (amounts[2], path);
+        }
     }
 }

@@ -75,8 +75,12 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
         _disableInitializers();
     }
 
+    /**
+     * @notice Initialize the registry proxy. Can be called only once.
+     * @param admin_ Owner and DEFAULT_ADMIN_ROLE holder. Must be non-zero.
+     */
     function initialize(address admin_) public initializer {
-        require(admin_ != address(0), "VaultRegistry: zero admin");
+        if (admin_ == address(0)) revert ZeroAddress();
         __Ownable_init(admin_);
         __AccessControl_init();
         __UUPSUpgradeable_init();
@@ -209,15 +213,21 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
 
     // ─────────────────────────── VIEWS ──────────────────────────────────────
 
+    /// @notice Full registry record. Reverts if `vaultId` has never been registered.
     function getVault(uint256 vaultId) external view returns (VaultLib.VaultRecord memory) {
         _requireExists(vaultId);
         return _vaults[vaultId];
     }
 
+    /**
+     * @notice Whether the vault is marked active.
+     * @dev Returns `false` for unregistered ids (default mapping value) without reverting.
+     */
     function isActive(uint256 vaultId) external view returns (bool) {
         return _vaults[vaultId].active;
     }
 
+    /// @notice Number of registered vaults (`nextVaultId - 1`).
     function totalVaults() external view returns (uint256) {
         return nextVaultId - 1;
     }
@@ -230,5 +240,9 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
 
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
+    /**
+     * @dev Storage gap for future variable additions. Reduce this size by the number
+     *      of slots added in subsequent upgrades.
+     */
     uint256[47] private __gap;
 }

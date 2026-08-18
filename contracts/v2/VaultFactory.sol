@@ -73,13 +73,13 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     event CapitalFacilityImplementationUpdated(address indexed oldImpl, address indexed newImpl);
     event EpochManagerImplementationUpdated(address indexed oldImpl, address indexed newImpl);
     event SharedSettlementEngineUpdated(address indexed oldEngine, address indexed newEngine);
+    event OpenLiquidityRouterUpdated(address indexed oldRouter, address indexed newRouter);
+    event RFQEngineUpdated(address indexed oldEngine, address indexed newEngine);
 
     // ─────────────────────────── ERRORS ─────────────────────────────────────
 
     error ZeroAddress();
     error InvalidEpochDuration();
-    error RouterNotSet();
-    error RFQEngineNotSet();
     error EpochManagerImplNotSet();
     error ReportedInventoryRequiresEpochs();
 
@@ -126,6 +126,16 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         _disableInitializers();
     }
 
+    /**
+     * @notice Initialize the factory proxy. Can be called only once.
+     * @param registry_                      VaultRegistry (this factory must later hold FACTORY_ROLE).
+     * @param rwavaultImplementation_        RWAVault logic address.
+     * @param capitalFacilityImplementation_ CapitalFacility logic address.
+     * @param epochManagerImplementation_    EpochManager logic address.
+     * @param openLiquidityRouter_           Shared OpenLiquidityRouter proxy.
+     * @param rfqEngine_                     Shared RFQEngine proxy.
+     * @param sharedSettlementEngine_        Shared SharedSettlementEngine proxy.
+     */
     function initialize(
         address registry_,
         address rwavaultImplementation_,
@@ -199,10 +209,13 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
 
         _wireRoles(vaultAddr);
 
-        // Register per-vault operator before transferring ownership (factory still holds admin).
+        // Register per-vault operator while the factory still holds DEFAULT_ADMIN_ROLE.
         if (p.operator != address(0)) {
             _registerOperator(vaultId, facilityAddr, epochManagerAddr, p.operator);
         }
+
+        // Drop factory operator roles before revoking admin in `_transferOwnership`.
+        _relinquishFactoryRoles(facilityAddr, epochManagerAddr);
 
         // Transfer vault ownership to the caller — each issuer owns their own vault stack.
         _transferOwnership(vaultAddr, facilityAddr, epochManagerAddr, msg.sender);
@@ -224,11 +237,13 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
 
     function setOpenLiquidityRouter(address newRouter) external onlyOwner {
         if (newRouter == address(0)) revert ZeroAddress();
+        emit OpenLiquidityRouterUpdated(openLiquidityRouter, newRouter);
         openLiquidityRouter = newRouter;
     }
 
     function setRFQEngine(address newEngine) external onlyOwner {
         if (newEngine == address(0)) revert ZeroAddress();
+        emit RFQEngineUpdated(rfqEngine, newEngine);
         rfqEngine = newEngine;
     }
 
@@ -333,6 +348,24 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         IVaultOperatorRegistry(sharedSettlementEngine).setVaultOperator(vaultId, operator);
     }
 
+    /**
+     * @dev Revoke operator roles granted to the factory during initialize of child proxies.
+     *      Must run while the factory still holds DEFAULT_ADMIN_ROLE on those proxies.
+     */
+    function _relinquishFactoryRoles(address facilityAddr, address epochManagerAddr) private {
+        bytes32 facilityOp = CapitalFacility(facilityAddr).FACILITY_OPERATOR_ROLE();
+        if (CapitalFacility(facilityAddr).hasRole(facilityOp, address(this))) {
+            CapitalFacility(facilityAddr).revokeRole(facilityOp, address(this));
+        }
+
+        if (epochManagerAddr != address(0)) {
+            bytes32 epochRole = EpochManager(epochManagerAddr).EPOCH_MANAGER_ROLE();
+            if (EpochManager(epochManagerAddr).hasRole(epochRole, address(this))) {
+                EpochManager(epochManagerAddr).revokeRole(epochRole, address(this));
+            }
+        }
+    }
+
     function _wireRoles(address vaultAddr) private {
         bytes32 redeemerRole = keccak256("REDEEMER_ROLE");
         RWAVault(vaultAddr).grantRole(redeemerRole, openLiquidityRouter);
@@ -379,5 +412,9 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
 
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
+    /**
+     * @dev Storage gap for future variable additions. Reduce this size by the number
+     *      of slots added in subsequent upgrades.
+     */
     uint256[45] private __gap;
 }
