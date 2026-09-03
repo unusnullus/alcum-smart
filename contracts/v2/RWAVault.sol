@@ -13,6 +13,7 @@ import {ERC20Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC20/
 import {IERC20} from "@openzeppelin/contracts/interfaces/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/interfaces/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IUniswapV2Router02} from "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 
 import {IAssetOracle} from "./interfaces/IAssetOracle.sol";
@@ -46,6 +47,7 @@ contract RWAVault is
     ReentrancyGuardUpgradeable
 {
     using SafeERC20 for IERC20;
+    using Math for uint256;
 
     // ─────────────────────────── ROLES ──────────────────────────────────────
 
@@ -273,6 +275,39 @@ contract RWAVault is
         return n.assetInInventory + n.assetInTransit + fromSettlement;
     }
 
+    /**
+     * @inheritdoc ERC4626Upgradeable
+     * @dev Empty vaults price their first shares from the oracle-implied
+     *      settlement value, avoiding inflated first-user shares from the
+     *      ERC-4626 virtual offset. Reported-inventory vaults keep
+     *      `totalAssets() == 0` until the first operator NAV, so they keep using
+     *      this bootstrap rate until NAV is initialized.
+     */
+    function _convertToShares(
+        uint256 assets,
+        Math.Rounding rounding
+    ) internal view override returns (uint256) {
+        if (_usesOracleBootstrapRate()) {
+            return _assetsToBootstrapShares(assets, rounding);
+        }
+        return super._convertToShares(assets, rounding);
+    }
+
+    /**
+     * @inheritdoc ERC4626Upgradeable
+     * @dev Mirror of {_convertToShares} for previews and share value reads
+     *      before the first reported NAV.
+     */
+    function _convertToAssets(
+        uint256 shares,
+        Math.Rounding rounding
+    ) internal view override returns (uint256) {
+        if (_usesOracleBootstrapRate()) {
+            return _bootstrapSharesToAssets(shares, rounding);
+        }
+        return super._convertToAssets(shares, rounding);
+    }
+
     // ─────────────────────────── PRICE UTILITIES ────────────────────────────
 
     /**
@@ -446,6 +481,90 @@ contract RWAVault is
         shares = convertToShares(assetAmount);
     }
 
+    function _usesOracleBootstrapRate() internal view returns (bool) {
+        if (totalSupply() == 0) return true;
+        if (!reportedInventoryOnly) return false;
+        if (settlementEngine == address(0)) revert ReportedNavNotConfigured();
+        return !INavReader(settlementEngine).navInitialized(vaultId);
+    }
+
+    function _assetsToBootstrapShares(
+        uint256 assets,
+        Math.Rounding rounding
+    ) internal view returns (uint256) {
+        uint256 settlementValue = _assetToSettlementAmount(assets, rounding);
+        uint8 settlementDecimals_ = IERC20Metadata(address(settlementToken)).decimals();
+        return _scaleDecimals(
+            settlementValue,
+            settlementDecimals_,
+            VaultLib.VAULT_SHARE_DECIMALS,
+            rounding
+        );
+    }
+
+    function _bootstrapSharesToAssets(
+        uint256 shares,
+        Math.Rounding rounding
+    ) internal view returns (uint256) {
+        uint8 settlementDecimals_ = IERC20Metadata(address(settlementToken)).decimals();
+        uint256 settlementValue = _scaleDecimals(
+            shares,
+            VaultLib.VAULT_SHARE_DECIMALS,
+            settlementDecimals_,
+            rounding
+        );
+        return _settlementToAssetAmount(settlementValue, rounding);
+    }
+
+    function _assetToSettlementAmount(
+        uint256 assetAmount,
+        Math.Rounding rounding
+    ) internal view returns (uint256) {
+        uint256 assetPrice = getAssetPrice();
+        if (assetPrice == 0) revert InvalidAssetPrice();
+
+        uint8 oracleDecimals = assetOracle.decimals();
+        uint8 assetDecimals_ = IERC20Metadata(asset()).decimals();
+        uint8 settlementDecimals_ = IERC20Metadata(address(settlementToken)).decimals();
+
+        return assetAmount.mulDiv(
+            assetPrice * 10 ** uint256(settlementDecimals_),
+            10 ** uint256(assetDecimals_) * 10 ** uint256(oracleDecimals),
+            rounding
+        );
+    }
+
+    function _settlementToAssetAmount(
+        uint256 settlementAmount,
+        Math.Rounding rounding
+    ) internal view returns (uint256) {
+        uint256 assetPrice = getAssetPrice();
+        if (assetPrice == 0) revert InvalidAssetPrice();
+
+        uint8 oracleDecimals = assetOracle.decimals();
+        uint8 assetDecimals_ = IERC20Metadata(asset()).decimals();
+        uint8 settlementDecimals_ = IERC20Metadata(address(settlementToken)).decimals();
+
+        return settlementAmount.mulDiv(
+            10 ** uint256(oracleDecimals) * 10 ** uint256(assetDecimals_),
+            assetPrice * 10 ** uint256(settlementDecimals_),
+            rounding
+        );
+    }
+
+    function _scaleDecimals(
+        uint256 amount,
+        uint8 fromDecimals,
+        uint8 toDecimals,
+        Math.Rounding rounding
+    ) internal pure returns (uint256) {
+        if (fromDecimals == toDecimals) return amount;
+        if (fromDecimals < toDecimals) {
+            return amount * 10 ** uint256(toDecimals - fromDecimals);
+        }
+        return amount.mulDiv(1, 10 ** uint256(fromDecimals - toDecimals), rounding);
+    }
+
     // ─────────────────────────── ADMIN ──────────────────────────────────────
 
     /// @notice Replace the asset price oracle. Must implement IAssetOracle with 8-decimal prices.
@@ -506,16 +625,11 @@ contract RWAVault is
 
     /**
      * @inheritdoc ERC4626Upgradeable
-     * @dev Uses a minimum virtual offset of 3 when asset and share decimals match,
-     *      so empty-vault share conversion follows OpenZeppelin ERC-4626 virtual-asset semantics.
+     * @dev Empty-vault pricing is handled by the oracle bootstrap conversion,
+     *      so no extra decimal offset is needed.
      */
-    function _decimalsOffset() internal view override returns (uint8) {
-        uint8 assetDecimals = IERC20Metadata(asset()).decimals();
-        uint8 shareDecimals = decimals();
-        if (assetDecimals > shareDecimals) {
-            return assetDecimals - shareDecimals;
-        }
-        return 3;
+    function _decimalsOffset() internal pure override returns (uint8) {
+        return 0;
     }
 
     /// @dev Only the owner (vault issuer admin) may authorize an implementation upgrade.
