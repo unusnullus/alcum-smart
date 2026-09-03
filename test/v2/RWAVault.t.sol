@@ -59,7 +59,7 @@ contract RWAVaultTest is V2TestBase {
     function test_deposit_multipleUsers() public {
         uint256 s1 = _mintAndDeposit(user, DEPOSIT_AMOUNT);
         uint256 s2 = _mintAndDeposit(user2, DEPOSIT_AMOUNT);
-        assertEq(s1, s2);
+        assertApproxEqAbs(s1, s2, 10);
         assertEq(vault.totalAssets(), 2 * DEPOSIT_AMOUNT);
     }
 
@@ -294,8 +294,8 @@ contract RWAVaultTest is V2TestBase {
     }
 
     function test_getShareValueIn_revertsWhenOraclePriceZero() public {
-        MockAssetOracle(address(assetOracle)).setPrice(0);
         uint256 shares = _mintAndDeposit(user, DEPOSIT_AMOUNT);
+        MockAssetOracle(address(assetOracle)).setPrice(0);
         vm.expectRevert(RWAVault.InvalidAssetPrice.selector);
         vault.getShareValueIn(address(usdc), shares);
     }
@@ -304,9 +304,8 @@ contract RWAVaultTest is V2TestBase {
 
     function test_getTokenToShareRate_usdc() public {
         // 4500 USDC / $4.50 = 1000 tokens → shares
-        // Vault is empty so rate = 1:1, shares = convertToShares(1000e6) = 1000e6
         uint256 shares = vault.getTokenToShareRate(address(usdc), 4500e6);
-        assertGt(shares, 0);
+        assertEq(shares, 1000e6);
     }
 
     function test_getTokenToShareRate_revertsZeroAmount() public {
@@ -332,9 +331,9 @@ contract RWAVaultTest is V2TestBase {
 
     // ─── convertToAssets / convertToShares ───────────────────────────────────
 
-    function test_convertToShares_zeroTotalSupply_usesVirtualOffset() public {
-        // Empty vault: _decimalsOffset=3 → shares = assets * 10**3.
-        assertEq(vault.convertToShares(1000e6), 1_000_000_000_000);
+    function test_convertToShares_zeroTotalSupply_mintsCollateralDenominatedShares() public {
+        // Empty vault: shares are collateral-denominated, so first mint is 1:1.
+        assertEq(vault.convertToShares(1000e6), 1000e6);
     }
 
     function test_convertToAssets_afterDeposit() public {

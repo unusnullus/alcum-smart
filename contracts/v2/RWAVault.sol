@@ -56,9 +56,9 @@ contract RWAVault is
 
     // ─────────────────────────── STATE ──────────────────────────────────────
 
-    IAssetOracle       public assetOracle;
+    IAssetOracle public assetOracle;
     IUniswapV2Router02 public uniswapRouter;
-    IERC20             public settlementToken;
+    IERC20 public settlementToken;
 
     /// @notice WETH address used as intermediate hop in ETH-denominated price paths.
     address public wethToken;
@@ -98,16 +98,14 @@ contract RWAVault is
     event SettlementTokenUpdated(address indexed previous, address indexed current);
     event WethTokenUpdated(address indexed previous, address indexed current);
     event SwapIntermediaryUpdated(address indexed previous, address indexed current);
-    event ReportedNavConfigured(
-        address indexed settlementEngine,
-        uint256 indexed vaultId,
-        bool reportedInventoryOnly
-    );
+    event ReportedNavConfigured(address indexed settlementEngine, uint256 indexed vaultId, bool reportedInventoryOnly);
 
     // ─────────────────────────── INIT ───────────────────────────────────────
 
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() { _disableInitializers(); }
+    constructor() {
+        _disableInitializers();
+    }
 
     /**
      * @param assetToken_    RWA token this vault wraps (underlying of the ERC-4626).
@@ -119,19 +117,19 @@ contract RWAVault is
      * @param wethToken_         WETH address for ETH-quoted price paths.
      */
     function initialize(
-        IERC20  assetToken_,
-        string  memory name_,
-        string  memory symbol_,
+        IERC20 assetToken_,
+        string memory name_,
+        string memory symbol_,
         address assetOracle_,
         address uniswapRouter_,
         address settlementToken_,
         address wethToken_
     ) public initializer {
         if (address(assetToken_) == address(0)) revert InvalidAddress();
-        if (assetOracle_         == address(0)) revert InvalidAddress();
-        if (uniswapRouter_       == address(0)) revert InvalidAddress();
-        if (settlementToken_     == address(0)) revert InvalidAddress();
-        if (wethToken_           == address(0)) revert InvalidAddress();
+        if (assetOracle_ == address(0)) revert InvalidAddress();
+        if (uniswapRouter_ == address(0)) revert InvalidAddress();
+        if (settlementToken_ == address(0)) revert InvalidAddress();
+        if (wethToken_ == address(0)) revert InvalidAddress();
 
         __ERC20_init(name_, symbol_);
         __ERC4626_init(assetToken_);
@@ -143,10 +141,10 @@ contract RWAVault is
 
         _grantRole(DEFAULT_ADMIN_ROLE, _msgSender());
 
-        assetOracle      = IAssetOracle(assetOracle_);
-        uniswapRouter    = IUniswapV2Router02(uniswapRouter_);
-        settlementToken  = IERC20(settlementToken_);
-        wethToken        = wethToken_;
+        assetOracle = IAssetOracle(assetOracle_);
+        uniswapRouter = IUniswapV2Router02(uniswapRouter_);
+        settlementToken = IERC20(settlementToken_);
+        wethToken = wethToken_;
     }
 
     // ─────────────────────────── ERC-4626 OVERRIDES ─────────────────────────
@@ -156,13 +154,7 @@ contract RWAVault is
      * @dev Deposits are unrestricted (KYC is enforced at the router claim path).
      *      Paused state blocks both deposit and mint.
      */
-    function deposit(uint256 assets, address receiver)
-        public
-        override
-        nonReentrant
-        whenNotPaused
-        returns (uint256)
-    {
+    function deposit(uint256 assets, address receiver) public override nonReentrant whenNotPaused returns (uint256) {
         return super.deposit(assets, receiver);
     }
 
@@ -170,31 +162,31 @@ contract RWAVault is
      * @inheritdoc ERC4626Upgradeable
      * @dev See {deposit}.
      */
-    function mint(uint256 shares, address receiver)
-        public
-        override
-        nonReentrant
-        whenNotPaused
-        returns (uint256)
-    {
+    function mint(uint256 shares, address receiver) public override nonReentrant whenNotPaused returns (uint256) {
         return super.mint(shares, receiver);
     }
 
     /// @inheritdoc ERC4626Upgradeable
-    function withdraw(
-        uint256 assets,
-        address receiver,
-        address owner
-    ) public override onlyRole(REDEEMER_ROLE) nonReentrant whenNotPaused returns (uint256 shares) {
+    function withdraw(uint256 assets, address receiver, address owner)
+        public
+        override
+        onlyRole(REDEEMER_ROLE)
+        nonReentrant
+        whenNotPaused
+        returns (uint256 shares)
+    {
         return super.withdraw(assets, receiver, owner);
     }
 
     /// @inheritdoc ERC4626Upgradeable
-    function redeem(
-        uint256 shares,
-        address receiver,
-        address owner
-    ) public override onlyRole(REDEEMER_ROLE) nonReentrant whenNotPaused returns (uint256 assets) {
+    function redeem(uint256 shares, address receiver, address owner)
+        public
+        override
+        onlyRole(REDEEMER_ROLE)
+        nonReentrant
+        whenNotPaused
+        returns (uint256 assets)
+    {
         return super.redeem(shares, receiver, owner);
     }
 
@@ -256,54 +248,39 @@ contract RWAVault is
         if (spot == 0) return n.assetInInventory + n.assetInTransit;
 
         uint256 settlementSide = n.retainedEarnings + n.stablecoinBalance;
-        uint256 netSettlement = settlementSide > n.liabilities
-            ? settlementSide - n.liabilities
-            : 0;
+        uint256 netSettlement = settlementSide > n.liabilities ? settlementSide - n.liabilities : 0;
 
         uint8 oracleDecimals = assetOracle.decimals();
         uint8 assetDecimals_ = IERC20Metadata(asset()).decimals();
         uint8 settlementDecimals_ = IERC20Metadata(address(settlementToken)).decimals();
 
-        uint256 fromSettlement = VaultLib.settlementToAssetAmount(
-            netSettlement,
-            spot,
-            assetDecimals_,
-            oracleDecimals,
-            settlementDecimals_
-        );
+        uint256 fromSettlement =
+            VaultLib.settlementToAssetAmount(netSettlement, spot, assetDecimals_, oracleDecimals, settlementDecimals_);
 
         return n.assetInInventory + n.assetInTransit + fromSettlement;
     }
 
     /**
      * @inheritdoc ERC4626Upgradeable
-     * @dev Empty vaults price their first shares from the oracle-implied
-     *      settlement value, avoiding inflated first-user shares from the
-     *      ERC-4626 virtual offset. Reported-inventory vaults keep
-     *      `totalAssets() == 0` until the first operator NAV, so they keep using
-     *      this bootstrap rate until NAV is initialized.
+     * @dev Reported-inventory vaults keep `totalAssets() == 0` until the first
+     *      operator NAV is recorded. During that bootstrap window, conversions
+     *      use the vault's real on-chain asset balance so shares stay
+     *      collateral-denominated instead of being inflated by the zero NAV gate.
      */
-    function _convertToShares(
-        uint256 assets,
-        Math.Rounding rounding
-    ) internal view override returns (uint256) {
-        if (_usesOracleBootstrapRate()) {
-            return _assetsToBootstrapShares(assets, rounding);
+    function _convertToShares(uint256 assets, Math.Rounding rounding) internal view override returns (uint256) {
+        if (_usesReportedPreNavRate()) {
+            return _convertToSharesWithTotalAssets(assets, IERC20(asset()).balanceOf(address(this)), rounding);
         }
         return super._convertToShares(assets, rounding);
     }
 
     /**
      * @inheritdoc ERC4626Upgradeable
-     * @dev Mirror of {_convertToShares} for previews and share value reads
-     *      before the first reported NAV.
+     * @dev Mirror of {_convertToShares} before the first reported NAV.
      */
-    function _convertToAssets(
-        uint256 shares,
-        Math.Rounding rounding
-    ) internal view override returns (uint256) {
-        if (_usesOracleBootstrapRate()) {
-            return _bootstrapSharesToAssets(shares, rounding);
+    function _convertToAssets(uint256 shares, Math.Rounding rounding) internal view override returns (uint256) {
+        if (_usesReportedPreNavRate()) {
+            return _convertToAssetsWithTotalAssets(shares, IERC20(asset()).balanceOf(address(this)), rounding);
         }
         return super._convertToAssets(shares, rounding);
     }
@@ -335,25 +312,16 @@ contract RWAVault is
      *         `swapIntermediary` when one is configured.
      *         Reverts with `NoLiquidPath` if neither path succeeds.
      */
-    function _quoteToSettlement(
-        address fromToken,
-        uint256 fromAmount
-    ) internal view returns (uint256) {
+    function _quoteToSettlement(address fromToken, uint256 fromAmount) internal view returns (uint256) {
         address[] memory directPath = new address[](2);
         directPath[0] = fromToken;
         directPath[1] = address(settlementToken);
 
-        try uniswapRouter.getAmountsOut(fromAmount, directPath) returns (
-            uint256[] memory amounts
-        ) {
+        try uniswapRouter.getAmountsOut(fromAmount, directPath) returns (uint256[] memory amounts) {
             return amounts[1];
         } catch {
             address mid = swapIntermediary;
-            if (
-                mid == address(0) ||
-                mid == fromToken  ||
-                mid == address(settlementToken)
-            ) revert NoLiquidPath();
+            if (mid == address(0) || mid == fromToken || mid == address(settlementToken)) revert NoLiquidPath();
 
             address[] memory multiPath = new address[](3);
             multiPath[0] = fromToken;
@@ -369,25 +337,16 @@ contract RWAVault is
      * @notice Quote `fromSettlement` units of settlement token into `toToken`.
      * @dev    Mirror of `_quoteToSettlement` — tries direct path, then multi-hop.
      */
-    function _quoteFromSettlement(
-        address toToken,
-        uint256 fromSettlement
-    ) internal view returns (uint256) {
+    function _quoteFromSettlement(address toToken, uint256 fromSettlement) internal view returns (uint256) {
         address[] memory directPath = new address[](2);
         directPath[0] = address(settlementToken);
         directPath[1] = toToken;
 
-        try uniswapRouter.getAmountsOut(fromSettlement, directPath) returns (
-            uint256[] memory amounts
-        ) {
+        try uniswapRouter.getAmountsOut(fromSettlement, directPath) returns (uint256[] memory amounts) {
             return amounts[1];
         } catch {
             address mid = swapIntermediary;
-            if (
-                mid == address(0) ||
-                mid == toToken  ||
-                mid == address(settlementToken)
-            ) revert NoLiquidPath();
+            if (mid == address(0) || mid == toToken || mid == address(settlementToken)) revert NoLiquidPath();
 
             address[] memory multiPath = new address[](3);
             multiPath[0] = address(settlementToken);
@@ -408,14 +367,11 @@ contract RWAVault is
      * @param quoteToken  Token to express value in. `address(0)` → WETH.
      * @param shareAmount Number of vault shares to price.
      */
-    function getShareValueIn(
-        address quoteToken,
-        uint256 shareAmount
-    ) external view returns (uint256 value) {
+    function getShareValueIn(address quoteToken, uint256 shareAmount) external view returns (uint256 value) {
         if (shareAmount == 0) revert InvalidAmount();
 
         uint256 assetAmount = convertToAssets(shareAmount);
-        uint256 assetPrice  = getAssetPrice();
+        uint256 assetPrice = getAssetPrice();
         if (assetPrice == 0) revert InvalidAssetPrice();
 
         uint8 oracleDecimals = assetOracle.decimals();
@@ -423,13 +379,9 @@ contract RWAVault is
         uint8 settlementDecimals = IERC20Metadata(address(settlementToken)).decimals();
 
         uint256 settlementValue = VaultLib.assetToSettlementAmount(
-            assetAmount,
-            assetPrice,
-            assetDecimals,
-            oracleDecimals,
-            settlementDecimals
+            assetAmount, assetPrice, assetDecimals, oracleDecimals, settlementDecimals
         );
-        address actualToken     = quoteToken == address(0) ? _resolveWeth() : quoteToken;
+        address actualToken = quoteToken == address(0) ? _resolveWeth() : quoteToken;
 
         if (actualToken == address(settlementToken)) {
             return settlementValue;
@@ -449,13 +401,10 @@ contract RWAVault is
      * @param inputToken  Token being deposited. `address(0)` → WETH equivalent.
      * @param tokenAmount Amount of `inputToken`.
      */
-    function getTokenToShareRate(
-        address inputToken,
-        uint256 tokenAmount
-    ) external view returns (uint256 shares) {
+    function getTokenToShareRate(address inputToken, uint256 tokenAmount) external view returns (uint256 shares) {
         if (tokenAmount == 0) revert InvalidAmount();
 
-        address actualToken     = inputToken == address(0) ? _resolveWeth() : inputToken;
+        address actualToken = inputToken == address(0) ? _resolveWeth() : inputToken;
         uint256 settlementValue;
 
         if (actualToken == address(settlementToken)) {
@@ -472,97 +421,31 @@ contract RWAVault is
         uint8 settlementDecimals = IERC20Metadata(address(settlementToken)).decimals();
 
         uint256 assetAmount = VaultLib.settlementToAssetAmount(
-            settlementValue,
-            assetPrice,
-            assetDecimals,
-            oracleDecimals,
-            settlementDecimals
+            settlementValue, assetPrice, assetDecimals, oracleDecimals, settlementDecimals
         );
         shares = convertToShares(assetAmount);
     }
 
-    function _usesOracleBootstrapRate() internal view returns (bool) {
-        if (totalSupply() == 0) return true;
+    function _usesReportedPreNavRate() internal view returns (bool) {
         if (!reportedInventoryOnly) return false;
         if (settlementEngine == address(0)) revert ReportedNavNotConfigured();
         return !INavReader(settlementEngine).navInitialized(vaultId);
     }
 
-    function _assetsToBootstrapShares(
-        uint256 assets,
-        Math.Rounding rounding
-    ) internal view returns (uint256) {
-        uint256 settlementValue = _assetToSettlementAmount(assets, rounding);
-        uint8 settlementDecimals_ = IERC20Metadata(address(settlementToken)).decimals();
-        return _scaleDecimals(
-            settlementValue,
-            settlementDecimals_,
-            VaultLib.VAULT_SHARE_DECIMALS,
-            rounding
-        );
+    function _convertToSharesWithTotalAssets(uint256 assets, uint256 totalAssets_, Math.Rounding rounding)
+        internal
+        view
+        returns (uint256)
+    {
+        return assets.mulDiv(totalSupply() + 10 ** _decimalsOffset(), totalAssets_ + 1, rounding);
     }
 
-    function _bootstrapSharesToAssets(
-        uint256 shares,
-        Math.Rounding rounding
-    ) internal view returns (uint256) {
-        uint8 settlementDecimals_ = IERC20Metadata(address(settlementToken)).decimals();
-        uint256 settlementValue = _scaleDecimals(
-            shares,
-            VaultLib.VAULT_SHARE_DECIMALS,
-            settlementDecimals_,
-            rounding
-        );
-        return _settlementToAssetAmount(settlementValue, rounding);
-    }
-
-    function _assetToSettlementAmount(
-        uint256 assetAmount,
-        Math.Rounding rounding
-    ) internal view returns (uint256) {
-        uint256 assetPrice = getAssetPrice();
-        if (assetPrice == 0) revert InvalidAssetPrice();
-
-        uint8 oracleDecimals = assetOracle.decimals();
-        uint8 assetDecimals_ = IERC20Metadata(asset()).decimals();
-        uint8 settlementDecimals_ = IERC20Metadata(address(settlementToken)).decimals();
-
-        return assetAmount.mulDiv(
-            assetPrice * 10 ** uint256(settlementDecimals_),
-            10 ** uint256(assetDecimals_) * 10 ** uint256(oracleDecimals),
-            rounding
-        );
-    }
-
-    function _settlementToAssetAmount(
-        uint256 settlementAmount,
-        Math.Rounding rounding
-    ) internal view returns (uint256) {
-        uint256 assetPrice = getAssetPrice();
-        if (assetPrice == 0) revert InvalidAssetPrice();
-
-        uint8 oracleDecimals = assetOracle.decimals();
-        uint8 assetDecimals_ = IERC20Metadata(asset()).decimals();
-        uint8 settlementDecimals_ = IERC20Metadata(address(settlementToken)).decimals();
-
-        return settlementAmount.mulDiv(
-            10 ** uint256(oracleDecimals) * 10 ** uint256(assetDecimals_),
-            assetPrice * 10 ** uint256(settlementDecimals_),
-            rounding
-        );
-    }
-
-    function _scaleDecimals(
-        uint256 amount,
-        uint8 fromDecimals,
-        uint8 toDecimals,
-        Math.Rounding rounding
-    ) internal pure returns (uint256) {
-        if (fromDecimals == toDecimals) return amount;
-        if (fromDecimals < toDecimals) {
-            return amount * 10 ** uint256(toDecimals - fromDecimals);
-        }
-        return amount.mulDiv(1, 10 ** uint256(fromDecimals - toDecimals), rounding);
+    function _convertToAssetsWithTotalAssets(uint256 shares, uint256 totalAssets_, Math.Rounding rounding)
+        internal
+        view
+        returns (uint256)
+    {
+        return shares.mulDiv(totalAssets_ + 1, totalSupply() + 10 ** _decimalsOffset(), rounding);
     }
 
     // ─────────────────────────── ADMIN ──────────────────────────────────────
@@ -607,11 +490,10 @@ contract RWAVault is
      * @notice Wire Settlement + vaultId for reported-inventory accounting.
      * @dev Called by VaultFactory right after registry assignment (before ownership transfer).
      */
-    function configureReportedNav(
-        address settlementEngine_,
-        uint256 vaultId_,
-        bool reportedInventoryOnly_
-    ) external onlyOwner {
+    function configureReportedNav(address settlementEngine_, uint256 vaultId_, bool reportedInventoryOnly_)
+        external
+        onlyOwner
+    {
         if (reportedInventoryOnly_ && settlementEngine_ == address(0)) revert InvalidAddress();
         if (vaultId_ == 0) revert InvalidAmount();
         settlementEngine = settlementEngine_;
@@ -620,13 +502,18 @@ contract RWAVault is
         emit ReportedNavConfigured(settlementEngine_, vaultId_, reportedInventoryOnly_);
     }
 
-    function pause()   external onlyOwner { _pause();   }
-    function unpause() external onlyOwner { _unpause(); }
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
+    }
 
     /**
      * @inheritdoc ERC4626Upgradeable
-     * @dev Empty-vault pricing is handled by the oracle bootstrap conversion,
-     *      so no extra decimal offset is needed.
+     * @dev Shares are collateral-denominated; use OpenZeppelin's default
+     *      virtual share offset.
      */
     function _decimalsOffset() internal pure override returns (uint8) {
         return 0;
@@ -636,7 +523,9 @@ contract RWAVault is
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
     /// @dev 6 decimal shares align with 6-decimal settlement tokens (e.g. USDC, USDT) as the primary pricing unit.
-    function decimals() public pure override returns (uint8) { return 6; }
+    function decimals() public pure override returns (uint8) {
+        return 6;
+    }
 
     /// @dev Reduced by 3 for settlementEngine, vaultId, reportedInventoryOnly.
     uint256[41] private __gap;

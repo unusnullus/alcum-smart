@@ -51,9 +51,7 @@ contract OpenLiquidityRouterTest is V2TestBase {
         alt.mint(user, 1_000e6);
         vm.startPrank(user);
         alt.approve(address(router), 1_000e6);
-        vm.expectRevert(
-            abi.encodeWithSelector(OpenLiquidityRouter.TokenNotAllowlisted.selector, address(alt))
-        );
+        vm.expectRevert(abi.encodeWithSelector(OpenLiquidityRouter.TokenNotAllowlisted.selector, address(alt)));
         router.zapAndDeposit(vaultId, IERC20(address(alt)), 1_000e6, DEPOSIT_ID, 100, 0);
         vm.stopPrank();
     }
@@ -107,33 +105,14 @@ contract OpenLiquidityRouterTest is V2TestBase {
         usdc.approve(address(router), amount * (maxPending + 1));
 
         for (uint256 i; i < maxPending; i++) {
-            router.zapAndDeposit(
-                vaultId,
-                IERC20(address(usdc)),
-                amount,
-                keccak256(abi.encode("spam", i)),
-                100,
-                0
-            );
+            router.zapAndDeposit(vaultId, IERC20(address(usdc)), amount, keccak256(abi.encode("spam", i)), 100, 0);
         }
         assertEq(router.getOpenPendingDeposits(vaultId, user), maxPending);
 
         vm.expectRevert(
-            abi.encodeWithSelector(
-                OpenLiquidityRouter.TooManyPendingDeposits.selector,
-                user,
-                maxPending,
-                maxPending
-            )
+            abi.encodeWithSelector(OpenLiquidityRouter.TooManyPendingDeposits.selector, user, maxPending, maxPending)
         );
-        router.zapAndDeposit(
-            vaultId,
-            IERC20(address(usdc)),
-            amount,
-            keccak256("spam-overflow"),
-            100,
-            0
-        );
+        router.zapAndDeposit(vaultId, IERC20(address(usdc)), amount, keccak256("spam-overflow"), 100, 0);
         vm.stopPrank();
     }
 
@@ -175,13 +154,7 @@ contract OpenLiquidityRouterTest is V2TestBase {
         vm.warp(block.timestamp + maxAge + 1);
 
         vm.expectRevert(
-            abi.encodeWithSelector(
-                OracleLib.StaleOracle.selector,
-                address(stale),
-                updatedAt,
-                maxAge,
-                block.timestamp
-            )
+            abi.encodeWithSelector(OracleLib.StaleOracle.selector, address(stale), updatedAt, maxAge, block.timestamp)
         );
         vm.prank(curator);
         router.approveDeposit(vaultId, DEPOSIT_ID, USDC_AMOUNT, ASSET_PRICE);
@@ -249,6 +222,117 @@ contract OpenLiquidityRouterTest is V2TestBase {
 
         assertTrue(settlement.navInitialized(vid));
         assertEq(v.totalAssets(), 1_000e6);
+    }
+
+    function test_reportedInventory_getTokenToShareRate_usesCollateralRateBeforeNav() public {
+        vm.startPrank(admin);
+        (uint256 vid, address vAddr,,) = factory.createVault(
+            VaultFactory.CreateVaultParams({
+                assetToken: address(assetToken),
+                settlementToken: address(usdc),
+                assetOracle: address(assetOracle),
+                uniswapRouter: address(uniswapRouter),
+                useEpochs: true,
+                epochDuration: 600,
+                wethToken: weth,
+                vaultName: "Reported Collateral Rate",
+                vaultSymbol: "xRBR",
+                operator: address(0),
+                treasury: treasury,
+                reportedInventoryOnly: true
+            })
+        );
+        registry.authorizeVaultMint(vid);
+        vm.stopPrank();
+
+        RWAVault v = RWAVault(vAddr);
+        assertFalse(settlement.navInitialized(vid));
+        assertEq(v.totalAssets(), 0);
+        assertEq(v.getTokenToShareRate(address(usdc), USDC_AMOUNT), 1_000e6);
+    }
+
+    function test_reportedInventory_firstDeposit_mintsCollateralDenominatedSharesBeforeNav() public {
+        vm.startPrank(admin);
+        (uint256 vid, address vAddr,,) = factory.createVault(
+            VaultFactory.CreateVaultParams({
+                assetToken: address(assetToken),
+                settlementToken: address(usdc),
+                assetOracle: address(assetOracle),
+                uniswapRouter: address(uniswapRouter),
+                useEpochs: true,
+                epochDuration: 600,
+                wethToken: weth,
+                vaultName: "Reported First Deposit",
+                vaultSymbol: "xRFD",
+                operator: address(0),
+                treasury: treasury,
+                reportedInventoryOnly: true
+            })
+        );
+        registry.authorizeVaultMint(vid);
+        vm.stopPrank();
+
+        bytes32 did = keccak256("reported-first-deposit");
+        usdc.mint(user, USDC_AMOUNT);
+        vm.startPrank(user);
+        usdc.approve(address(router), USDC_AMOUNT);
+        router.zapAndDeposit(vid, IERC20(address(usdc)), USDC_AMOUNT, did, 100, 0);
+        vm.stopPrank();
+
+        vm.prank(curator);
+        router.approveDeposit(vid, did, USDC_AMOUNT, ASSET_PRICE);
+
+        VaultLib.Deposit memory d = router.getDeposit(vid, did);
+        assertEq(d.approvedAssetAmount, 1_000e6);
+        assertEq(d.approvedShares, 1_000e6);
+        assertEq(RWAVault(vAddr).totalAssets(), 0);
+        assertFalse(settlement.navInitialized(vid));
+    }
+
+    function test_reportedInventory_secondDepositBeforeNav_usesAssetBalanceRate() public {
+        vm.startPrank(admin);
+        (uint256 vid, address vAddr,,) = factory.createVault(
+            VaultFactory.CreateVaultParams({
+                assetToken: address(assetToken),
+                settlementToken: address(usdc),
+                assetOracle: address(assetOracle),
+                uniswapRouter: address(uniswapRouter),
+                useEpochs: true,
+                epochDuration: 600,
+                wethToken: weth,
+                vaultName: "Reported Second Deposit",
+                vaultSymbol: "xRSD",
+                operator: address(0),
+                treasury: treasury,
+                reportedInventoryOnly: true
+            })
+        );
+        registry.authorizeVaultMint(vid);
+        vm.stopPrank();
+
+        bytes32 firstId = keccak256("reported-first-deposit");
+        bytes32 secondId = keccak256("reported-second-deposit");
+
+        for (uint256 i = 0; i < 2; ++i) {
+            address depositor = i == 0 ? user : user2;
+            bytes32 depositId = i == 0 ? firstId : secondId;
+
+            usdc.mint(depositor, USDC_AMOUNT);
+            vm.startPrank(depositor);
+            usdc.approve(address(router), USDC_AMOUNT);
+            router.zapAndDeposit(vid, IERC20(address(usdc)), USDC_AMOUNT, depositId, 100, 0);
+            vm.stopPrank();
+
+            vm.prank(curator);
+            router.approveDeposit(vid, depositId, USDC_AMOUNT, ASSET_PRICE);
+        }
+
+        VaultLib.Deposit memory firstDeposit = router.getDeposit(vid, firstId);
+        VaultLib.Deposit memory secondDeposit = router.getDeposit(vid, secondId);
+        assertEq(firstDeposit.approvedShares, 1_000e6);
+        assertEq(secondDeposit.approvedShares, 1_000e6);
+        assertEq(RWAVault(vAddr).totalAssets(), 0);
+        assertFalse(settlement.navInitialized(vid));
     }
 }
 
