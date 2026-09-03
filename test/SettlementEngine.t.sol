@@ -127,13 +127,16 @@ contract SettlementEngineTest is Test {
         ERC1967Proxy xcupProxy = new ERC1967Proxy(address(xcupImpl), xcupInitData);
         xcup = xCUP(address(xcupProxy));
 
-        // Deploy SettlementEngine
+        // Deploy SettlementEngine (initialize requires: vault, treasury, zapper,
+        //   redeemSilo, epochManager, copperPriceConsumer, usdc, systemFeeBps)
+        address mockRedeemSilo = makeAddr("redeemSilo");
         SettlementEngine settlementImpl = new SettlementEngine();
         bytes memory settlementInitData = abi.encodeWithSelector(
             SettlementEngine.initialize.selector,
             address(xcup),
             treasury,
             zapper,
+            mockRedeemSilo,
             address(epochManager),
             address(copperPriceConsumer),
             address(usdc),
@@ -580,6 +583,7 @@ contract SettlementEngineTest is Test {
             address(0), // Zero vault
             treasury,
             zapper,
+            makeAddr("redeemSilo"),
             address(epochManager),
             address(copperPriceConsumer),
             address(usdc),
@@ -597,6 +601,7 @@ contract SettlementEngineTest is Test {
             address(xcup),
             address(0), // Zero treasury
             zapper,
+            makeAddr("redeemSilo"),
             address(epochManager),
             address(copperPriceConsumer),
             address(usdc),
@@ -614,6 +619,7 @@ contract SettlementEngineTest is Test {
             address(xcup),
             treasury,
             address(0), // Zero zapper
+            makeAddr("redeemSilo"),
             address(epochManager),
             address(copperPriceConsumer),
             address(usdc),
@@ -631,6 +637,7 @@ contract SettlementEngineTest is Test {
             address(xcup),
             treasury,
             zapper,
+            makeAddr("redeemSilo"),
             address(0), // Zero epoch manager
             address(copperPriceConsumer),
             address(usdc),
@@ -648,6 +655,7 @@ contract SettlementEngineTest is Test {
             address(xcup),
             treasury,
             zapper,
+            makeAddr("redeemSilo"),
             address(epochManager),
             address(0), // Zero copper price consumer
             address(usdc),
@@ -665,6 +673,7 @@ contract SettlementEngineTest is Test {
             address(xcup),
             treasury,
             zapper,
+            makeAddr("redeemSilo"),
             address(epochManager),
             address(copperPriceConsumer),
             address(0), // Zero USDC
@@ -682,6 +691,7 @@ contract SettlementEngineTest is Test {
             address(xcup),
             treasury,
             zapper,
+            makeAddr("redeemSilo"),
             address(epochManager),
             address(copperPriceConsumer),
             address(usdc),

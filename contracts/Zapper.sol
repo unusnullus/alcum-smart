@@ -406,6 +406,7 @@ contract Zapper is
             tokenIn,
             amount,
             slippageBps,
+            0,
             _router,
             _usdc,
             address(_silo),

@@ -16,6 +16,9 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IUniswapV2Router02} from "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 
 import {IAssetOracle} from "./interfaces/IAssetOracle.sol";
+import {INavReader} from "./interfaces/INavReader.sol";
+
+import {VaultLib} from "./libraries/VaultLib.sol";
 
 /**
  * @title RWAVault
@@ -68,6 +71,15 @@ contract RWAVault is
      */
     address public swapIntermediary;
 
+    /// @notice SharedSettlementEngine — source of reported NAV when `reportedInventoryOnly`.
+    address public settlementEngine;
+
+    /// @notice Registry vault id (set by VaultFactory after registration).
+    uint256 public vaultId;
+
+    /// @notice When true, ERC-4626 `totalAssets` follows operator-reported NAV (§05).
+    bool public reportedInventoryOnly;
+
     // ─────────────────────────── ERRORS ─────────────────────────────────────
 
     error InvalidAddress();
@@ -75,6 +87,7 @@ contract RWAVault is
     error InvalidAssetPrice();
     error OracleNotSet();
     error NoLiquidPath();
+    error ReportedNavNotConfigured();
 
     // ─────────────────────────── EVENTS ─────────────────────────────────────
 
@@ -83,6 +96,11 @@ contract RWAVault is
     event SettlementTokenUpdated(address indexed previous, address indexed current);
     event WethTokenUpdated(address indexed previous, address indexed current);
     event SwapIntermediaryUpdated(address indexed previous, address indexed current);
+    event ReportedNavConfigured(
+        address indexed settlementEngine,
+        uint256 indexed vaultId,
+        bool reportedInventoryOnly
+    );
 
     // ─────────────────────────── INIT ───────────────────────────────────────
 
@@ -176,6 +194,83 @@ contract RWAVault is
         address owner
     ) public override onlyRole(REDEEMER_ROLE) nonReentrant whenNotPaused returns (uint256 assets) {
         return super.redeem(shares, receiver, owner);
+    }
+
+    /**
+     * @inheritdoc ERC4626Upgradeable
+     * @dev Returns 0 while paused so integrators do not assume deposits are open (FIND-002).
+     */
+    function maxDeposit(address receiver) public view override returns (uint256) {
+        if (paused()) return 0;
+        return super.maxDeposit(receiver);
+    }
+
+    /**
+     * @inheritdoc ERC4626Upgradeable
+     * @dev See {maxDeposit}.
+     */
+    function maxMint(address receiver) public view override returns (uint256) {
+        if (paused()) return 0;
+        return super.maxMint(receiver);
+    }
+
+    /**
+     * @inheritdoc ERC4626Upgradeable
+     * @dev Direct withdraw is REDEEMER_ROLE-only (router/RFQ). EOAs and other integrators see 0.
+     */
+    function maxWithdraw(address owner) public view override returns (uint256) {
+        if (paused()) return 0;
+        if (!hasRole(REDEEMER_ROLE, _msgSender())) return 0;
+        return convertToAssets(balanceOf(owner));
+    }
+
+    /**
+     * @inheritdoc ERC4626Upgradeable
+     * @dev See {maxWithdraw}.
+     */
+    function maxRedeem(address owner) public view override returns (uint256) {
+        if (paused()) return 0;
+        if (!hasRole(REDEEMER_ROLE, _msgSender())) return 0;
+        return balanceOf(owner);
+    }
+
+    /**
+     * @inheritdoc ERC4626Upgradeable
+     * @dev Sync vaults: on-chain asset balance.
+     *      Reported-inventory vaults: operator NAV converted to asset units (§05).
+     *      Before first `updateNAV` (`!navInitialized`): returns 0 (catalog/Z2 gate).
+     */
+    function totalAssets() public view override returns (uint256) {
+        if (!reportedInventoryOnly) {
+            return IERC20(asset()).balanceOf(address(this));
+        }
+        if (settlementEngine == address(0)) revert ReportedNavNotConfigured();
+
+        INavReader settlement = INavReader(settlementEngine);
+        if (!settlement.navInitialized(vaultId)) return 0;
+
+        INavReader.NAVComponents memory n = settlement.getNav(vaultId);
+        uint256 spot = n.assetSpotPrice;
+        if (spot == 0) return n.assetInInventory + n.assetInTransit;
+
+        uint256 settlementSide = n.retainedEarnings + n.stablecoinBalance;
+        uint256 netSettlement = settlementSide > n.liabilities
+            ? settlementSide - n.liabilities
+            : 0;
+
+        uint8 oracleDecimals = assetOracle.decimals();
+        uint8 assetDecimals_ = IERC20Metadata(asset()).decimals();
+        uint8 settlementDecimals_ = IERC20Metadata(address(settlementToken)).decimals();
+
+        uint256 fromSettlement = VaultLib.settlementToAssetAmount(
+            netSettlement,
+            spot,
+            assetDecimals_,
+            oracleDecimals,
+            settlementDecimals_
+        );
+
+        return n.assetInInventory + n.assetInTransit + fromSettlement;
     }
 
     // ─────────────────────────── PRICE UTILITIES ────────────────────────────
@@ -288,10 +383,17 @@ contract RWAVault is
         uint256 assetPrice  = getAssetPrice();
         if (assetPrice == 0) revert InvalidAssetPrice();
 
-        uint8   oracleDecimals = assetOracle.decimals();
-        uint256 scale          = 10 ** uint256(oracleDecimals);
+        uint8 oracleDecimals = assetOracle.decimals();
+        uint8 assetDecimals = IERC20Metadata(asset()).decimals();
+        uint8 settlementDecimals = IERC20Metadata(address(settlementToken)).decimals();
 
-        uint256 settlementValue = (assetAmount * assetPrice) / scale;
+        uint256 settlementValue = VaultLib.assetToSettlementAmount(
+            assetAmount,
+            assetPrice,
+            assetDecimals,
+            oracleDecimals,
+            settlementDecimals
+        );
         address actualToken     = quoteToken == address(0) ? _resolveWeth() : quoteToken;
 
         if (actualToken == address(settlementToken)) {
@@ -330,10 +432,17 @@ contract RWAVault is
         uint256 assetPrice = getAssetPrice();
         if (assetPrice == 0) revert InvalidAssetPrice();
 
-        uint8   oracleDecimals = assetOracle.decimals();
-        uint256 scale          = 10 ** uint256(oracleDecimals);
+        uint8 oracleDecimals = assetOracle.decimals();
+        uint8 assetDecimals = IERC20Metadata(asset()).decimals();
+        uint8 settlementDecimals = IERC20Metadata(address(settlementToken)).decimals();
 
-        uint256 assetAmount = (settlementValue * scale) / assetPrice;
+        uint256 assetAmount = VaultLib.settlementToAssetAmount(
+            settlementValue,
+            assetPrice,
+            assetDecimals,
+            oracleDecimals,
+            settlementDecimals
+        );
         shares = convertToShares(assetAmount);
     }
 
@@ -375,6 +484,23 @@ contract RWAVault is
         swapIntermediary = newIntermediary;
     }
 
+    /**
+     * @notice Wire Settlement + vaultId for reported-inventory accounting.
+     * @dev Called by VaultFactory right after registry assignment (before ownership transfer).
+     */
+    function configureReportedNav(
+        address settlementEngine_,
+        uint256 vaultId_,
+        bool reportedInventoryOnly_
+    ) external onlyOwner {
+        if (reportedInventoryOnly_ && settlementEngine_ == address(0)) revert InvalidAddress();
+        if (vaultId_ == 0) revert InvalidAmount();
+        settlementEngine = settlementEngine_;
+        vaultId = vaultId_;
+        reportedInventoryOnly = reportedInventoryOnly_;
+        emit ReportedNavConfigured(settlementEngine_, vaultId_, reportedInventoryOnly_);
+    }
+
     function pause()   external onlyOwner { _pause();   }
     function unpause() external onlyOwner { _unpause(); }
 
@@ -398,5 +524,6 @@ contract RWAVault is
     /// @dev 6 decimal shares align with 6-decimal settlement tokens (e.g. USDC, USDT) as the primary pricing unit.
     function decimals() public pure override returns (uint8) { return 6; }
 
-    uint256[44] private __gap;
+    /// @dev Reduced by 3 for settlementEngine, vaultId, reportedInventoryOnly.
+    uint256[41] private __gap;
 }

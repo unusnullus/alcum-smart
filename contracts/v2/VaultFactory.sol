@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
@@ -33,7 +34,7 @@ interface IVaultOperatorRegistry {
  *      RFQEngine is shared across all vaults and is injected at initialization time.
  *      VaultFactory itself must hold FACTORY_ROLE in VaultRegistry before calling createVault.
  */
-contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
+contract VaultFactory is Initializable, OwnableUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgradeable {
     // ─────────────────────────── STATE ──────────────────────────────────────
 
     VaultRegistry public registry;
@@ -106,7 +107,7 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         /// @notice ERC-20 symbol for vault shares (e.g. "xGOLD").
         string vaultSymbol;
         /// @notice Operational operator address.
-        ///         Receives VAULT_CURATOR_ROLE + HOST_INTEGRATION_ROLE on OpenLiquidityRouter,
+        ///         Receives per-vault curator rights on OpenLiquidityRouter via setVaultOperator,
         ///         REVENUE_MANAGER_ROLE on SharedSettlementEngine, and
         ///         FACILITY_OPERATOR_ROLE on the deployed CapitalFacility.
         ///         Pass address(0) to skip — roles can be granted manually later.
@@ -154,6 +155,7 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         if (sharedSettlementEngine_ == address(0)) revert ZeroAddress();
 
         __Ownable_init(_msgSender());
+        __ReentrancyGuard_init();
         __UUPSUpgradeable_init();
 
         registry = VaultRegistry(registry_);
@@ -184,7 +186,7 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
      */
     function createVault(
         CreateVaultParams calldata p
-    ) external returns (uint256 vaultId, address vaultAddr, address facilityAddr, address epochManagerAddr) {
+    ) external nonReentrant returns (uint256 vaultId, address vaultAddr, address facilityAddr, address epochManagerAddr) {
         _validate(p);
 
         if (p.useEpochs) {
@@ -204,6 +206,15 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
             p.uniswapRouter,
             epochManagerAddr,
             p.treasury,
+            p.reportedInventoryOnly
+        );
+
+        CapitalFacility(facilityAddr).setVaultId(vaultId);
+
+        // §05: vault reads Settlement NAV when reportedInventoryOnly.
+        RWAVault(vaultAddr).configureReportedNav(
+            sharedSettlementEngine,
+            vaultId,
             p.reportedInventoryOnly
         );
 
@@ -323,8 +334,8 @@ contract VaultFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable {
      *      - FACILITY_OPERATOR_ROLE on the newly deployed CapitalFacility (factory is its admin).
      *      - EPOCH_MANAGER_ROLE on EpochManager (when useEpochs=true) so the operator can
      *        advance epochs via nextEpoch() after settling revenue.
-     *      - setVaultOperator(vaultId, operator) on OpenLiquidityRouter  — grants curator +
-     *        host-integration rights scoped to this vault only.
+     *      - setVaultOperator(vaultId, operator) on OpenLiquidityRouter — grants curator
+     *        rights scoped to this vault only.
      *      - setVaultOperator(vaultId, operator) on SharedSettlementEngine — grants revenue-manager
      *        rights scoped to this vault only.
      *

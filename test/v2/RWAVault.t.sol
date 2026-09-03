@@ -37,6 +37,7 @@ contract RWAVaultTest is V2TestBase {
     // ─── deposit (ERC-4626) ───────────────────────────────────────────────────
 
     function _mintAndDeposit(address depositor, uint256 amount) internal returns (uint256 shares) {
+        vm.prank(admin);
         assetToken.mint(depositor, amount);
         vm.prank(depositor);
         assetToken.approve(address(vault), amount);
@@ -66,6 +67,7 @@ contract RWAVaultTest is V2TestBase {
         uint256 targetShares = 2_000_000_000_000; // respects virtual offset in empty vault
         uint256 assetsNeeded = vault.previewMint(targetShares);
 
+        vm.prank(admin);
         assetToken.mint(user, assetsNeeded);
         vm.startPrank(user);
         assetToken.approve(address(vault), assetsNeeded);
@@ -137,6 +139,7 @@ contract RWAVaultTest is V2TestBase {
         vm.prank(admin);
         vault.pause();
 
+        vm.prank(admin);
         assetToken.mint(user, DEPOSIT_AMOUNT);
         vm.prank(user);
         assetToken.approve(address(vault), DEPOSIT_AMOUNT);
@@ -339,5 +342,56 @@ contract RWAVaultTest is V2TestBase {
         // totalAssets = DEPOSIT_AMOUNT, totalSupply = DEPOSIT_AMOUNT → 1:1
         uint256 assets = vault.convertToAssets(vault.balanceOf(user));
         assertApproxEqAbs(assets, DEPOSIT_AMOUNT, 1);
+    }
+
+    // ─── ERC-4626 max* views (FIND-002) ───────────────────────────────────────
+
+    function test_maxDeposit_maxMint_openWhenNotPaused() public {
+        assertGt(vault.maxDeposit(user), 0);
+        assertGt(vault.maxMint(user), 0);
+    }
+
+    function test_maxDeposit_maxMint_zeroWhenPaused() public {
+        vm.prank(admin);
+        vault.pause();
+
+        assertEq(vault.maxDeposit(user), 0);
+        assertEq(vault.maxMint(user), 0);
+    }
+
+    function test_maxWithdraw_maxRedeem_zeroForEoa() public {
+        _mintAndDeposit(user, DEPOSIT_AMOUNT);
+
+        vm.prank(user);
+        assertEq(vault.maxWithdraw(user), 0);
+        assertEq(vault.maxRedeem(user), 0);
+    }
+
+    function test_maxWithdraw_maxRedeem_nonZeroForRedeemer() public {
+        uint256 shares = _mintAndDeposit(user, DEPOSIT_AMOUNT);
+
+        bytes32 redeemerRole = vault.REDEEMER_ROLE();
+        vm.prank(admin);
+        vault.grantRole(redeemerRole, admin);
+
+        vm.startPrank(admin);
+        assertEq(vault.maxRedeem(user), shares);
+        assertGt(vault.convertToAssets(vault.balanceOf(user)), 0);
+        assertApproxEqAbs(vault.maxWithdraw(user), DEPOSIT_AMOUNT, 1);
+        vm.stopPrank();
+    }
+
+    function test_maxWithdraw_maxRedeem_zeroWhenPausedEvenForRedeemer() public {
+        _mintAndDeposit(user, DEPOSIT_AMOUNT);
+
+        bytes32 redeemerRole = vault.REDEEMER_ROLE();
+        vm.startPrank(admin);
+        vault.grantRole(redeemerRole, admin);
+        vault.pause();
+        vm.stopPrank();
+
+        vm.prank(admin);
+        assertEq(vault.maxWithdraw(user), 0);
+        assertEq(vault.maxRedeem(user), 0);
     }
 }

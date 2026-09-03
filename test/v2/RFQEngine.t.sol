@@ -17,7 +17,6 @@ contract RFQEngineTest is V2TestBase {
 
     /// Give `user` shares and approve rfqEngine.
     function _giveUserShares(uint256 amount) internal {
-        // Mint assetToken into the vault first (simulate prior deposit)
         vm.startPrank(admin);
         assetToken.mint(vaultAddr, amount);
         vm.stopPrank();

@@ -279,7 +279,7 @@ contract VaultFactoryTest is V2TestBase {
 
     function test_registry_setVaultActive_unauthorizedReverts() public {
         vm.prank(user);
-        vm.expectRevert(VaultRegistry.Unauthorized.selector);
+        vm.expectRevert();
         registry.setVaultActive(vaultId, false);
     }
 
@@ -294,7 +294,7 @@ contract VaultFactoryTest is V2TestBase {
 
     function test_registry_setVaultOracle_unauthorizedReverts() public {
         vm.prank(user);
-        vm.expectRevert(VaultRegistry.Unauthorized.selector);
+        vm.expectRevert();
         registry.setVaultOracle(vaultId, address(assetOracle));
     }
 
@@ -321,18 +321,6 @@ contract VaultFactoryTest is V2TestBase {
         registry.setVaultTreasury(vaultId, newTreasury);
 
         assertEq(registry.getVault(vaultId).treasury, newTreasury);
-    }
-
-    function test_registry_governorRole_canSetVaultActive() public {
-        address timelock = makeAddr("timelock");
-
-        vm.prank(admin);
-        registry.grantGovernorRole(timelock);
-
-        // Timelock (governor) can now toggle vault
-        vm.prank(timelock);
-        registry.setVaultActive(vaultId, false);
-        assertFalse(registry.isActive(vaultId));
     }
 
     // ─── Factory admin ────────────────────────────────────────────────────

@@ -6,6 +6,8 @@ import {AccessControlUpgradeable} from "@openzeppelin/contracts-upgradeable/acce
 import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
+
 import {VaultLib} from "./libraries/VaultLib.sol";
 
 /**
@@ -14,9 +16,7 @@ import {VaultLib} from "./libraries/VaultLib.sol";
  *
  * @dev Access control:
  *      FACTORY_ROLE   — granted to VaultFactory; the only address that may register new vaults.
- *      GOVERNOR_ROLE  — intended for an on-chain Timelock (AlcumGovernor); may toggle vault
- *                       activity and update per-vault oracle and epoch-manager references.
- *      owner          — protocol multisig; may also perform governance actions and grant roles.
+ *      owner          — protocol multisig; soft-pause vaults and rotate oracle / epoch manager / treasury.
  *
  *      Sequential vaultIds start at 1 (0 is reserved as "not found" in reverse lookups).
  */
@@ -24,16 +24,6 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
     // ─────────────────────────── ROLES ──────────────────────────────────────
 
     bytes32 public constant FACTORY_ROLE = keccak256("FACTORY_ROLE");
-
-    /**
-     * @notice Role for on-chain governance proposals.
-     *         Grants permission to:
-     *           - toggle vault active/inactive
-     *           - rotate the vault's price oracle
-     *           - rotate the vault's epoch manager
-     * @dev Assign to an AlcumGovernor Timelock contract.
-     */
-    bytes32 public constant GOVERNOR_ROLE = keccak256("GOVERNOR_ROLE");
 
     // ─────────────────────────── STATE ──────────────────────────────────────
 
@@ -45,6 +35,17 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
 
     /// @notice vault proxy address → vaultId (reverse lookup).
     mapping(address => uint256) public vaultIdByAddress;
+
+    /// @notice vaultId → whether OpenLiquidityRouter / SharedSettlementEngine may mint this vault's asset token.
+    mapping(uint256 => bool) public mintAuthorized;
+
+    /// @notice Default max oracle age for freshness checks (FIND-029). `0` disables checks.
+    uint256 public defaultMaxOracleAge;
+
+    /// @notice Per-vault override. `0` → use `defaultMaxOracleAge`.
+    mapping(uint256 => uint256) private _vaultMaxOracleAge;
+    /// @dev True when an explicit per-vault age was set (including zero = disable for that vault).
+    mapping(uint256 => bool) private _vaultMaxOracleAgeSet;
 
     // ─────────────────────────── EVENTS ─────────────────────────────────────
 
@@ -59,14 +60,19 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
     event VaultOracleUpdated(uint256 indexed vaultId, address indexed oldOracle, address indexed newOracle);
     event VaultEpochManagerUpdated(uint256 indexed vaultId, address indexed oldEm, address indexed newEm);
     event VaultTreasuryUpdated(uint256 indexed vaultId, address indexed oldTreasury, address indexed newTreasury);
-    event GovernorGranted(address indexed account);
+    event VaultMintAuthorized(uint256 indexed vaultId, address indexed assetToken, address indexed by);
+    event DefaultMaxOracleAgeUpdated(uint256 oldAge, uint256 newAge);
+    event VaultMaxOracleAgeUpdated(uint256 indexed vaultId, uint256 maxAge, bool explicit);
 
     // ─────────────────────────── ERRORS ─────────────────────────────────────
 
     error ZeroAddress();
     error VaultAlreadyRegistered(address vault);
-    error Unauthorized();
     error ReportedInventoryRequiresEpochs();
+    error MintNotAuthorized(uint256 vaultId);
+    error MintAlreadyAuthorized(uint256 vaultId);
+    error NotAssetMinterAdmin(address caller, address assetToken);
+    error AssetTokenNotAccessControl(address assetToken);
 
     // ─────────────────────────── INIT ───────────────────────────────────────
 
@@ -86,6 +92,8 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
         __UUPSUpgradeable_init();
         _grantRole(DEFAULT_ADMIN_ROLE, admin_);
         nextVaultId = 1;
+        // FIND-029: 25 hours default; ops may raise per-vault / globally as bypass.
+        defaultMaxOracleAge = 25 hours;
     }
 
     // ─────────────────────────── FACTORY ────────────────────────────────────
@@ -141,25 +149,47 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
         emit VaultRegistered(vaultId, vault, assetToken, capitalFacility, rfqEngine);
     }
 
-    // ─────────────────────────── GOVERNANCE ─────────────────────────────────
-
     /**
-     * @notice Grant GOVERNOR_ROLE to a Timelock controller.
-     * @dev Wire this after deploying the AlcumGovernor + Timelock pair.
+     * @notice Authorize minting paths for a vault (deposit approve settle + revenue distribute).
+     * @dev Callable only by the admin of `MINTER_ROLE` on the vault's asset token.
+     *      Issuer onboarding: call this before granting the shared router/engine `MINTER_ROLE`
+     *      on the asset token so rogue vaults cannot use the global minter grant.
      */
-    function grantGovernorRole(address timelock) external onlyOwner {
-        if (timelock == address(0)) revert ZeroAddress();
-        _grantRole(GOVERNOR_ROLE, timelock);
-        emit GovernorGranted(timelock);
+    function authorizeVaultMint(uint256 vaultId) external {
+        _requireExists(vaultId);
+        if (mintAuthorized[vaultId]) revert MintAlreadyAuthorized(vaultId);
+
+        address assetToken = _vaults[vaultId].assetToken;
+        bytes32 minterRole = keccak256("MINTER_ROLE");
+
+        bytes32 adminRole;
+        try IAccessControl(assetToken).getRoleAdmin(minterRole) returns (bytes32 role) {
+            adminRole = role;
+        } catch {
+            revert AssetTokenNotAccessControl(assetToken);
+        }
+
+        if (!IAccessControl(assetToken).hasRole(adminRole, msg.sender)) {
+            revert NotAssetMinterAdmin(msg.sender, assetToken);
+        }
+
+        mintAuthorized[vaultId] = true;
+        emit VaultMintAuthorized(vaultId, assetToken, msg.sender);
     }
+
+    /// @notice Whether deposit approve-settle and revenue distribution may mint for `vaultId`.
+    function isMintAuthorized(uint256 vaultId) external view returns (bool) {
+        return mintAuthorized[vaultId];
+    }
+
+    // ─────────────────────────── PROTOCOL ADMIN ─────────────────────────────
 
     /**
      * @notice Activate or deactivate a vault (pauses new deposits and redemptions).
-     * @dev Callable by owner or GOVERNOR_ROLE. A deactivated vault still allows
-     *      existing RFQ fills and pending redemption claims to complete.
+     * @dev A deactivated vault still allows existing RFQ fills and pending redemption
+     *      claims to complete (consumers decide exact gates).
      */
-    function setVaultActive(uint256 vaultId, bool active) external {
-        if (!hasRole(GOVERNOR_ROLE, msg.sender) && msg.sender != owner()) revert Unauthorized();
+    function setVaultActive(uint256 vaultId, bool active) external onlyOwner {
         _requireExists(vaultId);
         _vaults[vaultId].active = active;
         emit VaultStatusChanged(vaultId, active);
@@ -167,12 +197,10 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
 
     /**
      * @notice Replace the price oracle for a vault.
-     * @dev Governance proposal target — allows oracle migration without redeploying
-     *      the vault. The new oracle must implement IAssetOracle and return prices
-     *      with 8 decimal precision.
+     * @dev Allows oracle migration without redeploying the vault. The new oracle must
+     *      implement IAssetOracle and return prices with 8 decimal precision.
      */
-    function setVaultOracle(uint256 vaultId, address newOracle) external {
-        if (!hasRole(GOVERNOR_ROLE, msg.sender) && msg.sender != owner()) revert Unauthorized();
+    function setVaultOracle(uint256 vaultId, address newOracle) external onlyOwner {
         _requireExists(vaultId);
         if (newOracle == address(0)) revert ZeroAddress();
 
@@ -186,8 +214,7 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
      * @dev Used when migrating to a new EpochManager implementation or adjusting
      *      settlement cycle parameters that require a fresh deployment.
      */
-    function setVaultEpochManager(uint256 vaultId, address newEm) external {
-        if (!hasRole(GOVERNOR_ROLE, msg.sender) && msg.sender != owner()) revert Unauthorized();
+    function setVaultEpochManager(uint256 vaultId, address newEm) external onlyOwner {
         _requireExists(vaultId);
         if (newEm == address(0)) revert ZeroAddress();
 
@@ -201,8 +228,7 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
      * @dev Receives USDC from deposit claims and serves as the fee-routing fallback
      *      for this vault in SharedSettlementEngine.
      */
-    function setVaultTreasury(uint256 vaultId, address newTreasury) external {
-        if (!hasRole(GOVERNOR_ROLE, msg.sender) && msg.sender != owner()) revert Unauthorized();
+    function setVaultTreasury(uint256 vaultId, address newTreasury) external onlyOwner {
         _requireExists(vaultId);
         if (newTreasury == address(0)) revert ZeroAddress();
 
@@ -211,7 +237,38 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
         emit VaultTreasuryUpdated(vaultId, old, newTreasury);
     }
 
+    /// @notice Set protocol-wide default max oracle age (`0` disables freshness checks).
+    function setDefaultMaxOracleAge(uint256 newAge) external onlyOwner {
+        emit DefaultMaxOracleAgeUpdated(defaultMaxOracleAge, newAge);
+        defaultMaxOracleAge = newAge;
+    }
+
+    /**
+     * @notice Set per-vault max oracle age override.
+     * @dev Pass `clear=true` to remove the override (falls back to default).
+     *      Pass `clear=false, maxAge=0` to disable checks for this vault only.
+     */
+    function setVaultMaxOracleAge(uint256 vaultId, uint256 maxAge, bool clear) external onlyOwner {
+        _requireExists(vaultId);
+        if (clear) {
+            delete _vaultMaxOracleAge[vaultId];
+            delete _vaultMaxOracleAgeSet[vaultId];
+            emit VaultMaxOracleAgeUpdated(vaultId, 0, false);
+            return;
+        }
+        _vaultMaxOracleAge[vaultId] = maxAge;
+        _vaultMaxOracleAgeSet[vaultId] = true;
+        emit VaultMaxOracleAgeUpdated(vaultId, maxAge, true);
+    }
+
     // ─────────────────────────── VIEWS ──────────────────────────────────────
+
+    /// @notice Effective max oracle age for `vaultId` (per-vault override or default).
+    function effectiveMaxOracleAge(uint256 vaultId) external view returns (uint256) {
+        _requireExists(vaultId);
+        if (_vaultMaxOracleAgeSet[vaultId]) return _vaultMaxOracleAge[vaultId];
+        return defaultMaxOracleAge;
+    }
 
     /// @notice Full registry record. Reverts if `vaultId` has never been registered.
     function getVault(uint256 vaultId) external view returns (VaultLib.VaultRecord memory) {
@@ -244,5 +301,6 @@ contract VaultRegistry is Initializable, OwnableUpgradeable, AccessControlUpgrad
      * @dev Storage gap for future variable additions. Reduce this size by the number
      *      of slots added in subsequent upgrades.
      */
-    uint256[47] private __gap;
+    /// @dev Reduced by 3 for defaultMaxOracleAge + two oracle-age mappings.
+    uint256[43] private __gap;
 }

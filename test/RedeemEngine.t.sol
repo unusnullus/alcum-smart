@@ -5,6 +5,8 @@ import {Test, console} from "forge-std/Test.sol";
 import {RedeemEngine} from "../contracts/RedeemEngine.sol";
 import {CUPToken} from "../contracts/CUPToken.sol";
 import {xCUP} from "../contracts/xCUP.sol";
+import {SettlementEngine} from "../contracts/SettlementEngine.sol";
+import {EpochManager} from "../contracts/EpochManager.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ICopperPriceConsumer} from "../contracts/interfaces/ICopperPriceConsumer.sol";
@@ -86,6 +88,8 @@ contract RedeemEngineTest is Test {
     RedeemEngine public redeemEngine;
     CUPToken public cupToken;
     xCUP public xcup;
+    SettlementEngine public settlementEngine;
+    EpochManager public epochManager;
     MockCopperPriceConsumer public copperPriceConsumer;
     MockUSDC public usdc;
     MockUniswapRouter public uniswapRouter;
@@ -157,6 +161,66 @@ contract RedeemEngineTest is Test {
 
         cupToken.grantRole(cupToken.MINTER_ROLE(), address(this));
         cupToken.mint(address(redeemEngine), 1000000 * 10 ** 6); // 1M CUP tokens
+
+        // ── Deploy EpochManager ───────────────────────────────────────────────
+        EpochManager epochManagerImpl = new EpochManager();
+        bytes memory epochInit = abi.encodeWithSelector(
+            EpochManager.initialize.selector,
+            uint256(600) // 10-minute epochs
+        );
+        ERC1967Proxy epochProxy = new ERC1967Proxy(address(epochManagerImpl), epochInit);
+        epochManager = EpochManager(address(epochProxy));
+
+        // ── Deploy SettlementEngine ───────────────────────────────────────────
+        address mockZapperForSettlement = makeAddr("mockZapperForSettlement");
+        SettlementEngine settlementImpl = new SettlementEngine();
+        bytes memory settlementInit = abi.encodeWithSelector(
+            SettlementEngine.initialize.selector,
+            address(xcup),
+            owner,                         // treasury
+            mockZapperForSettlement,
+            redeemEngine.redeemSilo(),
+            address(epochManager),
+            address(copperPriceConsumer),
+            address(usdc),
+            uint256(600)                   // 6% system fee bps
+        );
+        ERC1967Proxy settlementProxy = new ERC1967Proxy(address(settlementImpl), settlementInit);
+        settlementEngine = SettlementEngine(address(settlementProxy));
+
+        // ── Wire SettlementEngine + EpochManager into RedeemEngine ────────────
+        redeemEngine.setSettlementEngine(address(settlementEngine));
+        redeemEngine.setEpochManager(address(epochManager));
+
+        // ── Advance to epoch 1 then record revenue, then advance to epoch 2 ───
+        // This gives us a "previous epoch" (epoch 1) when tests run in epoch 2.
+        settlementEngine.grantRole(settlementEngine.REVENUE_MANAGER_ROLE(), address(this));
+
+        // ── Seed xCUP supply so SettlementEngine.settleEpochRevenue records a
+        //    non-zero totalSupplyAtClose (needed by price calculations in approvals) ─
+        uint256 seedAmount = 100_000 * 10 ** 6;
+        cupToken.grantRole(cupToken.MINTER_ROLE(), address(this));
+        cupToken.mint(address(this), seedAmount);
+        cupToken.approve(address(xcup), seedAmount);
+        xcup.deposit(seedAmount, address(this));
+
+        // Grant settlementEngine VAULT_CURATOR_ROLE on xcup so it can call totalSupply freely
+        settlementEngine.grantRole(settlementEngine.REVENUE_MANAGER_ROLE(), address(this));
+
+        // Start epoch 1 (warp past epoch duration first so nextEpoch succeeds)
+        vm.warp(block.timestamp + 601);
+        epochManager.nextEpoch(); // epoch 0 → 1
+
+        // Record and settle epoch 1 revenue (xcup.totalSupply > 0 → valid totalSupplyAtClose)
+        uint256 epoch1Revenue = 1_000_000 * 10 ** 6;
+        usdc.mint(address(this), epoch1Revenue);
+        usdc.approve(address(settlementEngine), epoch1Revenue);
+        settlementEngine.recordEpochRevenue(1, epoch1Revenue, 0, 0, 0, 0);
+        settlementEngine.settleEpochRevenue(1);
+
+        // Advance to epoch 2
+        vm.warp(block.timestamp + 601);
+        epochManager.nextEpoch(); // epoch 1 → 2
     }
 
     // ───────────────────────────── INITIALIZATION TESTS ─────────────────────────────
@@ -592,6 +656,9 @@ contract RedeemEngineTest is Test {
     }
 
     function testClaimRedeemCopperPriceZero() public {
+        // Since claimRedeem now uses pre-approved USDC amounts (set at approveRedeem time
+        // via epoch closure pricing), the copper price oracle is NOT consulted during claim.
+        // This test verifies that claim succeeds even when the oracle price is zero.
         uint256 shares = 1000 * 10 ** 6;
         uint256 usdcAmount = 800 * 10 ** 6;
 
@@ -603,30 +670,29 @@ contract RedeemEngineTest is Test {
         xcup.approve(address(redeemEngine), shares);
         vm.stopPrank();
 
-        // Request redeem (shares are transferred to contract)
+        // Request redeem
         bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         vm.startPrank(user1);
         redeemEngine.requestRedeem(shares, redeemId);
         vm.stopPrank();
 
-        // Approve redeem
+        // Approve redeem (curator pre-sets USDC amount, no oracle read at claim time)
         vm.startPrank(vaultCurator);
         redeemEngine.approveRedeem(redeemId, usdcAmount);
         vm.stopPrank();
 
         // Ensure redeem silo has enough USDC
-        uint256 copperPrice = 450000000;
-        uint256 expectedUsdcAmount = (shares * copperPrice) / (10 ** 8);
-        usdc.mint(redeemEngine.redeemSilo(), expectedUsdcAmount);
+        usdc.mint(redeemEngine.redeemSilo(), usdcAmount);
 
-        // Mock copper price to return 0
+        // Set oracle price to 0 – claim should still succeed
         copperPriceConsumer.updatePrice(0);
 
-        // Try to claim with zero copper price
         vm.startPrank(user1);
-        vm.expectRevert(RedeemLib.InvalidPrice.selector);
-        redeemEngine.claimRedeem(redeemId);
+        uint256 received = redeemEngine.claimRedeem(redeemId);
         vm.stopPrank();
+
+        assertEq(received, usdcAmount);
+        assertEq(usdc.balanceOf(user1), 1000000 * 10 ** 6 + usdcAmount); // original + claimed
     }
 
     function testClaimRedeemInsufficientUSDCBalance() public {

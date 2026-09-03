@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {V2TestBase} from "./Helpers.sol";
+import {V2TestBase, MockAccessControlMintable, MockERC20} from "./Helpers.sol";
 import {SharedSettlementEngine} from "../../contracts/v2/SharedSettlementEngine.sol";
 import {VaultFactory} from "../../contracts/v2/VaultFactory.sol";
 import {EpochManager} from "../../contracts/EpochManager.sol";
@@ -207,6 +207,31 @@ contract SharedSettlementEngineTest is V2TestBase {
         SharedSettlementEngine.NAVComponents memory stored = settlement.getNav(vaultId);
         assertEq(stored.assetInInventory, 100_000e6);
         assertEq(stored.liabilities, 200e6);
+        // FIND-030: calldata retainedEarnings is ignored while storage is still 0.
+        assertEq(stored.retainedEarnings, 0);
+    }
+
+    function test_updateNAV_preservesRetainedEarnings() public {
+        _settled();
+
+        SharedSettlementEngine.NAVComponents memory beforeNav = settlement.getNav(vaultId);
+        assertEq(beforeNav.retainedEarnings, NET_REVENUE);
+
+        SharedSettlementEngine.NAVComponents memory nav = SharedSettlementEngine.NAVComponents({
+            assetInInventory: 100_000e6,
+            assetSpotPrice: ASSET_PRICE,
+            assetInTransit: 0,
+            retainedEarnings: 0, // would wipe without FIND-030 guard
+            stablecoinBalance: 1000e6,
+            liabilities: 0
+        });
+
+        vm.prank(admin);
+        settlement.updateNAV(vaultId, nav);
+
+        SharedSettlementEngine.NAVComponents memory stored = settlement.getNav(vaultId);
+        assertEq(stored.retainedEarnings, NET_REVENUE);
+        assertEq(stored.stablecoinBalance, 1000e6);
     }
 
     function test_getNAVSummary_returnsPositiveValues() public {
@@ -225,6 +250,46 @@ contract SharedSettlementEngineTest is V2TestBase {
         settlement.updateNAV(vaultId, nav);
 
         settlement.getNAVSummary(vaultId); // must not revert
+    }
+
+    function test_getNAVSummary_scalesAssetValueToSettlementDecimals() public {
+        MockERC20 dai = new MockERC20("DAI", "DAI", 18);
+
+        vm.startPrank(admin);
+        (uint256 daiVaultId, address daiVaultAddr, , ) = factory.createVault(
+            VaultFactory.CreateVaultParams({
+                assetToken: address(assetToken),
+                settlementToken: address(dai),
+                assetOracle: address(assetOracle),
+                uniswapRouter: address(uniswapRouter),
+                useEpochs: true,
+                epochDuration: 600,
+                wethToken: weth,
+                vaultName: "xDAI",
+                vaultSymbol: "xDAI",
+                operator: address(0),
+                treasury: treasury,
+                reportedInventoryOnly: false
+            })
+        );
+        vm.stopPrank();
+
+        _mintAsset(daiVaultAddr, 1e6);
+
+        SharedSettlementEngine.NAVComponents memory nav = SharedSettlementEngine.NAVComponents({
+            assetInInventory: 1e6,
+            assetSpotPrice: 100_000_000,
+            assetInTransit: 0,
+            retainedEarnings: 0,
+            stablecoinBalance: 0,
+            liabilities: 0
+        });
+
+        vm.prank(admin);
+        settlement.updateNAV(daiVaultId, nav);
+
+        (uint256 totalAssets, , ) = settlement.getNAVSummary(daiVaultId);
+        assertEq(totalAssets, 1e18);
     }
 
     // ─── getLastSettledEpoch ───────────────────────────────────────────────
@@ -474,7 +539,7 @@ contract SharedSettlementEngineTest is V2TestBase {
     function test_distribute_reportedInventoryOnly_zeroKeepsZero_ignoresVaultBalance() public {
         // Create epoch vault that never syncs inventory from vault.balanceOf
         vm.startPrank(admin);
-        MockERC20v2 asset2 = new MockERC20v2();
+        MockAccessControlMintable asset2 = new MockAccessControlMintable("Asset2", "AT2", 6);
         (uint256 vid, address vAddr, , address emAddr) = factory.createVault(
             VaultFactory.CreateVaultParams({
                 assetToken: address(asset2),
@@ -492,6 +557,10 @@ contract SharedSettlementEngineTest is V2TestBase {
             })
         );
         assertTrue(registry.getVault(vid).reportedInventoryOnly);
+
+        registry.authorizeVaultMint(vid);
+        asset2.grantRole(asset2.MINTER_ROLE(), admin);
+        asset2.grantRole(asset2.MINTER_ROLE(), address(settlement));
 
         EpochManager em = EpochManager(emAddr);
         em.grantRole(em.EPOCH_MANAGER_ROLE(), admin);
@@ -531,7 +600,7 @@ contract SharedSettlementEngineTest is V2TestBase {
 
     function test_distribute_reportedInventoryOnly_preservesUpdateNAVAmount() public {
         vm.startPrank(admin);
-        MockERC20v2 asset2 = new MockERC20v2();
+        MockAccessControlMintable asset2 = new MockAccessControlMintable("Asset2b", "AT2b", 6);
         (uint256 vid, address vAddr, , address emAddr) = factory.createVault(
             VaultFactory.CreateVaultParams({
                 assetToken: address(asset2),
@@ -548,6 +617,10 @@ contract SharedSettlementEngineTest is V2TestBase {
                 reportedInventoryOnly: true
             })
         );
+
+        registry.authorizeVaultMint(vid);
+        asset2.grantRole(asset2.MINTER_ROLE(), admin);
+        asset2.grantRole(asset2.MINTER_ROLE(), address(settlement));
 
         EpochManager em = EpochManager(emAddr);
         em.grantRole(em.EPOCH_MANAGER_ROLE(), admin);

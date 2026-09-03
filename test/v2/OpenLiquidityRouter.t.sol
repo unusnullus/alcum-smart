@@ -1,423 +1,32 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {V2TestBase} from "./Helpers.sol";
+import {V2TestBase, MockAssetOracle, MockAccessControlMintable, MockERC20} from "./Helpers.sol";
 import {OpenLiquidityRouter} from "../../contracts/v2/OpenLiquidityRouter.sol";
 import {VaultFactory} from "../../contracts/v2/VaultFactory.sol";
 import {VaultLib} from "../../contracts/v2/libraries/VaultLib.sol";
+import {OracleLib} from "../../contracts/v2/libraries/OracleLib.sol";
+import {RWAVault} from "../../contracts/v2/RWAVault.sol";
+import {SharedSettlementEngine} from "../../contracts/v2/SharedSettlementEngine.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract OpenLiquidityRouterTest is V2TestBase {
-    uint256 constant USDC_AMOUNT = 4500e6; // $4,500
-    uint256 constant ASSET_PRICE = 450_000_000; // $4.50 (8 dec)
-    uint256 constant ORACLE_DEC = 8;
-    uint256 constant ASSET_AMOUNT = (USDC_AMOUNT * 1e8) / ASSET_PRICE; // = 1000e6
+    uint256 constant USDC_AMOUNT = 4500e6;
+    uint256 constant ASSET_PRICE = 450_000_000;
+    bytes32 constant DEPOSIT_ID = keccak256("deposit-1");
 
-    // ─── External Deposit ─────────────────────────────────────────────────
-
-    function _registerExternal() internal returns (bytes32 did) {
-        vm.prank(admin);
-        did = router.registerExternalDeposit(vaultId, user, USDC_AMOUNT, bytes32("tag1"));
-    }
-
-    function test_externalDeposit_register_stores() public {
-        bytes32 did = _registerExternal();
-        VaultLib.Deposit memory d = router.getDeposit(vaultId, did);
-
-        assertEq(d.amount, USDC_AMOUNT);
-        assertEq(d.beneficiary, user);
-        assertTrue(d.isExternal);
-        assertFalse(d.approved);
-        assertEq(d.tag, bytes32("tag1"));
-    }
-
-    function test_externalDeposit_appearsInPending() public {
-        bytes32 did = _registerExternal();
-        bytes32[] memory pending = router.getPendingDepositIds(vaultId);
-        assertEq(pending.length, 1);
-        assertEq(pending[0], did);
-    }
-
-    function test_externalDeposit_approve() public {
-        bytes32 did = _registerExternal();
-        vm.prank(curator);
-        router.approveExternalDeposit(vaultId, did, USDC_AMOUNT, ASSET_PRICE);
-
-        VaultLib.Deposit memory d = router.getDeposit(vaultId, did);
-        assertTrue(d.approved);
-        assertEq(d.approvedAmount, USDC_AMOUNT);
-        assertEq(d.priceSnapshot, ASSET_PRICE);
-        assertEq(d.approvedAssetAmount, ASSET_AMOUNT);
-    }
-
-    function test_externalDeposit_approve_removesFromPending() public {
-        bytes32 did = _registerExternal();
-        vm.prank(curator);
-        router.approveExternalDeposit(vaultId, did, USDC_AMOUNT, ASSET_PRICE);
-
-        assertEq(router.getPendingDepositIds(vaultId).length, 0);
-    }
-
-    function test_externalDeposit_claim_mintsShares() public {
-        bytes32 did = _registerExternal();
-
-        vm.prank(curator);
-        router.approveExternalDeposit(vaultId, did, USDC_AMOUNT, ASSET_PRICE);
-
-        // Fund facility with USDC (represents the external cash that was wired)
-        _fundFacility(USDC_AMOUNT);
-        // Facility pre-approves router — already done in CapitalFacility.initialize()
-
-        // Give router MINTER authority (mock: just mint directly)
-        // In tests we use MockERC20, which has unrestricted mint
-        // claimDeposit calls IERC20Mintable(v.assetToken).mint(address(this), approvedAssetAmount)
-        // Our MockERC20 mint is unrestricted, so this works without a role setup.
-
-        uint256 sharesBefore = _sharesOf(user);
-
-        vm.prank(user);
-        uint256 shares = router.claimDeposit(vaultId, did);
-
-        assertGt(shares, 0);
-        assertGt(_sharesOf(user) - sharesBefore, 0);
-    }
-
-    function test_externalDeposit_revertsDoubleApprove() public {
-        bytes32 did = _registerExternal();
-        vm.prank(curator);
-        router.approveExternalDeposit(vaultId, did, USDC_AMOUNT, ASSET_PRICE);
-
-        vm.prank(curator);
-        vm.expectRevert(VaultLib.DepositAlreadyApproved.selector);
-        router.approveExternalDeposit(vaultId, did, USDC_AMOUNT, ASSET_PRICE);
-    }
-
-    function test_externalDeposit_registerRevertsZeroAmount() public {
-        vm.prank(admin);
-        vm.expectRevert(OpenLiquidityRouter.ZeroAmount.selector);
-        router.registerExternalDeposit(vaultId, user, 0, bytes32("tag"));
-    }
-
-    function test_externalDeposit_registerRevertsZeroBeneficiary() public {
-        vm.prank(admin);
-        vm.expectRevert(OpenLiquidityRouter.ZeroAddress.selector);
-        router.registerExternalDeposit(vaultId, address(0), USDC_AMOUNT, bytes32("tag"));
-    }
-
-    function test_externalDeposit_decline_doesNotPullFacility() public {
-        bytes32 did = _registerExternal();
-        _fundFacility(USDC_AMOUNT);
-
-        uint256 facilityBefore = usdc.balanceOf(facilityAddr);
-        uint256 hostBefore = usdc.balanceOf(admin);
-
-        vm.prank(curator);
-        router.declineDeposit(vaultId, did);
-
-        assertEq(usdc.balanceOf(facilityAddr), facilityBefore);
-        assertEq(usdc.balanceOf(admin), hostBefore);
-        assertEq(router.getDeposit(vaultId, did).user, address(0));
-    }
-
-    // ─── Queued Redeem ────────────────────────────────────────────────────
-
-    function _setupUserWithShares() internal returns (uint256 shares) {
-        bytes32 did = _registerExternal();
-        vm.prank(curator);
-        router.approveExternalDeposit(vaultId, did, USDC_AMOUNT, ASSET_PRICE);
-        _fundFacility(USDC_AMOUNT);
-        vm.prank(user);
-        shares = router.claimDeposit(vaultId, did);
-    }
-
-    function test_requestRedeem_locksShares() public {
-        uint256 shares = _setupUserWithShares();
-        bytes32 rid = keccak256("redeem1");
-
-        _approveVaultShares(user, shares);
-        vm.prank(user);
-        router.requestRedeem(vaultId, shares, rid);
-
-        VaultLib.RedeemRequest memory r = router.getRedeem(vaultId, rid);
-        assertEq(r.shares, shares);
-        assertEq(r.user, user);
-        assertFalse(r.approved);
-    }
-
-    function test_requestRedeem_revertsZeroShares() public {
-        vm.prank(user);
-        vm.expectRevert(OpenLiquidityRouter.ZeroAmount.selector);
-        router.requestRedeem(vaultId, 0, bytes32("rid"));
-    }
-
-    function test_approveRedeem_setsUsdcAmount() public {
-        uint256 shares = _setupUserWithShares();
-        bytes32 rid = keccak256("redeem1");
-
-        _approveVaultShares(user, shares);
-        vm.prank(user);
-        router.requestRedeem(vaultId, shares, rid);
-
-        _fundFacility(USDC_AMOUNT);
-
-        vm.prank(curator);
-        router.approveRedeem(vaultId, rid, USDC_AMOUNT);
-
-        VaultLib.RedeemRequest memory r = router.getRedeem(vaultId, rid);
-        assertTrue(r.approved);
-        assertEq(r.tokenAmount, USDC_AMOUNT);
-    }
-
-    function test_claimRedeem_sendsUSDC() public {
-        uint256 shares = _setupUserWithShares();
-        bytes32 rid = keccak256("redeem1");
-
-        _approveVaultShares(user, shares);
-        vm.prank(user);
-        router.requestRedeem(vaultId, shares, rid);
-
-        _fundFacility(USDC_AMOUNT);
-
-        vm.prank(curator);
-        router.approveRedeem(vaultId, rid, USDC_AMOUNT);
-
-        uint256 before = usdc.balanceOf(user);
-        vm.prank(user);
-        router.claimRedeem(vaultId, rid);
-
-        assertEq(usdc.balanceOf(user) - before, USDC_AMOUNT);
-    }
-
-    function test_declineRedeem_returnsShares() public {
-        uint256 shares = _setupUserWithShares();
-        bytes32 rid = keccak256("redeem1");
-
-        _approveVaultShares(user, shares);
-        vm.prank(user);
-        router.requestRedeem(vaultId, shares, rid);
-
-        uint256 beforeShares = _sharesOf(user);
-        vm.prank(curator);
-        router.declineRedeem(vaultId, rid);
-
-        assertEq(_sharesOf(user) - beforeShares, shares);
-    }
-
-    function test_approveRedeem_revertsInsufficientFacilityBalance() public {
-        uint256 shares = _setupUserWithShares();
-        bytes32 rid = keccak256("redeem1");
-
-        _approveVaultShares(user, shares);
-        vm.prank(user);
-        router.requestRedeem(vaultId, shares, rid);
-
-        // Don't fund facility — should revert
-        vm.prank(curator);
-        vm.expectRevert(OpenLiquidityRouter.InsufficientFacilityBalance.selector);
-        router.approveRedeem(vaultId, rid, USDC_AMOUNT);
-    }
-
-    // ─── Multi-vault isolation ─────────────────────────────────────────────
-
-    function test_multiVault_depositsIsolated() public {
-        // Create vault 2
-        vm.startPrank(admin);
-        MockERC20Stub at2 = new MockERC20Stub();
-        (uint256 vid2, , , ) = factory.createVault(
-            VaultFactory.CreateVaultParams({
-                assetToken: address(at2),
-                settlementToken: address(usdc),
-                assetOracle: address(assetOracle),
-                uniswapRouter: address(uniswapRouter),
-                useEpochs: true,
-                epochDuration: 600,
-                wethToken: weth,
-                vaultName: "xAT2",
-                vaultSymbol: "xAT2",
-                operator: address(0),
-                treasury: treasury,
-                reportedInventoryOnly: false
-            })
-        );
+    function _zapUsdc(address who, bytes32 did, uint256 amount) internal {
+        usdc.mint(who, amount);
+        vm.startPrank(who);
+        usdc.approve(address(router), amount);
+        router.zapAndDeposit(vaultId, IERC20(address(usdc)), amount, did, 100, 0);
         vm.stopPrank();
-
-        // Register deposit in vault 1
-        vm.prank(admin);
-        bytes32 did1 = router.registerExternalDeposit(vaultId, user, USDC_AMOUNT, bytes32("v1"));
-
-        // Register deposit in vault 2
-        vm.prank(admin);
-        bytes32 did2 = router.registerExternalDeposit(vid2, user2, USDC_AMOUNT, bytes32("v2"));
-
-        // Vault 1 pending: only did1
-        bytes32[] memory p1 = router.getPendingDepositIds(vaultId);
-        assertEq(p1.length, 1);
-        assertEq(p1[0], did1);
-
-        // Vault 2 pending: only did2
-        bytes32[] memory p2 = router.getPendingDepositIds(vid2);
-        assertEq(p2.length, 1);
-        assertEq(p2[0], did2);
     }
-
-    // ─── claimRedeem error paths ──────────────────────────────────────────
-
-    function test_claimRedeem_revertsIfNotOwner() public {
-        uint256 shares = _setupUserWithShares();
-        bytes32 rid = keccak256("redeem1");
-
-        _approveVaultShares(user, shares);
-        vm.prank(user);
-        router.requestRedeem(vaultId, shares, rid);
-
-        _fundFacility(USDC_AMOUNT);
-        vm.prank(curator);
-        router.approveRedeem(vaultId, rid, USDC_AMOUNT);
-
-        vm.prank(user2); // wrong caller
-        vm.expectRevert(OpenLiquidityRouter.NotRedeemOwner.selector);
-        router.claimRedeem(vaultId, rid);
-    }
-
-    function test_claimRedeem_revertsIfNotApproved() public {
-        uint256 shares = _setupUserWithShares();
-        bytes32 rid = keccak256("redeem1");
-
-        _approveVaultShares(user, shares);
-        vm.prank(user);
-        router.requestRedeem(vaultId, shares, rid);
-
-        vm.prank(user);
-        vm.expectRevert(VaultLib.RedeemNotApproved.selector);
-        router.claimRedeem(vaultId, rid);
-    }
-
-    function test_requestRedeem_appearsInPendingList() public {
-        uint256 shares = _setupUserWithShares();
-        bytes32 rid = keccak256("redeem1");
-
-        _approveVaultShares(user, shares);
-        vm.prank(user);
-        router.requestRedeem(vaultId, shares, rid);
-
-        bytes32[] memory pending = router.getPendingRedeemIds(vaultId);
-        assertEq(pending.length, 1);
-        assertEq(pending[0], rid);
-    }
-
-    function test_requestRedeem_appearsInUserRedeems() public {
-        uint256 shares = _setupUserWithShares();
-        bytes32 rid = keccak256("redeem1");
-
-        _approveVaultShares(user, shares);
-        vm.prank(user);
-        router.requestRedeem(vaultId, shares, rid);
-
-        bytes32[] memory userRedeems = router.getUserRedeems(vaultId, user);
-        assertEq(userRedeems.length, 1);
-        assertEq(userRedeems[0], rid);
-    }
-
-    // ─── getUserDeposits ──────────────────────────────────────────────────
-
-    function test_getUserDeposits_returnsUserEntries() public {
-        bytes32 did = _registerExternal();
-        bytes32[] memory userDeps = router.getUserDeposits(vaultId, user);
-        assertEq(userDeps.length, 1);
-        assertEq(userDeps[0], did);
-    }
-
-    function test_rescueTokens_revertsVaultShares() public {
-        vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(OpenLiquidityRouter.CannotRescueVaultShares.selector, vaultAddr));
-        router.rescueTokens(vaultAddr, admin, 1);
-    }
-
-    // ─── rescueTokens ─────────────────────────────────────────────────────
-
-    function test_rescueTokens_transfersOut() public {
-        // Accidentally send USDC to router
-        usdc.mint(address(router), 500e6);
-
-        uint256 before = usdc.balanceOf(admin);
-        vm.prank(admin);
-        router.rescueTokens(address(usdc), admin, 500e6);
-        assertEq(usdc.balanceOf(admin) - before, 500e6);
-    }
-
-    function test_rescueTokens_revertsZeroTo() public {
-        usdc.mint(address(router), 100e6);
-        vm.prank(admin);
-        vm.expectRevert(OpenLiquidityRouter.ZeroAddress.selector);
-        router.rescueTokens(address(usdc), address(0), 100e6);
-    }
-
-    function test_rescueTokens_revertsUnauthorized() public {
-        vm.prank(user);
-        vm.expectRevert();
-        router.rescueTokens(address(usdc), user, 1);
-    }
-
-    // ─── Vault treasury (registry) ───────────────────────────────────────
-
-    function test_claimDeposit_sendsUsdcToVaultTreasury() public {
-        // covered implicitly by deposit flow tests; registry stores per-vault treasury
-        assertEq(registry.getVault(vaultId).treasury, treasury);
-    }
-
-    // ─── getAssetPrice view ───────────────────────────────────────────────
-
-    function test_getAssetPrice_returnsOraclePrice() public {
-        assertEq(router.getAssetPrice(vaultId), ASSET_PRICE);
-    }
-
-    // ─── setRegistry ─────────────────────────────────────────────────────
-
-    function test_setRegistry_updates() public {
-        vm.prank(admin);
-        router.setRegistry(address(registry)); // same for simplicity
-        assertEq(address(router.registry()), address(registry));
-    }
-
-    function test_setRegistry_revertsZeroAddress() public {
-        vm.prank(admin);
-        vm.expectRevert(OpenLiquidityRouter.ZeroAddress.selector);
-        router.setRegistry(address(0));
-    }
-
-    // ─── inactive vault guard ─────────────────────────────────────────────
-
-    function test_deposit_revertsInactiveVault() public {
-        vm.prank(admin);
-        registry.setVaultActive(vaultId, false);
-
-        vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(OpenLiquidityRouter.VaultNotActive.selector, vaultId));
-        router.registerExternalDeposit(vaultId, user, USDC_AMOUNT, bytes32("tag"));
-    }
-
-    // ─── Pausing ─────────────────────────────────────────────────────────
-
-    function test_pause_blocksRegisterExternal() public {
-        vm.prank(admin);
-        router.pause();
-
-        vm.prank(admin);
-        vm.expectRevert();
-        router.registerExternalDeposit(vaultId, user, USDC_AMOUNT, bytes32("tag"));
-    }
-
-    // ─── zapAndDeposit ─────────────────────────────────────────────────────
 
     function test_zapAndDeposit_directSettlementTokenPath() public {
         bytes32 did = keccak256("direct-usdc-zap");
         uint256 amount = 123e6;
-
-        usdc.mint(user, amount);
-        vm.startPrank(user);
-        usdc.approve(address(router), amount);
-        router.zapAndDeposit(vaultId, IERC20(address(usdc)), amount, did, 100);
-        vm.stopPrank();
+        _zapUsdc(user, did, amount);
 
         VaultLib.Deposit memory d = router.getDeposit(vaultId, did);
         assertEq(d.user, user);
@@ -428,235 +37,289 @@ contract OpenLiquidityRouterTest is V2TestBase {
     function test_zapAndDeposit_revertsZeroAmount() public {
         vm.prank(user);
         vm.expectRevert(OpenLiquidityRouter.ZeroAmount.selector);
-        router.zapAndDeposit(vaultId, IERC20(address(usdc)), 0, keccak256("z0"), 100);
+        router.zapAndDeposit(vaultId, IERC20(address(usdc)), 0, keccak256("z0"), 100, 0);
     }
 
     function test_zapAndDeposit_revertsInvalidSlippage() public {
         vm.prank(user);
         vm.expectRevert(OpenLiquidityRouter.InvalidSlippage.selector);
-        router.zapAndDeposit(vaultId, IERC20(address(usdc)), 1, keccak256("z1"), 1001);
+        router.zapAndDeposit(vaultId, IERC20(address(usdc)), 1, keccak256("z1"), 1001, 0);
     }
 
-    function test_zapAndDeposit_swapPathRevertsWhenNoOutput() public {
-        MockERC20Stub input = new MockERC20Stub();
-        uint256 amount = 10e18;
-        input.mint(user, amount);
-
+    function test_zapAndDeposit_revertsTokenNotAllowlisted() public {
+        MockERC20 alt = new MockERC20("ALT", "ALT", 6);
+        alt.mint(user, 1_000e6);
         vm.startPrank(user);
-        input.approve(address(router), amount);
-        vm.expectRevert(OpenLiquidityRouter.ZeroAmount.selector);
-        router.zapAndDeposit(vaultId, IERC20(address(input)), amount, keccak256("z2"), 100);
+        alt.approve(address(router), 1_000e6);
+        vm.expectRevert(
+            abi.encodeWithSelector(OpenLiquidityRouter.TokenNotAllowlisted.selector, address(alt))
+        );
+        router.zapAndDeposit(vaultId, IERC20(address(alt)), 1_000e6, DEPOSIT_ID, 100, 0);
         vm.stopPrank();
     }
 
-    // ─── Internal helpers ─────────────────────────────────────────────────
+    function test_find015_directSettlementCreditsMeasuredBalance() public {
+        MockFeeOnTransferERC20 fot = new MockFeeOnTransferERC20("FoT USD", "FOT", 6, 100);
+        MockAssetOracle fotOracle = new MockAssetOracle(1e8, "ASSET / FOT");
 
-    function _sharesOf(address who) internal view returns (uint256) {
-        (bool ok, bytes memory data) = vaultAddr.staticcall(abi.encodeWithSignature("balanceOf(address)", who));
-        require(ok, "balanceOf failed");
-        return abi.decode(data, (uint256));
-    }
-
-    function _approveVaultShares(address from, uint256 amount) internal {
-        vm.prank(from);
-        (bool ok, ) = vaultAddr.call(abi.encodeWithSignature("approve(address,uint256)", address(router), amount));
-        require(ok, "approve failed");
-    }
-}
-
-// ─── Vesting Integration Tests ────────────────────────────────────────────────
-
-/**
- * @notice Minimal TokenVesting mock that records createVestingSchedule calls.
- *         The real TokenVesting requires tokens to be pre-funded; here we just track calls.
- */
-contract MockTokenVesting {
-    address public token;
-
-    struct Schedule {
-        address beneficiary;
-        uint256 cliff;
-        uint256 duration;
-        uint256 amount;
-    }
-
-    Schedule[] public schedules;
-
-    constructor(address token_) {
-        token = token_;
-    }
-
-    function createVestingSchedule(
-        address beneficiary,
-        uint256 /* start */,
-        uint256 cliff,
-        uint256 duration,
-        uint256 /* slicePeriodSeconds */,
-        bool /* revocable */,
-        uint256 amount
-    ) external {
-        schedules.push(Schedule(beneficiary, cliff, duration, amount));
-    }
-
-    function getToken() external view returns (address) {
-        return token;
-    }
-    function schedulesCount() external view returns (uint256) {
-        return schedules.length;
-    }
-}
-
-contract OpenLiquidityRouterVestingTest is V2TestBase {
-    uint256 constant USDC_AMOUNT = 4500e6;
-    uint256 constant ASSET_PRICE = 450_000_000;
-    uint256 constant ASSET_AMOUNT = (USDC_AMOUNT * 1e8) / ASSET_PRICE;
-
-    MockTokenVesting internal vesting;
-
-    function setUp() public override {
-        super.setUp();
-
-        // Deploy a mock vesting contract that wraps the vault's share token
-        vesting = new MockTokenVesting(vaultAddr);
-
-        // Admin configures vesting for vault 1: 30d cliff, 365d duration
-        vm.prank(admin);
-        router.setVaultVestingConfig(vaultId, address(vesting), 30 days, 365 days);
-    }
-
-    function _approveExternalDeposit() internal returns (bytes32 did) {
-        // Register
-        vm.prank(admin);
-        did = router.registerExternalDeposit(vaultId, user, USDC_AMOUNT, bytes32("tag"));
-
-        // Fund facility with USDC (simulating fiat on-ramp)
-        usdc.mint(facilityAddr, USDC_AMOUNT);
-        // Facility must approve router
-        vm.prank(facilityAddr);
-        usdc.approve(address(router), type(uint256).max);
-
-        // Curator approves
-        vm.prank(admin);
-        router.approveExternalDeposit(vaultId, did, USDC_AMOUNT, ASSET_PRICE);
-    }
-
-    function test_vestingConfig_isStored() public {
-        OpenLiquidityRouter.VaultVestingConfig memory cfg = router.getVestingConfig(vaultId);
-        assertEq(cfg.vestingContract, address(vesting));
-        assertEq(cfg.defaultCliff, 30 days);
-        assertEq(cfg.defaultDuration, 365 days);
-    }
-
-    function test_claimDeposit_revertsWhenVestingConfigured() public {
-        bytes32 did = _approveExternalDeposit();
-
-        vm.prank(user);
-        vm.expectRevert(abi.encodeWithSelector(OpenLiquidityRouter.VestingRequired.selector, vaultId));
-        router.claimDeposit(vaultId, did);
-    }
-
-    function test_claimDepositWithVesting_createsSchedule() public {
-        bytes32 did = _approveExternalDeposit();
-
-        vm.prank(user);
-        uint256 shares = router.claimDepositWithVesting(vaultId, did, 0, 0);
-
-        assertGt(shares, 0, "should receive shares");
-        assertEq(vesting.schedulesCount(), 1, "one vesting schedule created");
-
-        (address beneficiary, uint256 cliff, uint256 duration, uint256 amount) = vesting.schedules(0);
-        assertEq(beneficiary, user);
-        assertEq(cliff, 30 days);
-        assertEq(duration, 365 days);
-        assertEq(amount, shares);
-    }
-
-    function test_claimDepositWithVesting_overridesCliffAndDuration() public {
-        bytes32 did = _approveExternalDeposit();
-
-        vm.prank(user);
-        router.claimDepositWithVesting(vaultId, did, 60 days, 730 days);
-
-        (, uint256 cliff, uint256 duration, ) = vesting.schedules(0);
-        assertEq(cliff, 60 days);
-        assertEq(duration, 730 days);
-    }
-
-    function test_claimDepositWithVesting_revertsIfNotConfigured() public {
-        // Create vault 2 without vesting config
         vm.startPrank(admin);
-        MockERC20Stub at2 = new MockERC20Stub();
-        // Deploy without epochs so the vesting check is reached before any epoch gate.
-        (uint256 vid2, , , ) = factory.createVault(
+        (uint256 fotVaultId,, address fotFacility,) = factory.createVault(
             VaultFactory.CreateVaultParams({
-                assetToken: address(at2),
-                settlementToken: address(usdc),
-                assetOracle: address(assetOracle),
+                assetToken: address(assetToken),
+                settlementToken: address(fot),
+                assetOracle: address(fotOracle),
                 uniswapRouter: address(uniswapRouter),
-                useEpochs: false,
-                epochDuration: 0,
+                useEpochs: true,
+                epochDuration: 600,
                 wethToken: weth,
-                vaultName: "xAT2",
-                vaultSymbol: "xAT2",
+                vaultName: "FoT Vault",
+                vaultSymbol: "xFOT",
                 operator: address(0),
                 treasury: treasury,
                 reportedInventoryOnly: false
             })
         );
-        bytes32 did = router.registerExternalDeposit(vid2, user, USDC_AMOUNT, bytes32("t"));
-        usdc.mint(facilityAddr, USDC_AMOUNT);
+        registry.authorizeVaultMint(fotVaultId);
         vm.stopPrank();
 
-        vm.prank(admin);
-        router.approveExternalDeposit(vid2, did, USDC_AMOUNT, ASSET_PRICE);
+        bytes32 did = keccak256("fot-direct");
+        uint256 amount = 100e6;
+        uint256 expectedReceived = amount - (amount * 100) / 10_000;
 
-        vm.prank(user);
-        vm.expectRevert(abi.encodeWithSelector(OpenLiquidityRouter.VestingNotConfigured.selector, vid2));
-        router.claimDepositWithVesting(vid2, did, 0, 0);
+        fot.mint(user, amount);
+        vm.startPrank(user);
+        fot.approve(address(router), amount);
+        router.zapAndDeposit(fotVaultId, IERC20(address(fot)), amount, did, 100, 0);
+        vm.stopPrank();
+
+        VaultLib.Deposit memory d = router.getDeposit(fotVaultId, did);
+        assertEq(d.amount, expectedReceived);
+        assertEq(fot.balanceOf(fotFacility), expectedReceived);
+        assertEq(router.getCommittedLiability(fotVaultId), expectedReceived);
     }
 
-    function test_setVaultVestingConfig_revertsZeroAddress() public {
-        vm.prank(admin);
-        vm.expectRevert(OpenLiquidityRouter.ZeroAddress.selector);
-        router.setVaultVestingConfig(vaultId, address(0), 0, 0);
+    function test_find020_revertsTooManyPendingDeposits() public {
+        uint256 maxPending = router.MAX_PENDING_DEPOSITS_PER_USER();
+        uint256 amount = 1e6;
+        usdc.mint(user, amount * (maxPending + 1));
+
+        vm.startPrank(user);
+        usdc.approve(address(router), amount * (maxPending + 1));
+
+        for (uint256 i; i < maxPending; i++) {
+            router.zapAndDeposit(
+                vaultId,
+                IERC20(address(usdc)),
+                amount,
+                keccak256(abi.encode("spam", i)),
+                100,
+                0
+            );
+        }
+        assertEq(router.getOpenPendingDeposits(vaultId, user), maxPending);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                OpenLiquidityRouter.TooManyPendingDeposits.selector,
+                user,
+                maxPending,
+                maxPending
+            )
+        );
+        router.zapAndDeposit(
+            vaultId,
+            IERC20(address(usdc)),
+            amount,
+            keccak256("spam-overflow"),
+            100,
+            0
+        );
+        vm.stopPrank();
     }
 
-    function test_setVaultVestingConfig_revertsUnauthorized() public {
+    function test_approveDeposit_settlesShares() public {
+        _zapUsdc(user, DEPOSIT_ID, USDC_AMOUNT);
+
+        vm.prank(curator);
+        router.approveDeposit(vaultId, DEPOSIT_ID, USDC_AMOUNT, ASSET_PRICE);
+
+        VaultLib.Deposit memory d = router.getDeposit(vaultId, DEPOSIT_ID);
+        assertTrue(d.approved);
+        assertGt(d.approvedShares, 0);
+    }
+
+    function test_claimDeposit_transfersShares() public {
+        _zapUsdc(user, DEPOSIT_ID, USDC_AMOUNT);
+        vm.prank(curator);
+        router.approveDeposit(vaultId, DEPOSIT_ID, USDC_AMOUNT, ASSET_PRICE);
+
+        uint256 shares = router.getDeposit(vaultId, DEPOSIT_ID).approvedShares;
         vm.prank(user);
-        vm.expectRevert();
-        router.setVaultVestingConfig(vaultId, address(vesting), 0, 0);
+        router.claimDeposit(vaultId, DEPOSIT_ID);
+
+        assertEq(RWAVault(vaultAddr).balanceOf(user), shares);
+    }
+
+    function test_find029_approveDeposit_revertsStaleOracle() public {
+        _zapUsdc(user, DEPOSIT_ID, USDC_AMOUNT);
+
+        // Keep warp inside the 600s epoch window: use a short max age.
+        uint256 maxAge = 60;
+        MockStaleOracle stale = new MockStaleOracle(ASSET_PRICE, block.timestamp);
+        uint256 updatedAt = stale.updatedAt();
+        vm.startPrank(admin);
+        registry.setVaultOracle(vaultId, address(stale));
+        registry.setVaultMaxOracleAge(vaultId, maxAge, false);
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + maxAge + 1);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                OracleLib.StaleOracle.selector,
+                address(stale),
+                updatedAt,
+                maxAge,
+                block.timestamp
+            )
+        );
+        vm.prank(curator);
+        router.approveDeposit(vaultId, DEPOSIT_ID, USDC_AMOUNT, ASSET_PRICE);
+    }
+
+    function test_find029_bypass_raiseMaxOracleAge() public {
+        _zapUsdc(user, DEPOSIT_ID, USDC_AMOUNT);
+
+        uint256 maxAge = 60;
+        MockStaleOracle stale = new MockStaleOracle(ASSET_PRICE, block.timestamp);
+        vm.startPrank(admin);
+        registry.setVaultOracle(vaultId, address(stale));
+        registry.setVaultMaxOracleAge(vaultId, maxAge, false);
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + maxAge + 1);
+
+        // Bypass A: raise per-vault max age so the same feed is accepted again.
+        vm.prank(admin);
+        registry.setVaultMaxOracleAge(vaultId, 30 days, false);
+
+        vm.prank(curator);
+        router.approveDeposit(vaultId, DEPOSIT_ID, USDC_AMOUNT, ASSET_PRICE);
+        assertGt(router.getDeposit(vaultId, DEPOSIT_ID).approvedShares, 0);
+    }
+
+    function test_reportedInventory_totalAssets_zeroUntilNavInitialized() public {
+        vm.startPrank(admin);
+        (uint256 vid, address vAddr,,) = factory.createVault(
+            VaultFactory.CreateVaultParams({
+                assetToken: address(assetToken),
+                settlementToken: address(usdc),
+                assetOracle: address(assetOracle),
+                uniswapRouter: address(uniswapRouter),
+                useEpochs: true,
+                epochDuration: 600,
+                wethToken: weth,
+                vaultName: "Reported",
+                vaultSymbol: "xREP",
+                operator: address(0),
+                treasury: treasury,
+                reportedInventoryOnly: true
+            })
+        );
+        registry.authorizeVaultMint(vid);
+        vm.stopPrank();
+
+        RWAVault v = RWAVault(vAddr);
+        assertTrue(v.reportedInventoryOnly());
+        assertEq(v.totalAssets(), 0);
+        assertFalse(settlement.navInitialized(vid));
+
+        vm.prank(admin);
+        settlement.updateNAV(
+            vid,
+            SharedSettlementEngine.NAVComponents({
+                assetInInventory: 1_000e6,
+                assetSpotPrice: ASSET_PRICE,
+                assetInTransit: 0,
+                retainedEarnings: 0,
+                stablecoinBalance: 0,
+                liabilities: 0
+            })
+        );
+
+        assertTrue(settlement.navInitialized(vid));
+        assertEq(v.totalAssets(), 1_000e6);
     }
 }
 
-// Minimal stub for a second asset token in multi-vault test
-contract MockERC20Stub {
-    string public name = "Asset2";
-    string public symbol = "AT2";
-    uint8 public decimals = 6;
+contract MockStaleOracle {
+    uint256 public price;
+    uint256 private _updatedAt;
+
+    constructor(uint256 price_, uint256 updatedAt_) {
+        price = price_;
+        _updatedAt = updatedAt_;
+    }
+
+    function decimals() external pure returns (uint8) {
+        return 8;
+    }
+
+    function description() external pure returns (string memory) {
+        return "STALE";
+    }
+
+    function updatedAt() external view returns (uint256) {
+        return _updatedAt;
+    }
+}
+
+/// @dev ERC-20 that skims `feeBps` of each transfer (FIND-015 fixture).
+contract MockFeeOnTransferERC20 {
+    string public name;
+    string public symbol;
+    uint8 public immutable decimals;
+    uint256 public immutable feeBps;
+    uint256 public totalSupply;
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
-    uint256 public totalSupply;
 
-    function mint(address to, uint256 a) external {
-        balanceOf[to] += a;
-        totalSupply += a;
+    constructor(string memory name_, string memory symbol_, uint8 decimals_, uint256 feeBps_) {
+        name = name_;
+        symbol = symbol_;
+        decimals = decimals_;
+        feeBps = feeBps_;
     }
-    function transfer(address to, uint256 a) external returns (bool) {
-        balanceOf[msg.sender] -= a;
-        balanceOf[to] += a;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+        totalSupply += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
         return true;
     }
-    function transferFrom(address from, address to, uint256 a) external returns (bool) {
-        if (allowance[from][msg.sender] != type(uint256).max) allowance[from][msg.sender] -= a;
-        balanceOf[from] -= a;
-        balanceOf[to] += a;
-        return true;
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        return _transfer(msg.sender, to, amount);
     }
-    function approve(address s, uint256 a) external returns (bool) {
-        allowance[msg.sender][s] = a;
-        return true;
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        uint256 allowed = allowance[from][msg.sender];
+        if (allowed != type(uint256).max) {
+            allowance[from][msg.sender] = allowed - amount;
+        }
+        return _transfer(from, to, amount);
     }
-    function forceApprove(address s, uint256 a) external {
-        allowance[msg.sender][s] = a;
+
+    function _transfer(address from, address to, uint256 amount) internal returns (bool) {
+        uint256 fee = (amount * feeBps) / 10_000;
+        uint256 sendAmount = amount - fee;
+        balanceOf[from] -= amount;
+        balanceOf[to] += sendAmount;
+        // Fee is burned (removed from circulation) to mimic FoT skim.
+        totalSupply -= fee;
+        return true;
     }
 }

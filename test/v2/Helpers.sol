@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {CUPToken} from "../../contracts/CUPToken.sol";
@@ -39,6 +40,64 @@ contract MockERC20 {
     }
 
     function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+        totalSupply += amount;
+    }
+
+    function burn(address from, uint256 amount) external {
+        require(allowance[from][msg.sender] >= amount || from == msg.sender, "ERC20: burn allowance");
+        if (from != msg.sender) allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        totalSupply -= amount;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        if (allowance[from][msg.sender] != type(uint256).max) {
+            require(allowance[from][msg.sender] >= amount, "ERC20: allowance");
+            allowance[from][msg.sender] -= amount;
+        }
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function forceApprove(address spender, uint256 amount) external {
+        allowance[msg.sender][spender] = amount;
+    }
+}
+
+/// @dev Mintable ERC-20 with AccessControl-gated mint (production-like asset token).
+contract MockAccessControlMintable is AccessControl {
+    bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
+
+    string public name;
+    string public symbol;
+    uint8 public decimals;
+
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    uint256 public totalSupply;
+
+    constructor(string memory n, string memory s, uint8 d) {
+        name = n;
+        symbol = s;
+        decimals = d;
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+    }
+
+    function mint(address to, uint256 amount) external onlyRole(MINTER_ROLE) {
         balanceOf[to] += amount;
         totalSupply += amount;
     }
@@ -155,7 +214,7 @@ contract V2TestBase is Test {
 
     // ── Mocks ──────────────────────────────────────────────────────────────
     MockERC20 internal usdc;
-    MockERC20 internal assetToken; // generic RWA token (was CUP)
+    MockAccessControlMintable internal assetToken; // generic RWA token (was CUP)
     MockAssetOracle internal assetOracle;
     MockUniswapRouter internal uniswapRouter;
 
@@ -183,7 +242,7 @@ contract V2TestBase is Test {
 
         // ── External mocks ──────────────────────────────────────────────────
         usdc = new MockERC20("USD Coin", "USDC", 6);
-        assetToken = new MockERC20("Generic RWA Token", "GRWA", 6);
+        assetToken = new MockAccessControlMintable("Generic RWA Token", "GRWA", 6);
         assetOracle = new MockAssetOracle(450_000_000, "GRWA / USD"); // $4.50
         uniswapRouter = new MockUniswapRouter(weth);
 
@@ -215,7 +274,6 @@ contract V2TestBase is Test {
             )
         );
         router.grantRole(router.VAULT_CURATOR_ROLE(), curator);
-        router.grantRole(router.HOST_INTEGRATION_ROLE(), admin);
 
         // ── RFQEngine ──────────────────────────────────────────────────────
         rfqEngine = RFQEngine(
@@ -269,6 +327,10 @@ contract V2TestBase is Test {
         // Grant factory FACTORY_ROLE in registry
         registry.grantRole(registry.FACTORY_ROLE(), address(factory));
 
+        bytes32 vaultFactoryRole = router.VAULT_FACTORY_ROLE();
+        router.grantRole(vaultFactoryRole, address(factory));
+        settlement.grantRole(vaultFactoryRole, address(factory));
+
         // ── Create first vault (generic RWA, not copper-specific) ──────────
         // Factory auto-deploys a per-vault EpochManager proxy.
         (vaultId, vaultAddr, facilityAddr, epochManagerAddr) = factory.createVault(
@@ -288,10 +350,11 @@ contract V2TestBase is Test {
             })
         );
 
-        // Grant settlement + router MINTER_ROLE on assetToken
-        assetToken.mint(address(settlement), 0); // just to confirm it works
-        // In real usage, assetToken.MINTER_ROLE() is granted to settlement + router
-        // Here we use the unrestricted MockERC20.mint directly in tests
+        bytes32 minterRole = assetToken.MINTER_ROLE();
+        registry.authorizeVaultMint(vaultId);
+        assetToken.grantRole(minterRole, admin);
+        assetToken.grantRole(minterRole, address(router));
+        assetToken.grantRole(minterRole, address(settlement));
 
         // Wire EpochManager: grant EPOCH_MANAGER_ROLE to admin and settlement so tests can advance epochs.
         // The factory relinquishes EPOCH_MANAGER_ROLE after createVault; admin holds DEFAULT_ADMIN_ROLE.
@@ -327,6 +390,7 @@ contract V2TestBase is Test {
     }
 
     function _mintAsset(address to, uint256 amount) internal {
+        vm.prank(admin);
         assetToken.mint(to, amount);
     }
 }

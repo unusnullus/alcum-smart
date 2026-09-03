@@ -9,6 +9,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/interfaces/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
@@ -17,6 +18,7 @@ import {IEpochManager} from "./interfaces/IEpochManager.sol";
 import {IFeeDistributor} from "./interfaces/IFeeDistributor.sol";
 import {IERC20Mintable} from "../interfaces/IERC20Mintable.sol";
 import {VaultLib} from "./libraries/VaultLib.sol";
+import {OracleLib} from "./libraries/OracleLib.sol";
 import {VaultRegistry} from "./VaultRegistry.sol";
 
 /**
@@ -82,9 +84,9 @@ contract SharedSettlementEngine is
         uint256 assetInInventory; // asset token units in custody
         uint256 assetSpotPrice; // current oracle price (8 dec)
         uint256 assetInTransit; // asset tokens in transit between custodians
-        uint256 retainedEarnings; // USDC (6 dec) — undistributed protocol earnings
-        uint256 stablecoinBalance; // USDC (6 dec) — idle balance in CapitalFacility
-        uint256 liabilities; // USDC (6 dec) — pending redemption obligations
+        uint256 retainedEarnings; // settlement-token units — undistributed protocol earnings
+        uint256 stablecoinBalance; // settlement-token units — idle balance in CapitalFacility
+        uint256 liabilities; // settlement-token units — pending redemption obligations
     }
 
     /**
@@ -136,6 +138,9 @@ contract SharedSettlementEngine is
     /// @dev vaultId → epochId → system fee collected.
     mapping(uint256 => mapping(uint256 => uint256)) public epochSystemFees;
 
+    /// @notice True after the first successful `updateNAV` for a vault (§05 bootstrap / catalog gate).
+    mapping(uint256 => bool) public navInitialized;
+
     // ─────────────────────────── EVENTS ─────────────────────────────────────
 
     event EpochRevenueRecorded(uint256 indexed vaultId, uint256 indexed epochId, uint256 netRevenue);
@@ -147,6 +152,7 @@ contract SharedSettlementEngine is
         uint256 assetMinted,
         uint256 systemFee
     );
+    event NAVInitialized(uint256 indexed vaultId);
     event NAVUpdated(uint256 indexed vaultId, uint256 netAssets, uint256 pricePerShare);
     event VaultOperatorSet(uint256 indexed vaultId, address indexed operator);
     event SystemFeeUpdated(uint256 oldFee, uint256 newFee);
@@ -310,6 +316,7 @@ contract SharedSettlementEngine is
         if (r.netRevenue == 0) revert NoRevenueToDistribute(vaultId, epochId);
 
         VaultLib.VaultRecord memory v = registry.getVault(vaultId);
+        if (!registry.isMintAuthorized(vaultId)) revert VaultRegistry.MintNotAuthorized(vaultId);
 
         uint256 total = r.netRevenue;
         uint256 fee = (total * systemFeeBps) / BASIS_POINTS;
@@ -327,12 +334,22 @@ contract SharedSettlementEngine is
 
         uint256 mintPrice = r.averageBuyPrice;
         if (mintPrice == 0) {
+            OracleLib.requireFresh(v.assetOracle, registry.effectiveMaxOracleAge(vaultId));
             mintPrice = IAssetOracle(v.assetOracle).price();
         }
         if (mintPrice == 0) revert InvalidAssetPrice();
-        uint8 dec = IAssetOracle(v.assetOracle).decimals();
 
-        uint256 assetToMint = (netAfterFee * 10 ** uint256(dec)) / mintPrice;
+        uint8 oracleDecimals = IAssetOracle(v.assetOracle).decimals();
+        uint8 assetDecimals = IERC20Metadata(v.assetToken).decimals();
+        uint8 settlementDecimals = IERC20Metadata(v.settlementToken).decimals();
+
+        uint256 assetToMint = VaultLib.settlementToAssetAmount(
+            netAfterFee,
+            mintPrice,
+            assetDecimals,
+            oracleDecimals,
+            settlementDecimals
+        );
         if (assetToMint == 0) revert ZeroAssetTokensToMint();
 
         IERC20Mintable(v.assetToken).mint(v.vault, assetToMint);
@@ -357,29 +374,29 @@ contract SharedSettlementEngine is
 
     /**
      * @notice Update the NAV components for a vault and emit a price-per-share snapshot.
-     * @dev All monetary values in NAVComponents must use 6 decimal precision (USDC-aligned).
-     *      assetSpotPrice must use 8 decimal precision (oracle-aligned).
+     * @dev Monetary fields in NAVComponents use settlement-token precision.
+     *      assetSpotPrice uses oracle precision (typically 8 decimals).
+     *      `retainedEarnings` is preserved from storage — only settle/distribute mutate it.
+     *      Calldata retainedEarnings is ignored (FIND-030).
      */
     function updateNAV(uint256 vaultId, NAVComponents calldata newNav) external {
         _checkRevenueManager(vaultId);
         VaultLib.VaultRecord memory v = registry.getVault(vaultId);
 
         NAVComponents memory nav = newNav;
+        // FIND-030: do not let ops overwrite settle-accrued / undistributed earnings.
+        nav.retainedEarnings = _nav[vaultId].retainedEarnings;
         if (!v.reportedInventoryOnly) {
             nav.assetInInventory = IERC20(v.assetToken).balanceOf(v.vault);
         }
         _nav[vaultId] = nav;
 
-        NAVComponents storage n = _nav[vaultId];
+        if (!navInitialized[vaultId]) {
+            navInitialized[vaultId] = true;
+            emit NAVInitialized(vaultId);
+        }
 
-        uint8 dec = IAssetOracle(v.assetOracle).decimals();
-        uint256 scale = 10 ** uint256(dec);
-        uint256 assetValue = ((n.assetInInventory + n.assetInTransit) * n.assetSpotPrice) / scale;
-        uint256 totalAssets = assetValue + n.retainedEarnings + n.stablecoinBalance;
-        uint256 netAssets = totalAssets > n.liabilities ? totalAssets - n.liabilities : 0;
-
-        uint256 supply = IERC4626(v.vault).totalSupply();
-        uint256 pricePerShare = supply == 0 ? 1e6 : (netAssets * 1e6) / supply;
+        (uint256 netAssets, uint256 pricePerShare) = _computeNavSummary(vaultId, v);
 
         emit NAVUpdated(vaultId, netAssets, pricePerShare);
     }
@@ -398,16 +415,12 @@ contract SharedSettlementEngine is
     function getNAVSummary(
         uint256 vaultId
     ) external view returns (uint256 totalAssets, uint256 netAssets, uint256 pricePerShare) {
-        NAVComponents storage n = _nav[vaultId];
         VaultLib.VaultRecord memory v = registry.getVault(vaultId);
+        NAVComponents storage n = _nav[vaultId];
 
-        uint8 dec = IAssetOracle(v.assetOracle).decimals();
-        uint256 scale = 10 ** uint256(dec);
-        uint256 assetValue = ((n.assetInInventory + n.assetInTransit) * n.assetSpotPrice) / scale;
-        totalAssets = assetValue + n.retainedEarnings + n.stablecoinBalance;
+        totalAssets = _navTotalAssets(v, n);
         netAssets = totalAssets > n.liabilities ? totalAssets - n.liabilities : 0;
-        uint256 supply = IERC4626(v.vault).totalSupply();
-        pricePerShare = supply == 0 ? 1e6 : (netAssets * 1e6) / supply;
+        pricePerShare = _pricePerShare(v, netAssets);
     }
 
     /**
@@ -478,13 +491,54 @@ contract SharedSettlementEngine is
     }
 
     /// @notice Recover ERC-20 tokens accidentally sent to this contract.
-    function rescueTokens(address token, address to, uint256 amount) external onlyOwner {
+    function rescueTokens(address token, address to, uint256 amount) external onlyOwner nonReentrant {
         if (to == address(0)) revert ZeroAddress();
         if (registry.vaultIdByAddress(token) != 0) revert CannotRescueVaultShares(token);
         IERC20(token).safeTransfer(to, amount);
     }
 
     // ─────────────────────────── INTERNAL ───────────────────────────────────
+
+    function _computeNavSummary(
+        uint256 vaultId,
+        VaultLib.VaultRecord memory v
+    ) internal view returns (uint256 netAssets, uint256 pricePerShare) {
+        NAVComponents storage n = _nav[vaultId];
+        uint256 totalAssets = _navTotalAssets(v, n);
+        netAssets = totalAssets > n.liabilities ? totalAssets - n.liabilities : 0;
+        pricePerShare = _pricePerShare(v, netAssets);
+    }
+
+    function _navTotalAssets(
+        VaultLib.VaultRecord memory v,
+        NAVComponents storage n
+    ) internal view returns (uint256) {
+        uint8 oracleDecimals = IAssetOracle(v.assetOracle).decimals();
+        uint8 assetDecimals = IERC20Metadata(v.assetToken).decimals();
+        uint8 settlementDecimals = IERC20Metadata(v.settlementToken).decimals();
+
+        uint256 assetValue = VaultLib.assetToSettlementAmount(
+            n.assetInInventory + n.assetInTransit,
+            n.assetSpotPrice,
+            assetDecimals,
+            oracleDecimals,
+            settlementDecimals
+        );
+
+        return assetValue + n.retainedEarnings + n.stablecoinBalance;
+    }
+
+    function _pricePerShare(
+        VaultLib.VaultRecord memory v,
+        uint256 netAssets
+    ) internal view returns (uint256) {
+        uint256 supply = IERC4626(v.vault).totalSupply();
+        uint256 settlementScale = 10 ** uint256(IERC20Metadata(v.settlementToken).decimals());
+        if (supply == 0) {
+            return settlementScale;
+        }
+        return (netAssets * 10 ** uint256(VaultLib.VAULT_SHARE_DECIMALS)) / supply;
+    }
 
     /**
      * @dev Route the system fee according to the configured distribution path.
@@ -543,5 +597,5 @@ contract SharedSettlementEngine is
      * @dev Storage gap for future variable additions. Reduce this size by the number
      *      of slots added in subsequent upgrades.
      */
-    uint256[43] private __gap;
+    uint256[42] private __gap;
 }

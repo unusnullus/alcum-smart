@@ -11,6 +11,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 import {ICapitalFacility} from "./interfaces/ICapitalFacility.sol";
+import {ICommittedLiquidityRouter} from "./interfaces/ICommittedLiquidityRouter.sol";
 
 /**
  * @title CapitalFacility
@@ -61,6 +62,7 @@ contract CapitalFacility is
 
     IERC20 public token;
     address public authorizedSpender;
+    uint256 public vaultId;
 
     /// @dev protocol address → stablecoin amount currently deployed there.
     mapping(address => uint256) private _deployed;
@@ -81,10 +83,12 @@ contract CapitalFacility is
     error ZeroAmount();
     error ProtocolNotWhitelisted(address protocol);
     error InsufficientIdleBalance(uint256 available, uint256 requested);
+    error InsufficientUncommittedIdle(uint256 available, uint256 requested);
     error DeploymentFailed();
     error RecallFailed();
     error CalldataTooLong();
     error ZeroDeploymentInProtocol(address protocol);
+    error VaultIdAlreadySet();
 
     // ─────────────────────────── EVENTS ─────────────────────────────────────
 
@@ -124,6 +128,15 @@ contract CapitalFacility is
         token.forceApprove(authorizedSpender_, type(uint256).max);
     }
 
+    /**
+     * @notice Bind this facility to its registry vault id.
+     * @dev Called once by VaultFactory immediately after registerVault. Factory is the initial owner.
+     */
+    function setVaultId(uint256 vaultId_) external onlyOwner {
+        if (vaultId != 0) revert VaultIdAlreadySet();
+        vaultId = vaultId_;
+    }
+
     // ─────────────────────────── ICapitalFacility ───────────────────────────
 
     /// @inheritdoc ICapitalFacility
@@ -160,6 +173,12 @@ contract CapitalFacility is
 
         uint256 idle = idleBalance();
         if (idle < amount) revert InsufficientIdleBalance(idle, amount);
+
+        uint256 committed = vaultId == 0
+            ? 0
+            : ICommittedLiquidityRouter(authorizedSpender).getCommittedLiability(vaultId);
+        uint256 available = idle > committed ? idle - committed : 0;
+        if (available < amount) revert InsufficientUncommittedIdle(available, amount);
 
         token.safeTransfer(protocol, amount);
 
@@ -242,7 +261,7 @@ contract CapitalFacility is
      * @notice Replace the authorised spender and refresh the unlimited approval.
      * @dev Previous spender allowance is reset to 0 before the new unlimited approve.
      */
-    function setAuthorizedSpender(address newSpender) external onlyOwner {
+    function setAuthorizedSpender(address newSpender) external onlyOwner nonReentrant {
         if (newSpender == address(0)) revert ZeroAddress();
         address previous = authorizedSpender;
         token.forceApprove(previous, 0);
@@ -301,5 +320,5 @@ contract CapitalFacility is
      * @dev Storage gap for future variable additions. Reduce this size by the number
      *      of slots added in subsequent upgrades.
      */
-    uint256[45] private __gap;
+    uint256[44] private __gap;
 }

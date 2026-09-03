@@ -33,15 +33,20 @@ contract CopperAssetOracle is IAssetOracle, AccessControl {
     /// @notice Timestamp of the last manual fallback price update.
     uint256 public fallbackUpdatedAt;
 
+    /// @notice Timestamp of the last live-feed sync (FIND-029). Required for non-fallback freshness.
+    uint256 public feedUpdatedAt;
+
     /// @notice When true, `price()` always returns `fallbackPrice` regardless of the feed.
     bool public useFallback;
 
     event UnderlyingUpdated(address indexed oldUnderlying, address indexed newUnderlying);
     event FallbackPriceSet(uint256 oldPrice, uint256 newPrice, address indexed by);
     event UseFallbackToggled(bool useFallback);
+    event FeedUpdatedAtSet(uint256 updatedAt, address indexed by);
 
     error ZeroAddress();
     error ZeroPrice();
+    error InvalidTimestamp();
 
     constructor(address underlying_, address admin_) {
         if (underlying_ == address(0)) revert ZeroAddress();
@@ -74,9 +79,9 @@ contract CopperAssetOracle is IAssetOracle, AccessControl {
     /// @inheritdoc IAssetOracle
     function updatedAt() external view override returns (uint256) {
         if (useFallback) return fallbackUpdatedAt;
-        // ICopperPriceConsumer does not expose updatedAt; approximate with the
-        // last manual fallback update, falling back to the current block timestamp.
-        return fallbackUpdatedAt > 0 ? fallbackUpdatedAt : block.timestamp;
+        // Underlying copper consumer has no timestamp — ops must sync `feedUpdatedAt`
+        // (or use fallback) so FIND-029 freshness checks see a real age.
+        return feedUpdatedAt;
     }
 
     // ─────────────────────────── ADMIN ──────────────────────────────────────
@@ -101,6 +106,17 @@ contract CopperAssetOracle is IAssetOracle, AccessControl {
     /// @notice Toggle forced fallback mode. When enabled, the live feed is bypassed.
     function setUseFallback(bool flag) external onlyRole(ORACLE_ADMIN_ROLE) {
         useFallback = flag;
+        if (flag && fallbackUpdatedAt == 0 && fallbackPrice != 0) {
+            fallbackUpdatedAt = block.timestamp;
+        }
         emit UseFallbackToggled(flag);
+    }
+
+    /// @notice Record when the live underlying feed was last known-good (FIND-029).
+    /// @dev `ts == 0` clears freshness (oracle will fail stale checks until re-synced).
+    function setFeedUpdatedAt(uint256 ts) external onlyRole(ORACLE_ADMIN_ROLE) {
+        if (ts > block.timestamp) revert InvalidTimestamp();
+        feedUpdatedAt = ts;
+        emit FeedUpdatedAtSet(ts, msg.sender);
     }
 }

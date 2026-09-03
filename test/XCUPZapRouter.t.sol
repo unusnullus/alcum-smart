@@ -293,6 +293,20 @@ contract XCUPZapRouterTest is Test {
 
         vm.stopPrank();
 
+        // XCUPZapRouter calls IXCUPPriceView methods on the xcup address.
+        // xcup is ERC20Mock in tests → we mock both price-view calls.
+        // Partial-match: only the selector is provided, Foundry matches any call with that selector.
+        vm.mockCall(
+            address(xcup),
+            abi.encodeWithSelector(bytes4(keccak256("getXcupPriceInToken(address,uint256)"))),
+            abi.encode(uint256(100 * ONE_USDC))
+        );
+        vm.mockCall(
+            address(xcup),
+            abi.encodeWithSelector(bytes4(keccak256("getTokenToXcupExchangeRate(address,uint256)"))),
+            abi.encode(uint256(100 * ONE_XCUP))
+        );
+
         // User approves zap router
         vm.prank(user);
         xcup.approve(address(zapRouter), type(uint256).max);

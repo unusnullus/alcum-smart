@@ -10,46 +10,67 @@ contract VaultLibHarness {
 
     mapping(bytes32 => VaultLib.Deposit)              public deposits;
     bytes32[]                                          public pendingIds;
+    mapping(bytes32 => uint256)                        public pendingIndex;
     mapping(address => bytes32[])                      public userDeposits;
+    mapping(address => mapping(bytes32 => uint256))    public userIndex;
 
     mapping(bytes32 => VaultLib.RedeemRequest)         public redeems;
     bytes32[]                                          public pendingRedeemIds;
+    mapping(bytes32 => uint256)                        public pendingRedeemIndex;
     mapping(address => bytes32[])                      public userRedeems;
+    mapping(address => mapping(bytes32 => uint256))    public userRedeemIndex;
 
     function recordDeposit(bytes32 depositId, uint256 amount, address user) external {
-        VaultLib.recordDeposit(deposits, pendingIds, userDeposits, depositId, amount, user);
-    }
-
-    function recordExternalDeposit(
-        uint256 usdcAmount,
-        address beneficiary,
-        bytes32 tag,
-        address createdBy,
-        uint256 nonce
-    ) external returns (bytes32) {
-        return VaultLib.recordExternalDeposit(
-            deposits, pendingIds, userDeposits, usdcAmount, beneficiary, tag, createdBy, nonce
+        VaultLib.recordDeposit(
+            deposits,
+            pendingIds,
+            pendingIndex,
+            userDeposits,
+            userIndex,
+            depositId,
+            amount,
+            user
         );
     }
 
-    function approveDeposit(bytes32 depositId, uint256 approvedAmount, uint256 assetPrice, uint8 dec) external {
-        VaultLib.approveDeposit(deposits, depositId, approvedAmount, assetPrice, dec);
-    }
-
-    function approveExternalDeposit(bytes32 depositId, uint256 approvedUsdc, uint256 assetPrice, uint8 dec) external {
-        VaultLib.approveExternalDeposit(deposits, depositId, approvedUsdc, assetPrice, dec);
+    function approveDeposit(
+        bytes32 depositId,
+        uint256 approvedAmount,
+        uint256 assetPrice,
+        uint8 oracleDecimals,
+        uint8 assetDecimals,
+        uint8 settlementDecimals
+    ) external {
+        VaultLib.approveDeposit(
+            deposits,
+            depositId,
+            approvedAmount,
+            assetPrice,
+            oracleDecimals,
+            assetDecimals,
+            settlementDecimals
+        );
     }
 
     function recordRedeemRequest(bytes32 redeemId, address user, uint256 shares) external {
-        VaultLib.recordRedeemRequest(redeems, pendingRedeemIds, userRedeems, redeemId, user, shares);
+        VaultLib.recordRedeemRequest(
+            redeems,
+            pendingRedeemIds,
+            pendingRedeemIndex,
+            userRedeems,
+            userRedeemIndex,
+            redeemId,
+            user,
+            shares
+        );
     }
 
     function removeFromArray(bytes32 id) external {
-        VaultLib.removeFromArray(pendingIds, id);
+        VaultLib.removeFromArray(pendingIds, pendingIndex, id);
     }
 
     function removeUserEntry(address user, bytes32 id) external {
-        VaultLib.removeUserEntry(userDeposits, user, id);
+        VaultLib.removeUserEntry(userDeposits, userIndex, user, id);
     }
 
     function getDeposit(bytes32 depositId) external view returns (VaultLib.Deposit memory) {
@@ -86,14 +107,15 @@ contract VaultLibTest is Test {
         VaultLib.Deposit memory d = h.getDeposit(DID);
         assertEq(d.user,   userA);
         assertEq(d.amount, 1000e6);
-        assertFalse(d.isExternal);
         assertFalse(d.approved);
+        assertEq(d.approvedShares, 0);
     }
 
     function test_recordDeposit_addsToPending() public {
         h.recordDeposit(DID, 1000e6, userA);
         assertEq(h.getPendingIds().length, 1);
         assertEq(h.getPendingIds()[0], DID);
+        assertEq(h.pendingIndex(DID), 1);
     }
 
     function test_recordDeposit_addsToUserList() public {
@@ -101,6 +123,7 @@ contract VaultLibTest is Test {
         bytes32[] memory uDeps = h.getUserDeposits(userA);
         assertEq(uDeps.length, 1);
         assertEq(uDeps[0], DID);
+        assertEq(h.userIndex(userA, DID), 1);
     }
 
     function test_recordDeposit_revertsAlreadyExists() public {
@@ -109,118 +132,77 @@ contract VaultLibTest is Test {
         h.recordDeposit(DID, 500e6, userA);
     }
 
-    // ─── approveDeposit (non-external) ────────────────────────────────────────
+    // ─── approveDeposit ───────────────────────────────────────────────────────
 
     function test_approveDeposit_approvesCorrectly() public {
         h.recordDeposit(DID, 1000e6, userA);
-        h.approveDeposit(DID, 1000e6, 450_000_000, 8);
+        h.approveDeposit(DID, 1000e6, 450_000_000, 8, 6, 6);
 
         VaultLib.Deposit memory d = h.getDeposit(DID);
         assertTrue(d.approved);
         assertEq(d.approvedAmount, 1000e6);
         assertEq(d.priceSnapshot,  450_000_000);
-        // 1000e6 * 1e8 / 450_000_000 = 2222222222
         assertEq(d.approvedAssetAmount, uint256(1000e6) * 1e8 / 450_000_000);
+    }
+
+    function test_approveDeposit_scalesSettlementToAssetDecimals() public {
+        // 1 DAI (18 dec) at $1/asset → 1 whole asset token (6 dec)
+        h.recordDeposit(DID, 1e18, userA);
+        h.approveDeposit(DID, 1e18, 100_000_000, 8, 6, 18);
+
+        VaultLib.Deposit memory d = h.getDeposit(DID);
+        assertEq(d.approvedAssetAmount, 1e6);
+    }
+
+    function test_assetToSettlementAmount_matchesInverse() public pure {
+        uint256 assetAmount = 100e6;
+        uint256 price = 450_000_000;
+        uint256 settlement = VaultLib.assetToSettlementAmount(assetAmount, price, 6, 8, 18);
+        uint256 roundTrip = VaultLib.settlementToAssetAmount(settlement, price, 6, 8, 18);
+        assertEq(roundTrip, assetAmount);
     }
 
     function test_approveDeposit_revertsNotFound() public {
         vm.expectRevert(VaultLib.DepositNotFound.selector);
-        h.approveDeposit(DID, 1000e6, 450_000_000, 8);
-    }
-
-    function test_approveDeposit_revertsIfExternal() public {
-        h.recordExternalDeposit(1000e6, userA, bytes32("tag"), userB, 0);
-        bytes32[] memory p = h.getPendingIds();
-        bytes32 did = p[0];
-        vm.expectRevert(VaultLib.ExternalDepositRequiresPriceApproval.selector);
-        h.approveDeposit(did, 1000e6, 450_000_000, 8);
+        h.approveDeposit(DID, 1000e6, 450_000_000, 8, 6, 6);
     }
 
     function test_approveDeposit_revertsAlreadyApproved() public {
         h.recordDeposit(DID, 1000e6, userA);
-        h.approveDeposit(DID, 1000e6, 450_000_000, 8);
+        h.approveDeposit(DID, 1000e6, 450_000_000, 8, 6, 6);
         vm.expectRevert(VaultLib.DepositAlreadyApproved.selector);
-        h.approveDeposit(DID, 1000e6, 450_000_000, 8);
+        h.approveDeposit(DID, 1000e6, 450_000_000, 8, 6, 6);
+    }
+
+    function test_approveDeposit_revertsPartialAmount() public {
+        h.recordDeposit(DID, 1000e6, userA);
+        vm.expectRevert(VaultLib.MustApproveFullDeposit.selector);
+        h.approveDeposit(DID, 500e6, 450_000_000, 8, 6, 6);
     }
 
     function test_approveDeposit_revertsZeroApprovedAmount() public {
         h.recordDeposit(DID, 1000e6, userA);
-        vm.expectRevert(VaultLib.InvalidApprovedAmount.selector);
-        h.approveDeposit(DID, 0, 450_000_000, 8);
+        vm.expectRevert(VaultLib.MustApproveFullDeposit.selector);
+        h.approveDeposit(DID, 0, 450_000_000, 8, 6, 6);
     }
 
     function test_approveDeposit_revertsAmountExceedsDeposit() public {
         h.recordDeposit(DID, 1000e6, userA);
-        vm.expectRevert(VaultLib.InvalidApprovedAmount.selector);
-        h.approveDeposit(DID, 2000e6, 450_000_000, 8); // 2000 > 1000
+        vm.expectRevert(VaultLib.MustApproveFullDeposit.selector);
+        h.approveDeposit(DID, 2000e6, 450_000_000, 8, 6, 6);
     }
 
     function test_approveDeposit_revertsZeroPrice() public {
         h.recordDeposit(DID, 1000e6, userA);
         vm.expectRevert(VaultLib.InvalidApprovedAmount.selector);
-        h.approveDeposit(DID, 1000e6, 0, 8);
+        h.approveDeposit(DID, 1000e6, 0, 8, 6, 6);
     }
 
-    // ─── recordExternalDeposit ────────────────────────────────────────────────
-
-    function test_recordExternalDeposit_storesData() public {
-        bytes32 did = h.recordExternalDeposit(2000e6, userA, bytes32("mytag"), userB, 0);
-
-        VaultLib.Deposit memory d = h.getDeposit(did);
-        assertEq(d.amount,      2000e6);
-        assertEq(d.beneficiary, userA);
-        assertTrue(d.isExternal);
-        assertEq(d.tag, bytes32("mytag"));
-    }
-
-    function test_recordExternalDeposit_revertsZeroBeneficiary() public {
-        vm.expectRevert(VaultLib.InvalidBeneficiary.selector);
-        h.recordExternalDeposit(1000e6, address(0), bytes32("tag"), userA, 0);
-    }
-
-    // ─── approveExternalDeposit error paths ──────────────────────────────────
-
-    function test_approveExternalDeposit_revertsNotExternalDeposit() public {
-        h.recordDeposit(DID, 1000e6, userA);
-        vm.expectRevert(VaultLib.NotExternalDeposit.selector);
-        h.approveExternalDeposit(DID, 1000e6, 450_000_000, 8);
-    }
-
-    function test_approveExternalDeposit_revertsNotFound() public {
-        vm.expectRevert(VaultLib.DepositNotFound.selector);
-        h.approveExternalDeposit(DID, 1000e6, 450_000_000, 8);
-    }
-
-    function test_approveExternalDeposit_revertsZeroPrice() public {
-        bytes32 did = h.recordExternalDeposit(1000e6, userA, bytes32("t"), userB, 0);
+    function test_find031_approveDeposit_revertsZeroAssetAmount() public {
+        // 1 wei USDC at $4.50 truncates: 1 * 1e8 / 450_000_000 == 0
+        h.recordDeposit(DID, 1, userA);
         vm.expectRevert(VaultLib.InvalidApprovedAmount.selector);
-        h.approveExternalDeposit(did, 1000e6, 0, 8);
-    }
-
-    function test_approveExternalDeposit_revertsInvalidAmount() public {
-        bytes32 did = h.recordExternalDeposit(1000e6, userA, bytes32("t"), userB, 0);
-        vm.expectRevert(VaultLib.InvalidApprovedAmount.selector);
-        h.approveExternalDeposit(did, 9999e6, 450_000_000, 8); // > deposit amount
-    }
-
-    function test_approveExternalDeposit_success() public {
-        bytes32 did = h.recordExternalDeposit(1000e6, userA, bytes32("t"), userB, 0);
-        h.approveExternalDeposit(did, 900e6, 450_000_000, 8);
-
-        VaultLib.Deposit memory d = h.getDeposit(did);
-        assertTrue(d.approved);
-        assertEq(d.approvedAmount, 900e6);
-        assertEq(d.priceSnapshot, 450_000_000);
-        assertEq(d.approvedAssetAmount, (900e6 * 1e8) / 450_000_000);
-    }
-
-    function test_recordExternalDeposit_nonceCollisionRehashes() public {
-        vm.warp(1_700_000_000);
-        bytes32 first = h.recordExternalDeposit(1000e6, userA, bytes32("same"), userB, 7);
-        bytes32 second = h.recordExternalDeposit(1000e6, userA, bytes32("same"), userB, 7);
-
-        assertTrue(first != second, "deposit id should rehash on collision");
-        assertEq(h.getPendingIds().length, 2);
+        h.approveDeposit(DID, 1, 450_000_000, 8, 6, 6);
     }
 
     // ─── recordRedeemRequest ─────────────────────────────────────────────────
@@ -232,6 +214,7 @@ contract VaultLibTest is Test {
         assertEq(r.shares, 500e6);
         assertFalse(r.approved);
         assertFalse(r.claimed);
+        assertEq(h.pendingRedeemIndex(RID), 1);
     }
 
     function test_recordRedeemRequest_revertsAlreadyExists() public {
@@ -240,7 +223,7 @@ contract VaultLibTest is Test {
         h.recordRedeemRequest(RID, userA, 500e6);
     }
 
-    // ─── removeFromArray ─────────────────────────────────────────────────────
+    // ─── removeFromArray (O(1) indexed) ──────────────────────────────────────
 
     function test_removeFromArray_removesCorrectElement() public {
         bytes32 id1 = keccak256("a");
@@ -252,21 +235,42 @@ contract VaultLibTest is Test {
         h.recordDeposit(id3, 1, userA);
 
         assertEq(h.getPendingIds().length, 3);
+        assertEq(h.pendingIndex(id2), 2);
 
         h.removeFromArray(id2);
 
         assertEq(h.getPendingIds().length, 2);
-        // id2 should no longer be in the list
+        assertEq(h.pendingIndex(id2), 0);
         bytes32[] memory arr = h.getPendingIds();
         for (uint256 i; i < arr.length; i++) {
             assertTrue(arr[i] != id2, "id2 should be removed");
+            assertEq(h.pendingIndex(arr[i]), i + 1);
         }
+    }
+
+    function test_removeFromArray_updatesMovedElementIndex() public {
+        bytes32 id1 = keccak256("a");
+        bytes32 id2 = keccak256("b");
+        bytes32 id3 = keccak256("c");
+
+        h.recordDeposit(id1, 1, userA);
+        h.recordDeposit(id2, 1, userB);
+        h.recordDeposit(id3, 1, userA);
+
+        // Remove middle element — id3 swaps into index 2
+        h.removeFromArray(id2);
+
+        assertEq(h.getPendingIds()[0], id1);
+        assertEq(h.getPendingIds()[1], id3);
+        assertEq(h.pendingIndex(id1), 1);
+        assertEq(h.pendingIndex(id3), 2);
     }
 
     function test_removeFromArray_noopIfNotFound() public {
         h.recordDeposit(DID, 1, userA);
-        h.removeFromArray(keccak256("nonexistent")); // should not revert
+        h.removeFromArray(keccak256("nonexistent"));
         assertEq(h.getPendingIds().length, 1);
+        assertEq(h.pendingIndex(DID), 1);
     }
 
     // ─── removeUserEntry ─────────────────────────────────────────────────────
@@ -283,11 +287,13 @@ contract VaultLibTest is Test {
 
         assertEq(h.getUserDeposits(userA).length, 1);
         assertEq(h.getUserDeposits(userA)[0], id2);
+        assertEq(h.userIndex(userA, id1), 0);
+        assertEq(h.userIndex(userA, id2), 1);
     }
 
     function test_removeUserEntry_noopIfNotFound() public {
         h.recordDeposit(DID, 1, userA);
-        h.removeUserEntry(userA, keccak256("nonexistent")); // should not revert
+        h.removeUserEntry(userA, keccak256("nonexistent"));
         assertEq(h.getUserDeposits(userA).length, 1);
     }
 }

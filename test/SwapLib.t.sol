@@ -371,6 +371,7 @@ contract TestContract {
                 tokenIn,
                 amount,
                 slippageBps,
+                0,
                 router,
                 IERC20(address(usdc)),
                 silo,
@@ -388,7 +389,7 @@ contract TestContract {
         uint256 slippageBps,
         uint256 msgValue
     ) external payable {
-        SwapLib.tradeForToken(tokenIn, tokenOut, amountIn, slippageBps, router, silo, msgValue, address(0));
+        SwapLib.tradeForToken(tokenIn, tokenOut, amountIn, slippageBps, 0, router, silo, msgValue, address(0));
     }
 }
 

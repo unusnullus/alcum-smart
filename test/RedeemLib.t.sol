@@ -400,6 +400,9 @@ contract RedeemLibTest is Test {
     }
 
     function testClaimRedeemInvalidPrice() public {
+        // RedeemLib.claimRedeem no longer validates the price oracle at claim time.
+        // The USDC amount is locked at approveRedeem time. This test verifies that
+        // claimRedeem succeeds even when the oracle price is 0.
         uint256 shares = 1000 * 10 ** 6;
         bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         testContract.requestRedeem(redeemId, user1, shares);
@@ -407,19 +410,23 @@ contract RedeemLibTest is Test {
 
         testContract.approveRedeem(redeemId, usdcAmount);
 
-        // Create price consumer with zero price
         MockPriceConsumer zeroPriceConsumer = new MockPriceConsumer(0);
 
-        // Transfer xCUP shares to testContract (simulating requestRedeem behavior)
         vm.startPrank(user1);
         vault.approve(address(testContract), shares);
         vault.transfer(address(testContract), shares);
-        vm.expectRevert(RedeemLib.InvalidPrice.selector);
-        testContract.claimRedeem(redeemId, user1, vault, usdcToken, address(silo), zapper, address(zeroPriceConsumer));
+        // Should succeed: price oracle is not consulted at claim time
+        uint256 received = testContract.claimRedeem(
+            redeemId, user1, vault, usdcToken, address(silo), zapper, address(zeroPriceConsumer)
+        );
         vm.stopPrank();
+
+        assertEq(received, usdcAmount);
     }
 
     function testClaimRedeemPriceOracleCallFailed() public {
+        // RedeemLib.claimRedeem no longer calls the price oracle at claim time.
+        // This test verifies that even an invalid oracle address doesn't break claim.
         uint256 shares = 1000 * 10 ** 6;
         bytes32 redeemId = keccak256(abi.encodePacked(user1, block.timestamp, shares));
         testContract.requestRedeem(redeemId, user1, shares);
@@ -427,15 +434,13 @@ contract RedeemLibTest is Test {
 
         testContract.approveRedeem(redeemId, usdcAmount);
 
-        // Use contract without price() function that returns invalid data
         MockInvalidPriceConsumer invalidPriceConsumer = new MockInvalidPriceConsumer();
 
-        // Transfer xCUP shares to testContract (simulating requestRedeem behavior)
         vm.startPrank(user1);
         vault.approve(address(testContract), shares);
         vault.transfer(address(testContract), shares);
-        vm.expectRevert("Price oracle call failed");
-        testContract.claimRedeem(
+        // Should succeed: oracle is not called
+        uint256 received = testContract.claimRedeem(
             redeemId,
             user1,
             vault,
@@ -445,6 +450,8 @@ contract RedeemLibTest is Test {
             address(invalidPriceConsumer)
         );
         vm.stopPrank();
+
+        assertEq(received, usdcAmount);
     }
 
     // ───────────────────────────── GET REDEEM TESTS ─────────────────────────────

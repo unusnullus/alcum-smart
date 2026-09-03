@@ -7,6 +7,9 @@ pragma solidity ^0.8.24;
  */
 library VaultLib {
 
+    /// @dev RWAVault share token always exposes 6 decimals.
+    uint8 internal constant VAULT_SHARE_DECIMALS = 6;
+
     // ─────────────────────────── STRUCTS ────────────────────────────────────
 
     /**
@@ -35,16 +38,13 @@ library VaultLib {
     struct Deposit {
         address user;
         bytes32 depositId;
-        uint256 amount;              // USDC deposited
-        uint256 approvedAmount;      // curator-approved USDC (≤ amount)
+        uint256 amount;              // settlement token deposited
+        uint256 approvedAmount;      // curator-approved settlement amount (= amount when approved)
         uint256 approvedAssetAmount; // asset-token units calculated at approval price
+        uint256 approvedShares;      // vault shares escrowed on router after approve
         uint256 priceSnapshot;       // oracle price (8 dec) locked at approval
-        address beneficiary;         // share recipient (zero → use user)
-        address createdBy;
-        address claimedBy;
+        address claimedBy;           // non-zero after claim
         bool    approved;
-        bool    isExternal;
-        bytes32 tag;
     }
 
     /// @notice Queued redemption request (non-RFQ path).
@@ -66,9 +66,7 @@ library VaultLib {
     error DepositNotApproved();
     error DepositAlreadyClaimed();
     error InvalidApprovedAmount();
-    error InvalidBeneficiary();
-    error NotExternalDeposit();
-    error ExternalDepositRequiresPriceApproval();
+    error MustApproveFullDeposit();
     error RedeemNotFound();
     /// @notice A redeem request with this id already exists (not necessarily approved).
     error RedeemAlreadyExists();
@@ -77,17 +75,52 @@ library VaultLib {
     error RedeemAlreadyClaimed();
     error NotRedeemOwner();
 
+    // ─────────────────────────── DECIMAL CONVERSION ─────────────────────────
+
+    /**
+     * @notice Convert asset-token units to settlement-token units using an oracle USD price.
+     * @dev `assetPrice` uses `oracleDecimals` (typically 8). Result uses `settlementDecimals`.
+     */
+    function assetToSettlementAmount(
+        uint256 assetAmount,
+        uint256 assetPrice,
+        uint8 assetDecimals,
+        uint8 oracleDecimals,
+        uint8 settlementDecimals
+    ) internal pure returns (uint256) {
+        return (assetAmount * assetPrice * 10 ** uint256(settlementDecimals))
+            / (10 ** uint256(assetDecimals) * 10 ** uint256(oracleDecimals));
+    }
+
+    /**
+     * @notice Convert settlement-token units to asset-token units using an oracle USD price.
+     * @dev Inverse of {assetToSettlementAmount}.
+     */
+    function settlementToAssetAmount(
+        uint256 settlementAmount,
+        uint256 assetPrice,
+        uint8 assetDecimals,
+        uint8 oracleDecimals,
+        uint8 settlementDecimals
+    ) internal pure returns (uint256) {
+        return (settlementAmount * 10 ** uint256(oracleDecimals) * 10 ** uint256(assetDecimals))
+            / (assetPrice * 10 ** uint256(settlementDecimals));
+    }
+
     // ─────────────────────────── DEPOSIT HELPERS ────────────────────────────
 
     /**
      * @notice Store a pending on-chain zap deposit.
      * @dev Reverts if `depositId` is already used. `depositId` is caller-supplied;
      *      the router should document that clients must use a unique id.
+     *      Index maps store 1-based positions for O(1) removal (FIND-020).
      */
     function recordDeposit(
         mapping(bytes32 => Deposit) storage deposits,
         bytes32[] storage pendingIds,
+        mapping(bytes32 => uint256) storage pendingIndex,
         mapping(address => bytes32[]) storage userDeposits,
+        mapping(address => mapping(bytes32 => uint256)) storage userIndex,
         bytes32 depositId,
         uint256 amount,
         address user
@@ -100,110 +133,46 @@ library VaultLib {
             amount:              amount,
             approvedAmount:      0,
             approvedAssetAmount: 0,
+            approvedShares:      0,
             priceSnapshot:       0,
-            beneficiary:         address(0),
-            createdBy:           user,
             claimedBy:           address(0),
-            approved:            false,
-            isExternal:          false,
-            tag:                 bytes32(0)
+            approved:            false
         });
-        pendingIds.push(depositId);
-        userDeposits[user].push(depositId);
-    }
-
-    /**
-     * @notice Store a pending off-chain / host-to-host deposit.
-     * @dev No settlement tokens move. The id is derived from caller, timestamp,
-     *      amount, beneficiary, tag and nonce. Indexed under `beneficiary` in
-     *      `userDeposits` (not under `createdBy`).
-     */
-    function recordExternalDeposit(
-        mapping(bytes32 => Deposit) storage deposits,
-        bytes32[] storage pendingIds,
-        mapping(address => bytes32[]) storage userDeposits,
-        uint256 tokenAmount,
-        address beneficiary_,
-        bytes32 tag_,
-        address createdBy,
-        uint256 nonce
-    ) internal returns (bytes32 depositId) {
-        if (beneficiary_ == address(0)) revert InvalidBeneficiary();
-
-        depositId = keccak256(abi.encodePacked(createdBy, block.timestamp, tokenAmount, beneficiary_, tag_, nonce));
-        uint256 attempts;
-        while (deposits[depositId].user != address(0) && attempts < 100) {
-            nonce++;
-            depositId = keccak256(abi.encodePacked(createdBy, block.timestamp, tokenAmount, beneficiary_, tag_, nonce));
-            attempts++;
-        }
-        if (deposits[depositId].user != address(0)) revert DepositAlreadyExists();
-
-        deposits[depositId] = Deposit({
-            user:                createdBy,
-            depositId:           depositId,
-            amount:              tokenAmount,
-            approvedAmount:      0,
-            approvedAssetAmount: 0,
-            priceSnapshot:       0,
-            beneficiary:         beneficiary_,
-            createdBy:           createdBy,
-            claimedBy:           address(0),
-            approved:            false,
-            isExternal:          true,
-            tag:                 tag_
-        });
-        pendingIds.push(depositId);
-        userDeposits[beneficiary_].push(depositId);
+        pushId(pendingIds, pendingIndex, depositId);
+        pushId(userDeposits[user], userIndex[user], depositId);
     }
 
     /**
      * @notice Curator-approve a zap deposit and lock `approvedAssetAmount`.
-     * @dev `approvedAssetAmount = approvedAmount * 10**oracleDecimals / assetPrice`.
-     *      Reverts for external deposits — use {approveExternalDeposit}.
+     * @dev Uses {settlementToAssetAmount} so asset and settlement ERC-20 decimals may differ.
      */
     function approveDeposit(
         mapping(bytes32 => Deposit) storage deposits,
         bytes32 depositId,
         uint256 approvedAmount,
         uint256 assetPrice,
-        uint8   oracleDecimals
+        uint8   oracleDecimals,
+        uint8   assetDecimals,
+        uint8   settlementDecimals
     ) internal {
         Deposit storage d = deposits[depositId];
         if (d.user == address(0))  revert DepositNotFound();
-        if (d.isExternal)          revert ExternalDepositRequiresPriceApproval();
         if (d.approved)            revert DepositAlreadyApproved();
-        if (approvedAmount == 0 || approvedAmount > d.amount) revert InvalidApprovedAmount();
+        if (approvedAmount == 0 || approvedAmount != d.amount) revert MustApproveFullDeposit();
         if (assetPrice == 0)       revert InvalidApprovedAmount();
 
         d.approved            = true;
         d.approvedAmount      = approvedAmount;
         d.priceSnapshot       = assetPrice;
-        d.approvedAssetAmount = (approvedAmount * 10 ** uint256(oracleDecimals)) / assetPrice;
-    }
-
-    /**
-     * @notice Curator-approve an external deposit and lock `approvedAssetAmount`.
-     * @dev Same pricing formula as {approveDeposit}. Reverts for non-external deposits.
-     */
-    function approveExternalDeposit(
-        mapping(bytes32 => Deposit) storage deposits,
-        bytes32 depositId,
-        uint256 approvedTokenAmount,
-        uint256 assetPrice,
-        uint8   oracleDecimals
-    ) internal {
-        Deposit storage d = deposits[depositId];
-        if (d.user == address(0)) revert DepositNotFound();
-        if (!d.isExternal)        revert NotExternalDeposit();
-        if (d.approved)           revert DepositAlreadyApproved();
-        if (approvedTokenAmount == 0 || approvedTokenAmount > d.amount) revert InvalidApprovedAmount();
-        if (assetPrice == 0)      revert InvalidApprovedAmount();
-
-        d.approved            = true;
-        d.approvedAmount      = approvedTokenAmount;
-        d.priceSnapshot       = assetPrice;
-        d.approvedAssetAmount = (approvedTokenAmount * 10 ** uint256(oracleDecimals)) / assetPrice;
+        d.approvedAssetAmount = settlementToAssetAmount(
+            approvedAmount,
+            assetPrice,
+            assetDecimals,
+            oracleDecimals,
+            settlementDecimals
+        );
+        // FIND-031: integer division can truncate dust deposits to zero asset units.
+        if (d.approvedAssetAmount == 0) revert InvalidApprovedAmount();
     }
 
     // ─────────────────────────── REDEEM HELPERS ─────────────────────────────
@@ -214,7 +183,9 @@ library VaultLib {
     function recordRedeemRequest(
         mapping(bytes32 => RedeemRequest) storage redeems,
         bytes32[] storage pendingIds,
+        mapping(bytes32 => uint256) storage pendingIndex,
         mapping(address => bytes32[]) storage userRedeems,
+        mapping(address => mapping(bytes32 => uint256)) storage userIndex,
         bytes32 redeemId,
         address user,
         uint256 shares
@@ -228,37 +199,52 @@ library VaultLib {
             approved:    false,
             claimed:     false
         });
-        pendingIds.push(redeemId);
-        userRedeems[user].push(redeemId);
+        pushId(pendingIds, pendingIndex, redeemId);
+        pushId(userRedeems[user], userIndex[user], redeemId);
     }
 
     // ─────────────────────────── ARRAY HELPERS ──────────────────────────────
 
-    /// @dev O(n) removal — acceptable for reasonably-sized pending queues.
-    function removeFromArray(bytes32[] storage arr, bytes32 id) internal {
-        uint256 len = arr.length;
-        for (uint256 i; i < len; i++) {
-            if (arr[i] == id) {
-                arr[i] = arr[len - 1];
-                arr.pop();
-                return;
-            }
+    /**
+     * @dev Append `id` and record its 1-based index for O(1) removal.
+     */
+    function pushId(
+        bytes32[] storage arr,
+        mapping(bytes32 => uint256) storage indexMap,
+        bytes32 id
+    ) internal {
+        arr.push(id);
+        indexMap[id] = arr.length;
+    }
+
+    /**
+     * @dev O(1) swap-and-pop removal using a 1-based index map. No-op if `id` is absent.
+     */
+    function removeFromArray(
+        bytes32[] storage arr,
+        mapping(bytes32 => uint256) storage indexMap,
+        bytes32 id
+    ) internal {
+        uint256 idx = indexMap[id];
+        if (idx == 0) return;
+
+        uint256 i = idx - 1;
+        uint256 last = arr.length - 1;
+        if (i != last) {
+            bytes32 moved = arr[last];
+            arr[i] = moved;
+            indexMap[moved] = idx;
         }
+        arr.pop();
+        delete indexMap[id];
     }
 
     function removeUserEntry(
         mapping(address => bytes32[]) storage map,
+        mapping(address => mapping(bytes32 => uint256)) storage indexMap,
         address user,
         bytes32 id
     ) internal {
-        bytes32[] storage arr = map[user];
-        uint256 len = arr.length;
-        for (uint256 i; i < len; i++) {
-            if (arr[i] == id) {
-                arr[i] = arr[len - 1];
-                arr.pop();
-                return;
-            }
-        }
+        removeFromArray(map[user], indexMap[user], id);
     }
 }

@@ -9,17 +9,18 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts-upgradeable/proxy/utils/U
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/interfaces/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {IUniswapV2Router02} from "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
 
 import {IAssetOracle} from "./interfaces/IAssetOracle.sol";
 import {IEpochManager} from "./interfaces/IEpochManager.sol";
-import {ITokenVesting} from "./interfaces/ITokenVesting.sol";
 import {IERC20Mintable} from "../interfaces/IERC20Mintable.sol";
 import {SwapLib} from "../libraries/SwapLib.sol";
 
 import {VaultLib} from "./libraries/VaultLib.sol";
+import {OracleLib} from "./libraries/OracleLib.sol";
 import {VaultRegistry} from "./VaultRegistry.sol";
 import {RWAVault} from "./RWAVault.sol";
 
@@ -32,9 +33,10 @@ import {RWAVault} from "./RWAVault.sol";
  *      each CapitalFacility — both granted automatically by VaultFactory.
  *
  *      Deposit path (curator-gated):
- *        zapAndDeposit  →  approveDeposit (curator)  →  claimDeposit
- *        or:
- *        registerExternalDeposit  →  approveExternalDeposit  →  claimDeposit
+ *        zapAndDeposit  →  approveDeposit (curator settles)  →  claimDeposit (user)
+ *
+ *      On approve the curator moves USDC to treasury, mints asset tokens if needed,
+ *      and deposits into the RWAVault — vault shares are escrowed on this router until claim.
  *
  *      Queued redemption path (curator-gated, T+days):
  *        requestRedeem  →  approveRedeem (curator)  →  claimRedeem
@@ -42,18 +44,13 @@ import {RWAVault} from "./RWAVault.sol";
  *      For T+0 instant redemptions, users interact directly with RFQEngine —
  *      this router is not in that execution path.
  *
- *      Vesting path (optional per-vault):
- *        claimDepositWithVesting — delivers vault shares into a TokenVesting
- *        schedule instead of transferring them directly to the beneficiary.
- *
  *      Role layout:
  *        DEFAULT_ADMIN_ROLE    — protocol multisig
  *        VAULT_CURATOR_ROLE    — global super-curator (protocol admin); fallback for all vaults
- *        HOST_INTEGRATION_ROLE — global host integration (protocol admin); fallback for all vaults
  *        VAULT_FACTORY_ROLE    — VaultFactory; may register per-vault operators via setVaultOperator
  *
  *      Per-vault operator:
- *        vaultOperator[vaultId] — the issuer's own backend/hot-wallet; has curator + host rights
+ *        vaultOperator[vaultId] — the issuer's own backend/hot-wallet; has curator rights
  *        only for that specific vault. Set atomically by VaultFactory on vault creation.
  */
 contract OpenLiquidityRouter is
@@ -69,8 +66,7 @@ contract OpenLiquidityRouter is
 
     // ─────────────────────────── ROLES ──────────────────────────────────────
 
-    bytes32 public constant VAULT_CURATOR_ROLE    = keccak256("VAULT_CURATOR_ROLE");
-    bytes32 public constant HOST_INTEGRATION_ROLE = keccak256("HOST_INTEGRATION_ROLE");
+    bytes32 public constant VAULT_CURATOR_ROLE = keccak256("VAULT_CURATOR_ROLE");
     /// @notice Granted to VaultFactory so it can register per-vault operators.
     bytes32 public constant VAULT_FACTORY_ROLE    = keccak256("VAULT_FACTORY_ROLE");
 
@@ -82,49 +78,53 @@ contract OpenLiquidityRouter is
     address public treasury;
 
     /// @notice Per-vault operator: the issuer's backend hot-wallet for that specific vault.
-    ///         Has curator + host-integration rights scoped exclusively to its vaultId.
+    ///         Has curator rights scoped exclusively to its vaultId.
     mapping(uint256 => address) public vaultOperator;
 
     // vaultId → depositId → Deposit
     mapping(uint256 => mapping(bytes32 => VaultLib.Deposit)) private _deposits;
     mapping(uint256 => bytes32[]) private _pendingDepositIds;
+    /// @dev 1-based index into `_pendingDepositIds` for O(1) removal (FIND-020).
+    mapping(uint256 => mapping(bytes32 => uint256)) private _pendingDepositIndex;
     mapping(uint256 => mapping(address => bytes32[])) private _userDeposits;
-    mapping(uint256 => mapping(address => uint256)) private _userNonces;
+    mapping(uint256 => mapping(address => mapping(bytes32 => uint256))) private _userDepositIndex;
 
     // vaultId → redeemId → RedeemRequest
     mapping(uint256 => mapping(bytes32 => VaultLib.RedeemRequest)) private _redeems;
     mapping(uint256 => bytes32[]) private _pendingRedeemIds;
+    mapping(uint256 => mapping(bytes32 => uint256)) private _pendingRedeemIndex;
     mapping(uint256 => mapping(address => bytes32[])) private _userRedeems;
+    mapping(uint256 => mapping(address => mapping(bytes32 => uint256))) private _userRedeemIndex;
 
-    /**
-     * @notice Optional per-vault vesting configuration.
-     * @dev When vestingContract is non-zero, callers may use claimDepositWithVesting()
-     *      to receive vault shares as a TokenVesting schedule rather than a direct transfer.
-     */
-    struct VaultVestingConfig {
-        address vestingContract;
-        uint256 defaultCliff; // seconds
-        uint256 defaultDuration; // seconds
-    }
+    /// @notice Per-vault ERC-20 allowlist for zap `tokenIn` (swap path only).
+    ///         Settlement token and native ETH are always allowed and never stored here.
+    mapping(uint256 => mapping(address => bool)) private _zapTokenAllowed;
+    mapping(uint256 => address[]) private _zapTokenAllowedList;
 
-    /// @notice vaultId → VaultVestingConfig.
-    mapping(uint256 => VaultVestingConfig) public vestingConfigs;
+    /// @dev Settlement tokens reserved for pending deposits and approved unclaimed redeems.
+    mapping(uint256 => uint256) private _committedLiability;
+
+    /// @dev Count of unapproved pending deposits per user (FIND-020 spam bound).
+    mapping(uint256 => mapping(address => uint256)) private _openPendingDeposits;
+
+    /// @notice Max unapproved pending deposits a single address may hold per vault.
+    uint256 public constant MAX_PENDING_DEPOSITS_PER_USER = 50;
 
     // ─────────────────────────── EVENTS ─────────────────────────────────────
 
-    event VaultVestingConfigSet(uint256 indexed vaultId, address vestingContract, uint256 cliff, uint256 duration);
     event VaultOperatorSet(uint256 indexed vaultId, address indexed operator);
 
     event DepositCreated(uint256 indexed vaultId, bytes32 indexed depositId, address indexed user, uint256 tokenAmount);
-    event DepositApproved(uint256 indexed vaultId, bytes32 indexed depositId, uint256 approvedTokenAmount);
-    event DepositDeclined(uint256 indexed vaultId, bytes32 indexed depositId, address user, uint256 refund);
-    event DepositClaimed(uint256 indexed vaultId, bytes32 indexed depositId, address beneficiary, uint256 shares);
-    event ExternalDepositRegistered(
+    event DepositApproved(
         uint256 indexed vaultId,
         bytes32 indexed depositId,
-        address beneficiary,
-        bytes32 tag
+        uint256 approvedTokenAmount,
+        uint256 approvedShares
     );
+    event DepositDeclined(uint256 indexed vaultId, bytes32 indexed depositId, address user, uint256 refund);
+    event DepositClaimed(uint256 indexed vaultId, bytes32 indexed depositId, address beneficiary, uint256 shares);
+    event AssetInventoryToppedUp(uint256 indexed vaultId, uint256 amount);
+    event ZapTokenAllowlistUpdated(uint256 indexed vaultId, address indexed token, bool allowed);
 
     event RedeemRequested(uint256 indexed vaultId, bytes32 indexed redeemId, address indexed user, uint256 shares);
     event RedeemApproved(uint256 indexed vaultId, bytes32 indexed redeemId, uint256 tokenAmount);
@@ -139,15 +139,20 @@ contract OpenLiquidityRouter is
     error VaultNotActive(uint256 vaultId);
     error InvalidSlippage();
     error InsufficientFacilityBalance();
+    error InsufficientCommittedCoverage(uint256 idle, uint256 committed, uint256 requested);
     error NotRedeemOwner();
+    error NotDepositOwner();
     error Unauthorized();
     error AlreadyClaimed();
-    error VestingNotConfigured(uint256 vaultId);
     error EpochNotActive(uint256 vaultId);
-    error VestingRequired(uint256 vaultId);
     error RedeemPayoutTooHigh(uint256 requested, uint256 maxAllowed);
     error CannotRescueVaultShares(address vaultShareToken);
     error InvalidAssetPrice();
+    error TokenNotAllowlisted(address token);
+    error SettlementTokenAlwaysAllowed();
+    error EthAlwaysAllowed();
+    error TooManyPendingDeposits(address user, uint256 current, uint256 maxAllowed);
+    error UnexpectedETH();
 
     // ─────────────────────────── INIT ───────────────────────────────────────
 
@@ -183,18 +188,20 @@ contract OpenLiquidityRouter is
      * @notice Swap any ERC-20 (or native ETH) to USDC and register a pending deposit.
      * @dev USDC output is routed directly into the vault's CapitalFacility.
      *      The deposit enters a curator review queue; shares are issued only after approval.
-     * @param vaultId     Target vault (from VaultRegistry).
-     * @param tokenIn     Input token. Pass address(0) for native ETH.
-     * @param amount      Amount of tokenIn (ignored when ETH is sent via msg.value).
-     * @param depositId   Caller-supplied unique identifier for this deposit.
-     * @param slippageBps Maximum acceptable swap slippage in basis points (max 1000 = 10%).
+     * @param vaultId      Target vault (from VaultRegistry).
+     * @param tokenIn      Input token. Pass address(0) for native ETH.
+     * @param amount       Amount of tokenIn (ignored when ETH is sent via msg.value).
+     * @param depositId    Caller-supplied unique identifier for this deposit.
+     * @param slippageBps  Fallback swap slippage in basis points when `minAmountOut` is 0 (max 1000 = 10%).
+     * @param minAmountOut Minimum settlement tokens from swap (FIND-022). Ignored on direct settlement deposit.
      */
     function zapAndDeposit(
         uint256 vaultId,
         IERC20 tokenIn,
         uint256 amount,
         bytes32 depositId,
-        uint256 slippageBps
+        uint256 slippageBps,
+        uint256 minAmountOut
     ) external payable nonReentrant whenNotPaused {
         if (amount == 0) revert ZeroAmount();
         if (slippageBps > 1000) revert InvalidSlippage();
@@ -205,14 +212,23 @@ contract OpenLiquidityRouter is
 
         // When the caller deposits the settlement token directly (e.g. USDC), skip the
         // Uniswap swap and transfer it straight into the CapitalFacility.
+        // Reject attached ETH so it cannot be silently stranded on the router (FIND-033).
+        // Credit the measured facility balance delta so fee-on-transfer tokens cannot
+        // over-credit the pending deposit (FIND-015).
         if (address(tokenIn) != address(0) && address(tokenIn) == v.settlementToken) {
+            if (msg.value != 0) revert UnexpectedETH();
+            uint256 balBefore = IERC20(v.settlementToken).balanceOf(v.capitalFacility);
             IERC20(v.settlementToken).safeTransferFrom(msg.sender, v.capitalFacility, amount);
-            tokenReceived = amount;
+            tokenReceived = IERC20(v.settlementToken).balanceOf(v.capitalFacility) - balBefore;
         } else {
+            if (!_isZapSwapTokenAllowed(vaultId, address(tokenIn), v.settlementToken)) {
+                revert TokenNotAllowlisted(address(tokenIn));
+            }
             tokenReceived = SwapLib.zapIn(
                 tokenIn,
                 amount,
                 slippageBps,
+                minAmountOut,
                 IUniswapV2Router02(v.uniswapRouter),
                 IERC20(v.settlementToken),
                 v.capitalFacility,
@@ -225,43 +241,95 @@ contract OpenLiquidityRouter is
 
         if (tokenReceived == 0) revert ZeroAmount();
 
+        uint256 openPending = _openPendingDeposits[vaultId][msg.sender];
+        if (openPending >= MAX_PENDING_DEPOSITS_PER_USER) {
+            revert TooManyPendingDeposits(msg.sender, openPending, MAX_PENDING_DEPOSITS_PER_USER);
+        }
+
         VaultLib.recordDeposit(
             _deposits[vaultId],
             _pendingDepositIds[vaultId],
+            _pendingDepositIndex[vaultId],
             _userDeposits[vaultId],
+            _userDepositIndex[vaultId],
             depositId,
             tokenReceived,
             msg.sender
         );
+        _openPendingDeposits[vaultId][msg.sender] = openPending + 1;
+
+        _increaseCommitted(vaultId, tokenReceived);
 
         emit DepositCreated(vaultId, depositId, msg.sender, tokenReceived);
     }
 
     /**
-     * @notice Curator approves a standard deposit and locks the asset price.
-     * @param assetPrice  Oracle price (8 decimal precision) used to calculate asset units.
+     * @notice Optional pre-mint of asset tokens onto this router for upcoming approvals.
+     * @dev Curator may top up inventory to avoid auto-mint during approveDeposit.
+     *      Leftover balance rolls forward to future deposits.
+     */
+    function curatorTopUpAsset(uint256 vaultId, uint256 amount) external nonReentrant whenNotPaused {
+        _checkCurator(vaultId);
+        _requireActiveVault(vaultId);
+        if (amount == 0) revert ZeroAmount();
+
+        VaultLib.VaultRecord memory v = _activeVault(vaultId);
+        IERC20Mintable(v.assetToken).mint(address(this), amount);
+
+        emit AssetInventoryToppedUp(vaultId, amount);
+    }
+
+    /**
+     * @notice Curator approves a deposit, settles USDC, mints/deposits asset tokens, and escrows shares.
+     * @param approvedAmount Must equal the full deposit amount.
+     * @param assetPrice     Oracle price (8 decimal precision) used to calculate asset units.
      */
     function approveDeposit(
         uint256 vaultId,
         bytes32 depositId,
         uint256 approvedAmount,
         uint256 assetPrice
-    ) external whenNotPaused {
+    ) external nonReentrant whenNotPaused {
         _checkCurator(vaultId);
         _requireActiveVault(vaultId);
         _checkEpochActive(vaultId);
 
-        uint8 oracleDecimals = IAssetOracle(registry.getVault(vaultId).assetOracle).decimals();
+        VaultLib.VaultRecord memory vRecord = registry.getVault(vaultId);
+        _requireFreshOracle(vaultId, vRecord.assetOracle);
 
-        VaultLib.approveDeposit(_deposits[vaultId], depositId, approvedAmount, assetPrice, oracleDecimals);
+        uint8 oracleDecimals = IAssetOracle(vRecord.assetOracle).decimals();
+        uint8 assetDecimals = IERC20Metadata(vRecord.assetToken).decimals();
+        uint8 settlementDecimals = IERC20Metadata(vRecord.settlementToken).decimals();
 
-        VaultLib.removeFromArray(_pendingDepositIds[vaultId], depositId);
+        VaultLib.approveDeposit(
+            _deposits[vaultId],
+            depositId,
+            approvedAmount,
+            assetPrice,
+            oracleDecimals,
+            assetDecimals,
+            settlementDecimals
+        );
 
-        emit DepositApproved(vaultId, depositId, approvedAmount);
+        VaultLib.VaultRecord memory v = _activeVault(vaultId);
+        VaultLib.Deposit storage d = _deposits[vaultId][depositId];
+
+        if (!registry.isMintAuthorized(vaultId)) revert VaultRegistry.MintNotAuthorized(vaultId);
+
+        uint256 shares = _settleApprovedDeposit(v, d);
+        _decreaseCommitted(vaultId, d.approvedAmount);
+
+        VaultLib.removeFromArray(
+            _pendingDepositIds[vaultId],
+            _pendingDepositIndex[vaultId],
+            depositId
+        );
+        _decrementOpenPending(vaultId, d.user);
+
+        emit DepositApproved(vaultId, depositId, approvedAmount, shares);
     }
 
-    /// @notice Curator declines a pending deposit. Zap deposits are refunded from CapitalFacility;
-    ///         external deposits are cancelled without a token movement.
+    /// @notice Curator declines a pending deposit. USDC is refunded from CapitalFacility.
     function declineDeposit(
         uint256 vaultId,
         bytes32 depositId
@@ -275,175 +343,61 @@ contract OpenLiquidityRouter is
         if (d.approved) revert VaultLib.DepositAlreadyApproved();
 
         address user = d.user;
-        address listOwner = d.isExternal ? d.beneficiary : d.user;
         uint256 refund = d.amount;
-        bool isExternal = d.isExternal;
 
         delete _deposits[vaultId][depositId];
-        VaultLib.removeFromArray(_pendingDepositIds[vaultId], depositId);
-        VaultLib.removeUserEntry(_userDeposits[vaultId], listOwner, depositId);
+        VaultLib.removeFromArray(
+            _pendingDepositIds[vaultId],
+            _pendingDepositIndex[vaultId],
+            depositId
+        );
+        VaultLib.removeUserEntry(
+            _userDeposits[vaultId],
+            _userDepositIndex[vaultId],
+            user,
+            depositId
+        );
+        _decrementOpenPending(vaultId, user);
 
-        // External deposits never pulled settlement tokens into the facility.
-        // Refunding them would drain idle capital to the host integrator.
-        if (!isExternal && refund > 0) {
+        if (refund > 0) {
+            _decreaseCommitted(vaultId, refund);
             IERC20(v.settlementToken).safeTransferFrom(v.capitalFacility, user, refund);
         }
 
-        emit DepositDeclined(vaultId, depositId, user, isExternal ? 0 : refund);
+        emit DepositDeclined(vaultId, depositId, user, refund);
     }
 
     /**
-     * @notice Claim an approved deposit: mint asset tokens, deposit into the vault, receive shares.
-     * @dev When a {VaultVestingConfig} is set, use {claimDepositWithVesting} instead.
-     *      Shares always go to the deposit beneficiary (or `user` if beneficiary is zero).
-     * @return shares Vault shares minted for the beneficiary.
+     * @notice Claim an approved deposit — transfers escrowed vault shares to the depositor.
+     * @return shares Vault shares transferred to the depositor.
      */
     function claimDeposit(
         uint256 vaultId,
         bytes32 depositId
     ) external nonReentrant whenNotPaused returns (uint256 shares) {
         _checkEpochActive(vaultId);
-        if (vestingConfigs[vaultId].vestingContract != address(0)) revert VestingRequired(vaultId);
         VaultLib.VaultRecord memory v = _activeVault(vaultId);
         VaultLib.Deposit storage d = _deposits[vaultId][depositId];
 
         if (d.user == address(0)) revert VaultLib.DepositNotFound();
         if (!d.approved) revert VaultLib.DepositNotApproved();
         if (d.claimedBy != address(0)) revert AlreadyClaimed();
+        if (msg.sender != d.user) revert NotDepositOwner();
 
-        address beneficiary = d.beneficiary == address(0) ? d.user : d.beneficiary;
-
-        // Pull settlement tokens from CapitalFacility and forward to the vault's treasury (payment for custodied RWA).
-        IERC20(v.settlementToken).safeTransferFrom(v.capitalFacility, v.treasury, d.approvedAmount);
-        IERC20Mintable(v.assetToken).mint(address(this), d.approvedAssetAmount);
-        IERC20(v.assetToken).forceApprove(v.vault, d.approvedAssetAmount);
-        shares = IERC4626(v.vault).deposit(d.approvedAssetAmount, beneficiary);
+        shares = d.approvedShares;
+        if (shares == 0) revert ZeroAmount();
 
         d.claimedBy = msg.sender;
         VaultLib.removeUserEntry(
             _userDeposits[vaultId],
-            d.isExternal ? d.beneficiary : d.user,
+            _userDepositIndex[vaultId],
+            d.user,
             depositId
         );
 
-        emit DepositClaimed(vaultId, depositId, beneficiary, shares);
-    }
+        IERC20(v.vault).safeTransfer(d.user, shares);
 
-    /**
-     * @notice Claim an approved deposit via a TokenVesting schedule.
-     *
-     * @dev Vault shares are minted to the vault's configured vestingContract rather
-     *      than directly to the beneficiary. A linear vesting schedule is created for
-     *      the beneficiary inside that contract.
-     *
-     *      Pre-conditions:
-     *        1. Curator has approved the deposit.
-     *        2. A VaultVestingConfig is set for this vault (setVaultVestingConfig).
-     *        3. This router holds VESTING_CREATOR on the vestingContract.
-     *
-     * @param vaultId   Target vault.
-     * @param depositId Approved deposit identifier.
-     * @param cliff     Cliff override in seconds. 0 uses the vault's configured default.
-     * @param duration  Duration override in seconds. 0 uses the vault's configured default.
-     * @return shares   Vault shares locked inside the vesting contract.
-     */
-    function claimDepositWithVesting(
-        uint256 vaultId,
-        bytes32 depositId,
-        uint256 cliff,
-        uint256 duration
-    ) external nonReentrant whenNotPaused returns (uint256 shares) {
-        _checkEpochActive(vaultId);
-        VaultLib.VaultRecord memory v = _activeVault(vaultId);
-        VaultLib.Deposit storage d = _deposits[vaultId][depositId];
-        VaultVestingConfig memory cfg = vestingConfigs[vaultId];
-
-        if (d.user == address(0)) revert VaultLib.DepositNotFound();
-        if (!d.approved) revert VaultLib.DepositNotApproved();
-        if (d.claimedBy != address(0)) revert AlreadyClaimed();
-        if (cfg.vestingContract == address(0)) revert VestingNotConfigured(vaultId);
-
-        address beneficiary = d.beneficiary == address(0) ? d.user : d.beneficiary;
-        uint256 effectiveCliff = cliff > 0 ? cliff : cfg.defaultCliff;
-        uint256 effectiveDuration = duration > 0 ? duration : cfg.defaultDuration;
-
-        IERC20(v.settlementToken).safeTransferFrom(v.capitalFacility, v.treasury, d.approvedAmount);
-        IERC20Mintable(v.assetToken).mint(address(this), d.approvedAssetAmount);
-        IERC20(v.assetToken).forceApprove(v.vault, d.approvedAssetAmount);
-        shares = IERC4626(v.vault).deposit(d.approvedAssetAmount, cfg.vestingContract);
-
-        ITokenVesting(cfg.vestingContract).createVestingSchedule(
-            beneficiary,
-            block.timestamp,
-            effectiveCliff,
-            effectiveDuration,
-            1, // 1-second slicePeriod = fully linear release
-            false, // non-revocable by default
-            shares
-        );
-
-        d.claimedBy = msg.sender;
-        VaultLib.removeUserEntry(
-            _userDeposits[vaultId],
-            d.isExternal ? d.beneficiary : d.user,
-            depositId
-        );
-
-        emit DepositClaimed(vaultId, depositId, beneficiary, shares);
-    }
-
-    // ─────────────────────────── EXTERNAL DEPOSITS ──────────────────────────
-
-    /**
-     * @notice Register an off-chain / host-to-host deposit. No settlement tokens move at this step.
-     * @dev HOST_INTEGRATION_ROLE is required. The curator must subsequently call
-     *      approveExternalDeposit before the beneficiary can claim.
-     */
-    function registerExternalDeposit(
-        uint256 vaultId,
-        address beneficiary,
-        uint256 tokenAmount,
-        bytes32 tag
-    ) external whenNotPaused returns (bytes32 depositId) {
-        _checkHostIntegration(vaultId);
-        _requireActiveVault(vaultId);
-        if (beneficiary == address(0)) revert ZeroAddress();
-        if (tokenAmount == 0) revert ZeroAmount();
-
-        uint256 nonce = _userNonces[vaultId][msg.sender]++;
-
-        depositId = VaultLib.recordExternalDeposit(
-            _deposits[vaultId],
-            _pendingDepositIds[vaultId],
-            _userDeposits[vaultId],
-            tokenAmount,
-            beneficiary,
-            tag,
-            msg.sender,
-            nonce
-        );
-
-        emit ExternalDepositRegistered(vaultId, depositId, beneficiary, tag);
-    }
-
-    /// @notice Curator approves an external deposit with a specific asset price.
-    function approveExternalDeposit(
-        uint256 vaultId,
-        bytes32 depositId,
-        uint256 approvedTokenAmount,
-        uint256 assetPrice
-    ) external whenNotPaused {
-        _checkCurator(vaultId);
-        _requireActiveVault(vaultId);
-        _checkEpochActive(vaultId);
-
-        uint8 oracleDecimals = IAssetOracle(registry.getVault(vaultId).assetOracle).decimals();
-
-        VaultLib.approveExternalDeposit(_deposits[vaultId], depositId, approvedTokenAmount, assetPrice, oracleDecimals);
-
-        VaultLib.removeFromArray(_pendingDepositIds[vaultId], depositId);
-
-        emit DepositApproved(vaultId, depositId, approvedTokenAmount);
+        emit DepositClaimed(vaultId, depositId, d.user, shares);
     }
 
     // ─────────────────────────── QUEUED REDEEM FLOW ─────────────────────────
@@ -462,7 +416,9 @@ contract OpenLiquidityRouter is
         VaultLib.recordRedeemRequest(
             _redeems[vaultId],
             _pendingRedeemIds[vaultId],
+            _pendingRedeemIndex[vaultId],
             _userRedeems[vaultId],
+            _userRedeemIndex[vaultId],
             redeemId,
             msg.sender,
             shares
@@ -486,6 +442,8 @@ contract OpenLiquidityRouter is
         if (tokenAmount == 0) revert ZeroAmount();
 
         VaultLib.VaultRecord memory v = _activeVault(vaultId);
+        _requireFreshOracle(vaultId, v.assetOracle);
+
         VaultLib.RedeemRequest storage r = _redeems[vaultId][redeemId];
 
         if (r.user == address(0)) revert VaultLib.RedeemNotFound();
@@ -495,12 +453,22 @@ contract OpenLiquidityRouter is
         uint256 maxPayout = _maxRedeemPayout(v, r.shares);
         if (tokenAmount > maxPayout) revert RedeemPayoutTooHigh(tokenAmount, maxPayout);
 
-        if (IERC20(v.settlementToken).balanceOf(v.capitalFacility) < tokenAmount) revert InsufficientFacilityBalance();
+        uint256 idle = IERC20(v.settlementToken).balanceOf(v.capitalFacility);
+        uint256 committed = _committedLiability[vaultId];
+        if (idle < committed + tokenAmount) {
+            revert InsufficientCommittedCoverage(idle, committed, tokenAmount);
+        }
+
+        _increaseCommitted(vaultId, tokenAmount);
 
         r.approved = true;
         r.tokenAmount = tokenAmount;
 
-        VaultLib.removeFromArray(_pendingRedeemIds[vaultId], redeemId);
+        VaultLib.removeFromArray(
+            _pendingRedeemIds[vaultId],
+            _pendingRedeemIndex[vaultId],
+            redeemId
+        );
 
         emit RedeemApproved(vaultId, redeemId, tokenAmount);
     }
@@ -525,10 +493,17 @@ contract OpenLiquidityRouter is
         tokenAmount = r.tokenAmount;
         r.claimed = true;
 
+        _decreaseCommitted(vaultId, tokenAmount);
+
         IERC4626(v.vault).redeem(r.shares, v.treasury, address(this));
         IERC20(v.settlementToken).safeTransferFrom(v.capitalFacility, msg.sender, tokenAmount);
 
-        VaultLib.removeUserEntry(_userRedeems[vaultId], msg.sender, redeemId);
+        VaultLib.removeUserEntry(
+            _userRedeems[vaultId],
+            _userRedeemIndex[vaultId],
+            msg.sender,
+            redeemId
+        );
 
         emit RedeemClaimed(vaultId, redeemId, msg.sender, tokenAmount);
     }
@@ -550,8 +525,17 @@ contract OpenLiquidityRouter is
         uint256 shares = r.shares;
 
         delete _redeems[vaultId][redeemId];
-        VaultLib.removeFromArray(_pendingRedeemIds[vaultId], redeemId);
-        VaultLib.removeUserEntry(_userRedeems[vaultId], user, redeemId);
+        VaultLib.removeFromArray(
+            _pendingRedeemIds[vaultId],
+            _pendingRedeemIndex[vaultId],
+            redeemId
+        );
+        VaultLib.removeUserEntry(
+            _userRedeems[vaultId],
+            _userRedeemIndex[vaultId],
+            user,
+            redeemId
+        );
 
         IERC20(v.vault).safeTransfer(user, shares);
 
@@ -571,35 +555,30 @@ contract OpenLiquidityRouter is
         emit VaultOperatorSet(vaultId, operator);
     }
 
+    /**
+     * @notice Allow or disallow an ERC-20 as `tokenIn` for zap swaps on a vault.
+     * @dev Settlement token and native ETH are always allowed and cannot be toggled.
+     *      Callable by the per-vault operator or global `VAULT_CURATOR_ROLE`.
+     */
+    function setZapTokenAllowed(uint256 vaultId, address token, bool allowed) external {
+        _checkCurator(vaultId);
+        _setZapTokenAllowed(vaultId, token, allowed);
+    }
+
+    /// @notice Batch variant of {setZapTokenAllowed}.
+    function setZapTokensAllowed(uint256 vaultId, address[] calldata tokens, bool allowed) external {
+        _checkCurator(vaultId);
+        uint256 len = tokens.length;
+        for (uint256 i; i < len; ++i) {
+            _setZapTokenAllowed(vaultId, tokens[i], allowed);
+        }
+    }
+
     function pause() external onlyOwner {
         _pause();
     }
     function unpause() external onlyOwner {
         _unpause();
-    }
-
-    /**
-     * @notice Configure TokenVesting integration for a vault.
-     * @dev The vestingContract must hold sufficient vault shares before any
-     *      claimDepositWithVesting calls, and must recognise this router as a creator.
-     * @param vestingContract TokenVesting contract address. Must not be zero.
-     * @param defaultCliff    Default cliff in seconds (may be overridden per claim).
-     * @param defaultDuration Default vesting duration in seconds.
-     */
-    function setVaultVestingConfig(
-        uint256 vaultId,
-        address vestingContract,
-        uint256 defaultCliff,
-        uint256 defaultDuration
-    ) external onlyOwner {
-        _requireActiveVault(vaultId);
-        if (vestingContract == address(0)) revert ZeroAddress();
-        vestingConfigs[vaultId] = VaultVestingConfig({
-            vestingContract: vestingContract,
-            defaultCliff: defaultCliff,
-            defaultDuration: defaultDuration
-        });
-        emit VaultVestingConfigSet(vaultId, vestingContract, defaultCliff, defaultDuration);
     }
 
     function setRegistry(address newRegistry) external onlyOwner {
@@ -612,7 +591,7 @@ contract OpenLiquidityRouter is
      * @notice Recover ERC-20 tokens accidentally sent to this contract.
      * @dev Cannot rescue registered vault share tokens (ERC-4626 share addresses).
      */
-    function rescueTokens(address token, address to, uint256 amount) external onlyOwner {
+    function rescueTokens(address token, address to, uint256 amount) external onlyOwner nonReentrant {
         if (to == address(0)) revert ZeroAddress();
         if (registry.vaultIdByAddress(token) != 0) revert CannotRescueVaultShares(token);
         IERC20(token).safeTransfer(to, amount);
@@ -632,6 +611,11 @@ contract OpenLiquidityRouter is
         return _userDeposits[vaultId][user];
     }
 
+    /// @notice Number of unapproved pending deposits for `user` on `vaultId`.
+    function getOpenPendingDeposits(uint256 vaultId, address user) external view returns (uint256) {
+        return _openPendingDeposits[vaultId][user];
+    }
+
     function getRedeem(uint256 vaultId, bytes32 redeemId) external view returns (VaultLib.RedeemRequest memory) {
         return _redeems[vaultId][redeemId];
     }
@@ -644,12 +628,33 @@ contract OpenLiquidityRouter is
         return _userRedeems[vaultId][user];
     }
 
-    function getAssetPrice(uint256 vaultId) external view returns (uint256) {
-        return IAssetOracle(_activeVault(vaultId).assetOracle).price();
+    /// @notice Whether `token` may be used as zap `tokenIn` for `vaultId`.
+    /// @dev Native ETH (`address(0)`) and the vault settlement token are always true.
+    function isZapTokenAllowed(uint256 vaultId, address token) external view returns (bool) {
+        address settlementToken = registry.getVault(vaultId).settlementToken;
+        return _isZapSwapTokenAllowed(vaultId, token, settlementToken);
     }
 
-    function getVestingConfig(uint256 vaultId) external view returns (VaultVestingConfig memory) {
-        return vestingConfigs[vaultId];
+    /// @notice ERC-20 tokens explicitly allowlisted for zap swaps (excludes settlement token and ETH).
+    function getZapAllowedTokens(uint256 vaultId) external view returns (address[] memory) {
+        return _zapTokenAllowedList[vaultId];
+    }
+
+    /// @notice Settlement tokens reserved for pending deposits and approved unclaimed redeems.
+    function getCommittedLiability(uint256 vaultId) external view returns (uint256) {
+        return _committedLiability[vaultId];
+    }
+
+    /// @notice Idle facility balance minus committed liability (floored at zero).
+    function getAvailableIdle(uint256 vaultId) external view returns (uint256) {
+        VaultLib.VaultRecord memory v = registry.getVault(vaultId);
+        uint256 idle = IERC20(v.settlementToken).balanceOf(v.capitalFacility);
+        uint256 committed = _committedLiability[vaultId];
+        return idle > committed ? idle - committed : 0;
+    }
+
+    function getAssetPrice(uint256 vaultId) external view returns (uint256) {
+        return IAssetOracle(_activeVault(vaultId).assetOracle).price();
     }
 
     // ─────────────────────────── INTERNAL ───────────────────────────────────
@@ -663,16 +668,51 @@ contract OpenLiquidityRouter is
         if (!registry.isActive(vaultId)) revert VaultNotActive(vaultId);
     }
 
+    /// @dev FIND-029: revert on state-changing paths when the vault oracle is stale.
+    function _requireFreshOracle(uint256 vaultId, address oracle) internal view {
+        OracleLib.requireFresh(oracle, registry.effectiveMaxOracleAge(vaultId));
+    }
+
     /// @dev Reverts unless caller is the per-vault operator OR holds global VAULT_CURATOR_ROLE.
     function _checkCurator(uint256 vaultId) internal view {
         if (msg.sender != vaultOperator[vaultId] && !hasRole(VAULT_CURATOR_ROLE, msg.sender))
             revert Unauthorized();
     }
 
-    /// @dev Reverts unless caller is the per-vault operator OR holds global HOST_INTEGRATION_ROLE.
-    function _checkHostIntegration(uint256 vaultId) internal view {
-        if (msg.sender != vaultOperator[vaultId] && !hasRole(HOST_INTEGRATION_ROLE, msg.sender))
-            revert Unauthorized();
+    function _setZapTokenAllowed(uint256 vaultId, address token, bool allowed) private {
+        if (token == address(0)) revert EthAlwaysAllowed();
+
+        address settlementToken = registry.getVault(vaultId).settlementToken;
+        if (token == settlementToken) revert SettlementTokenAlwaysAllowed();
+
+        if (_zapTokenAllowed[vaultId][token] == allowed) return;
+
+        _zapTokenAllowed[vaultId][token] = allowed;
+
+        if (allowed) {
+            _zapTokenAllowedList[vaultId].push(token);
+        } else {
+            address[] storage list = _zapTokenAllowedList[vaultId];
+            uint256 len = list.length;
+            for (uint256 i; i < len; ++i) {
+                if (list[i] == token) {
+                    list[i] = list[len - 1];
+                    list.pop();
+                    break;
+                }
+            }
+        }
+
+        emit ZapTokenAllowlistUpdated(vaultId, token, allowed);
+    }
+
+    function _isZapSwapTokenAllowed(
+        uint256 vaultId,
+        address token,
+        address settlementToken
+    ) internal view returns (bool) {
+        if (token == address(0) || token == settlementToken) return true;
+        return _zapTokenAllowed[vaultId][token];
     }
 
     /**
@@ -687,16 +727,67 @@ contract OpenLiquidityRouter is
         }
     }
 
+    function _increaseCommitted(uint256 vaultId, uint256 amount) internal {
+        _committedLiability[vaultId] += amount;
+    }
+
+    function _decreaseCommitted(uint256 vaultId, uint256 amount) internal {
+        _committedLiability[vaultId] -= amount;
+    }
+
+    function _decrementOpenPending(uint256 vaultId, address user) internal {
+        uint256 openPending = _openPendingDeposits[vaultId][user];
+        if (openPending > 0) {
+            _openPendingDeposits[vaultId][user] = openPending - 1;
+        }
+    }
+
+    /**
+     * @dev Pull approved USDC to treasury, mint asset shortfall if needed, deposit into vault.
+     *      Vault shares are escrowed on this router until claimDeposit.
+     */
+    function _settleApprovedDeposit(
+        VaultLib.VaultRecord memory v,
+        VaultLib.Deposit storage d
+    ) internal returns (uint256 shares) {
+        uint256 need = d.approvedAssetAmount;
+        if (need == 0) revert ZeroAmount();
+
+        IERC20(v.settlementToken).safeTransferFrom(v.capitalFacility, v.treasury, d.approvedAmount);
+
+        uint256 pool = IERC20(v.assetToken).balanceOf(address(this));
+        if (pool < need) {
+            IERC20Mintable(v.assetToken).mint(address(this), need - pool);
+        }
+
+        IERC20(v.assetToken).forceApprove(v.vault, need);
+        shares = IERC4626(v.vault).deposit(need, address(this));
+        // FIND-031: ERC-4626 can round a non-zero asset amount down to zero shares.
+        if (shares == 0) revert ZeroAmount();
+        d.approvedShares = shares;
+    }
+
     /// @dev Oracle-implied settlement payout for `shares` locked in a redeem request.
     function _maxRedeemPayout(VaultLib.VaultRecord memory v, uint256 shares) internal view returns (uint256) {
         uint256 assetAmount = IERC4626(v.vault).convertToAssets(shares);
         uint256 assetPrice = IAssetOracle(v.assetOracle).price();
         if (assetPrice == 0) revert InvalidAssetPrice();
-        uint8 dec = IAssetOracle(v.assetOracle).decimals();
-        return (assetAmount * assetPrice) / (10 ** uint256(dec));
+
+        uint8 oracleDecimals = IAssetOracle(v.assetOracle).decimals();
+        uint8 assetDecimals = IERC20Metadata(v.assetToken).decimals();
+        uint8 settlementDecimals = IERC20Metadata(v.settlementToken).decimals();
+
+        return VaultLib.assetToSettlementAmount(
+            assetAmount,
+            assetPrice,
+            assetDecimals,
+            oracleDecimals,
+            settlementDecimals
+        );
     }
 
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
-    uint256[43] private __gap;
+    /// @dev Reduced by 5 for FIND-020 index maps + open-pending counter.
+    uint256[39] private __gap;
 }
